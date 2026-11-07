@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 构建产物
+*.zip
+
+# 运行时数据 —— 绝对不能提交
+vault.enc
+vault.tmp
+hosts.toml
+audit.log
+known_hosts
+.lock
+.setup-*.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

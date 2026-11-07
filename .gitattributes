@@ -1,0 +1,6 @@
+# 仓库内统一使用 LF，避免跨平台换行符混乱
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary
