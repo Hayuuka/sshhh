@@ -10,6 +10,16 @@ Give your AI agent SSH access without ever putting the password into its context
 
 ---
 
+## 适用场景
+
+- 让 **Claude Code / Cursor / Windsurf / Cline / WorkBuddy** 这类 AI 编程助手
+  帮你把代码部署到服务器，又不想把 SSH 密码写进 `.env` 或项目配置
+- 让 AI 帮忙排查线上问题：看日志、查磁盘、看服务状态、重启服务
+- 公司安全要求「生产环境密码不能进入任何第三方 AI 服务」
+- 同时用好几个 AI 工具，不想为每个都配一遍密码
+- 想限制 AI 只能跑只读命令，禁止 `rm -rf`、`shutdown`
+- 给 AI 临时开一次服务器权限，事后能查它到底跑了什么
+
 ## 为什么需要它
 
 现在很多人让 AI agent 帮忙上服务器排障、看日志、重启服务。为了让它能连，
@@ -262,3 +272,30 @@ py -3.14 tests/test_docs.py                   # 文档与代码一致性
 ## License
 
 [MIT](LICENSE)
+
+---
+
+<details>
+<summary><b>关键词 / Keywords</b> —— 帮助需要的人搜到这里</summary>
+
+<br>
+
+**中文**
+
+AI 连服务器不暴露密码 · 让 AI 用 SSH 但不给密码 · AI agent SSH 免密 ·
+Claude Code 连服务器 · Cursor 远程部署服务器 · AI 编程助手 部署到服务器 ·
+AI 运维 密码安全 · 本地凭据代理 · 密码不进大模型 · AI 自动化运维 ·
+MCP SSH 工具 · 给 AI 服务器权限 怎么才安全 · AI 帮我重启服务 ·
+把服务器交给 AI 靠谱吗 · AI 排障 看日志 · 生产环境密码 不能给 AI
+
+**English**
+
+ssh for ai agents · ai agent ssh access without password ·
+claude code ssh access · cursor ssh server · windsurf ssh · cline ssh · aider ssh ·
+mcp ssh server · credential broker for llm · secret injection for ai agents ·
+ai coding agent deploy to server · agent safe credentials ·
+password never reaches llm · keep secrets out of prompt · ai devops assistant ·
+remote server access for ai · ai agent run shell command remotely ·
+secure ssh proxy for llm · ai ops automation
+
+</details>
