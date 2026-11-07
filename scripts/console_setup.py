@@ -31,6 +31,62 @@ class Cancelled(Exception):
 
 
 # --------------------------------------------------------------------------
+# 控制台绑定与日志
+# --------------------------------------------------------------------------
+
+
+def _bind_console() -> None:
+    """把标准流绑到**本窗口自己的**控制台。
+
+    窗口是隔一层启动器拉起来的，正常情况下父进程没有传句柄，标准流本来就
+    指向新控制台。但如果某个宿主把句柄也继承了（stdin 是管道），getpass 会
+    读不到键盘、print 会写进管道 —— 表现就是「窗口是空的，然后自己关掉」。
+    这里显式打开 CONIN$/CONOUT$ 兜底，保证一定读写得到这个窗口。
+    """
+    if os.name != "nt":
+        return
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        try:
+            if stream is not None and stream.isatty():
+                continue
+        except Exception:
+            pass
+        device = "CONIN$" if name == "stdin" else "CONOUT$"
+        try:
+            setattr(sys, name, open(device, "r" if name == "stdin" else "w",
+                                    encoding="utf-8", errors="replace", buffering=1))
+        except OSError:
+            pass
+
+
+def _log(msg: str) -> None:
+    """写诊断日志到 ~/.sshhh/console.log。
+
+    只记录流程与异常，不记录用户输入 —— 密码永远不会经过这里。
+    """
+    try:
+        from lib import paths
+
+        paths.ensure_data_dir()
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(paths.data_dir() / "console.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} [pid {os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _log_path() -> str:
+    try:
+        from lib import paths
+
+        return str(paths.data_dir() / "console.log")
+    except Exception:
+        return "console.log"
+
+
+
+# --------------------------------------------------------------------------
 # 界面
 # --------------------------------------------------------------------------
 
@@ -307,14 +363,18 @@ def _write_result(path: Path, data: dict) -> None:
 
 
 def main() -> int:
+    _bind_console()
+
     if len(sys.argv) < 4:
         print("参数错误", file=sys.stderr)
+        _log("参数错误，退出")
         return 2
 
     task = sys.argv[1]
     payload = json.loads(sys.argv[2])
     result_file = Path(sys.argv[3])
 
+    _log(f"启动任务 {task}")
     _title("sshhh 配置向导")
 
     try:
@@ -326,18 +386,24 @@ def main() -> int:
         print()
         print(THIN)
         print("  已取消，没有做任何修改。")
+        _log("用户按 Ctrl+C 取消")
         _write_result(result_file, {"status": "cancel"})
         _hold(3)
         return 0
     except Exception as exc:
+        import traceback
+
+        _log("出错：" + "".join(traceback.format_exception(exc))[-1500:])
         print()
         print(THIN)
         _err(f"出错了：{exc}")
+        print(f"  详细日志：{_log_path()}")
         _write_result(result_file, {"status": "error", "error": str(exc)[:300]})
-        _hold(8)
+        _hold(30)
         return 1
 
     _write_result(result_file, result)
+    _log(f"任务 {task} 完成：{result.get('status')}")
 
     if task == "ping":
         return 0

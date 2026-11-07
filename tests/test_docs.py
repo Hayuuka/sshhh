@@ -16,6 +16,7 @@ SKILL.md 是 agent 唯一的说明书，写错了 agent 就会做错事。这里
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -114,12 +115,13 @@ def main() -> int:
     mentioned = set(re.findall(r"`([A-Z_]{4,})`", skill_md + protocol_md))
     unknown = mentioned - names - {
         "SSHHH_STATUS", "SSHHH_MESSAGE", "SSHHH_HINT",
-        "SSHHH_SETUP_TIMEOUT", "SSHHH_DATA_DIR", "SSHHH_CALLER", "SSHHH_MASTER",
+        "SSHHH_SETUP_TIMEOUT", "SSHHH_SETUP_HANDOFF",
+        "SSHHH_DATA_DIR", "SSHHH_CALLER", "SSHHH_MASTER",
         "RESULT_KEYS", "CREATE_NEW_CONSOLE", "PIP_INDEX_URL",
     }
     check("文档提到的状态名都有效", not unknown, f"未知：{sorted(unknown)}")
 
-    for code in (10, 11, 12, 13, 14, 20):
+    for code in (10, 11, 12, 13, 14, 15, 20):
         name = protocol.STATUS_NAMES[code]
         check(f"{code} = {name} 已收录", name in skill_md, name)
 
@@ -160,15 +162,20 @@ def main() -> int:
           not re.search(r"\bSSHH_[A-Z]+", readme_en))
 
     print("\n== 超时数值一致 ==")
-    check("默认窗口超时 180 秒",
-          f"{paths.DEFAULT_SETUP_TIMEOUT}" in skill_md
-          and f"{paths.DEFAULT_SETUP_TIMEOUT}" in protocol_md,
+    os.environ.pop("SSHHH_SETUP_HANDOFF", None)
+    handoff_default = sshhh._handoff_seconds() or 0
+    check("窗口硬超时 180 秒在 protocol 里",
+          f"{paths.DEFAULT_SETUP_TIMEOUT}" in protocol_md,
           str(paths.DEFAULT_SETUP_TIMEOUT))
     check("窗口超时范围 30–600",
           f"{paths.MIN_SETUP_TIMEOUT}" in protocol_md
           and f"{paths.MAX_SETUP_TIMEOUT}" in protocol_md)
     check("并发锁 30 秒有说明", "30 秒" in protocol_md)
-    check("三个超时被明确区分", "三个超时不要混" in protocol_md)
+    check("四个超时被明确区分", "四个超时不要混" in protocol_md)
+    check("SKILL.md 说明了窗口交接", "交接" in skill_md)
+    check("交接时长与代码一致",
+          f"{int(handoff_default)}" in protocol_md, str(handoff_default))
+    check("SKILL.md 建议首次调用 240 秒", "240 秒" in skill_md)
 
     print("\n== 运行时降级说明 ==")
     from lib import runtime  # noqa: E402
@@ -177,7 +184,7 @@ def main() -> int:
           str(runtime.PIP_INSTALL_TIMEOUT))
     check("pip 超时小于窗口超时（内层先超时）",
           runtime.PIP_INSTALL_TIMEOUT < paths.DEFAULT_SETUP_TIMEOUT)
-    check("SKILL.md 建议首次调用 400 秒", "400 秒" in skill_md)
+    check("SKILL.md 建议首次调用 240 秒", "240 秒" in skill_md)
     check("SKILL.md 覆盖「python 命令不存在」",
           "python 命令本身不存在" in skill_md)
     check("protocol.md 记录了 pip 超时数值",

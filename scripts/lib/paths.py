@@ -36,6 +36,15 @@ def lock_file() -> Path:
     return data_dir() / ".lock"
 
 
+def no_window_marker() -> Path:
+    """标记文件：这个环境里弹窗撑不住（命令一结束就被宿主回收）。
+
+    出现这个文件说明之前交接出去的窗口已经死了、配置却没完成，
+    之后不再尝试弹窗，直接引导用户在自己的终端里配置。
+    """
+    return data_dir() / ".no-window"
+
+
 def venv_dir() -> Path:
     return data_dir() / "venv"
 

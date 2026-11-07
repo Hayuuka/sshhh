@@ -33,7 +33,7 @@ sshhh —— AI 可用的 SSH 通道，密码不进入 AI 上下文
   status                  查看整体状态
   audit [-n N]            查看最近的调用记录
 
-  config                  强制打开配置窗口（手动配置用）
+  config [--here]         打开配置窗口；加 --here 则在当前终端里配置
   setpass <主机>           修改某台主机的密码
   unlock                  重新输入主密码
   setup                   只安装运行环境
@@ -106,6 +106,9 @@ def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
 
 
 def _manual_cmd(sub: str) -> str:
+    # 这个环境里弹窗撑不住时，manual 的 config 自动变成 --here
+    if sub == "config" and paths.no_window_marker().exists():
+        sub = "config --here"
     return f'python "{_SELF}" {sub}'
 
 
@@ -172,12 +175,34 @@ def _unknown_host(name: str) -> int:
     return protocol.EXIT_CONFIG
 
 
+def _handoff_seconds() -> float | None:
+    """等多久就把还活着的窗口交给用户。
+
+    默认 25 秒。为什么要交接：本进程一旦被 agent 的命令超时杀掉，宿主的
+    作业对象会把窗口一起杀掉 —— 用户正输着主密码，窗口就没了。正常退出
+    则窗口会活下来（实测），所以宁可早点交接，也不要一直挂着等被杀。
+
+    `SSHHH_SETUP_HANDOFF=0` 表示不交接，一直等到窗口结束或超时。
+    """
+    default = 25.0
+    raw = os.environ.get("SSHHH_SETUP_HANDOFF")
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return None
+    return min(value, 600.0)
+
+
 def _launch(task: str, payload: dict) -> tuple[str, dict]:
     from lib import console
 
     if not console.available():
         return console.TIMEOUT, {}
-    return console.launch(task, payload, _setup_timeout())
+    return console.launch(task, payload, _setup_timeout(), _handoff_seconds())
 
 
 def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
@@ -194,11 +219,74 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
             "配置窗口等待超时",
             hint=(
                 "配置窗口等待超时。请告诉用户在自己的终端里执行：\n"
-                f"{_manual_cmd(manual_sub)}"
+                f"{_manual_cmd(manual_sub)}\n"
+                "窗口可能还开着，里面输入完会照样生效；如果已经关了，重跑上面这条"
+            ),
+        )
+    if status == "gone":
+        return protocol.emit(
+            protocol.EXIT_TIMEOUT,
+            "配置窗口被外部终止了，配置没有完成",
+            hint=(
+                "这个环境会在命令结束时把残留进程一起回收，弹窗撑不住。\n"
+                "请告诉用户：在自己的终端里执行下面的命令，全程在当前终端完成，"
+                "不会再弹新窗口：\n"
+                f"{_manual_cmd('config --here')}"
+            ),
+        )
+    if status == "pending":
+        return protocol.emit(
+            protocol.EXIT_PENDING,
+            "配置窗口已打开，正在等待用户输入",
+            hint=(
+                "请告诉用户：桌面上已经打开了一个配置窗口，请在里面设置主密码和"
+                "服务器信息，完成后告诉你，你再重试原命令。\n"
+                "不要反复调用本命令，也不要再开新窗口；窗口关掉或超时才会返回别的状态。\n"
+                "如果窗口还没输完就自己关了，让用户在自己的终端里执行：\n"
+                f"{_manual_cmd('config --here')}"
             ),
         )
     err = detail.get("error") or "配置窗口返回错误"
-    return protocol.emit(protocol.EXIT_CONFIG, err)
+    return protocol.emit(
+        protocol.EXIT_CONFIG, str(err),
+        hint=("如果配置窗口反复异常退出，可以直接在用户自己的终端里执行下面的命令，"
+              "全程不弹新窗口：\n"
+              f"{_manual_cmd('config --here')}"),
+    )
+
+
+def _run_here(task: str, payload: dict) -> int:
+    """在当前终端里直接跑配置向导（不弹窗）。"""
+    from lib import protocol
+
+    if not sys.stdin.isatty():
+        return protocol.emit(
+            protocol.EXIT_CONFIG,
+            "当前终端不可交互，无法在这里配置",
+            hint=("请在真实的终端窗口里执行：\n"
+                  f"{_manual_cmd('config --here')}"),
+        )
+
+    import console_setup
+
+    handler = console_setup.TASKS.get(task)
+    if handler is None:
+        return protocol.emit(protocol.EXIT_CONFIG, f"未知任务：{task}")
+
+    try:
+        result = handler(payload)
+    except KeyboardInterrupt:
+        print()
+        return protocol.emit(protocol.EXIT_CANCELLED, "已取消，未做任何修改")
+    except Exception as exc:  # noqa: BLE001
+        return protocol.emit(
+            protocol.EXIT_CONFIG, f"配置失败：{exc}",
+            hint=f"详细日志见 {paths.data_dir() / 'console.log'}",
+        )
+
+    host = str(result.get("host") or "")
+    _say(f"[ok] 配置完成{f'，主机 {host}' if host else ''}")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -446,33 +534,36 @@ def cmd_get(argv: list[str]) -> int:
 
 
 def cmd_config(argv: list[str]) -> int:
-    """手动配置入口：没有库就做完整初始化，有库就加一台主机。"""
-    from lib import protocol, vault
+    """手动配置入口：没有库就做完整初始化，有库就加一台主机。
 
-    _parse(argv, set())
+    `--here` 表示在当前终端里直接跑向导，不弹新窗口。给「窗口总是被
+    外部杀掉」的场景留的退路 —— 全程在用户自己的终端里完成，没有子进程
+    可以被别人带走。
+    """
+    from lib import vault
+
+    opts, _ = _parse(argv, set())
+    here = bool(opts.get("here"))
 
     if not paths.vault_file().exists():
-        status, detail = _launch("setup", {})
-        if status != "ok":
-            return _setup_failed(status, detail, "config")
-        _say("[ok] 初始化完成")
-        return 0
+        task, done = "setup", "[ok] 初始化完成"
+    else:
+        try:
+            vault.open_vault()
+            task, done = "add_host", "[ok] 已添加主机"
+        except vault.VaultError:
+            task, done = "unlock", "[ok] 密码库已解锁"
 
-    try:
-        v = vault.open_vault()
-    except vault.VaultError:
-        status, detail = _launch("unlock", {})
-        if status != "ok":
-            return _setup_failed(status, detail, "unlock")
-        _say("[ok] 密码库已解锁")
-        return 0
+    if here:
+        return _run_here(task, {})
 
-    status, detail = _launch("add_host", {})
+    status, detail = _launch(task, {})
     if status != "ok":
         return _setup_failed(status, detail, "config")
-    _say(f"[ok] 已添加主机 {detail.get('host', '')}")
-    _ = v
-    _ = protocol
+    if task == "add_host":
+        _say(f"[ok] 已添加主机 {detail.get('host', '')}".rstrip())
+    else:
+        _say(done)
     return 0
 
 

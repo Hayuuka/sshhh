@@ -156,6 +156,15 @@ python scripts/sshhh.py run prod "df -h"
 
 第一次会弹出配置窗口，填完就通了。
 
+如果窗口总是刚开就关（有些 AI 工具在命令结束时会回收残留进程），
+改用下面这条 —— 全程在当前终端里完成，不弹新窗口，也就不会被回收：
+
+```bash
+python scripts/sshhh.py config --here
+```
+
+配一次就够，之后所有调用都直接连，不再涉及窗口。
+
 ## 数据存在哪里
 
 **不在 skill 目录里**，全部放在用户主目录下的 `~/.sshhh/`。
@@ -167,6 +176,7 @@ python scripts/sshhh.py run prod "df -h"
 | `~/.sshhh/hosts.toml` | 主机、端口、用户名、命令策略。**没有 password 字段** |
 | `~/.sshhh/known_hosts` | 主机指纹（TOFU） |
 | `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
+| `~/.sshhh/console.log` | 配置窗口的诊断日志，只记流程和异常，不含任何输入 |
 | `~/.sshhh/venv/` | 独立运行时，约 35 MB，只建一次 |
 | `~/.sshhh/.lock` | 跨进程文件锁 |
 
@@ -249,6 +259,21 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 这种行为会留在审计日志里，也更容易被你发现。
 
 ## 常见问题
+
+**Q：配置窗口刚弹出来就自己关了？**
+
+有些宿主（把每条命令放进作业对象、命令结束就回收残留进程的环境）会把窗口
+连带杀掉。脚本做了两层处理：窗口由独立的中间进程拉起、并且等 25 秒就把窗口
+「交接」出去后正常退出，尽量不让它跟着命令一起死。
+
+如果还是被回收，脚本会自动记住这个环境，改用不弹窗的方式，让用户在自己的
+终端里执行：
+
+```bash
+python scripts/sshhh.py config --here
+```
+
+配置窗口的每一次启动和异常都会写进 `~/.sshhh/console.log`，可以直接看。
 
 **Q：主密码忘了怎么办？**
 

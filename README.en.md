@@ -157,6 +157,16 @@ python scripts/sshhh.py run prod "df -h"
 
 The first call opens the configuration window. Once you're done, it connects.
 
+If the window keeps closing the moment it opens (some AI tools reap leftover
+processes when a command ends), use this instead — everything happens in your
+current terminal, no new window, nothing to reap:
+
+```bash
+python scripts/sshhh.py config --here
+```
+
+You only do this once; every later call connects directly, no window involved.
+
 ## Where your data lives
 
 Everything is under `~/.sshhh/` — **not inside the skill directory**, so
@@ -168,6 +178,7 @@ upgrading or reinstalling the skill never touches your configuration.
 | `~/.sshhh/hosts.toml` | Host list, port, user, policy rules. **No password field** |
 | `~/.sshhh/known_hosts` | Host key fingerprints (TOFU) |
 | `~/.sshhh/audit.log` | JSONL audit trail, redacted |
+| `~/.sshhh/console.log` | Diagnostics for the config window — flow and exceptions only, never your input |
 | `~/.sshhh/venv/` | Isolated runtime, ~35 MB, created once |
 | `~/.sshhh/.lock` | Cross-process file lock |
 
@@ -252,6 +263,23 @@ actively write code against internal APIs** rather than just read a file. That
 behaviour leaves an audit trail, and is far easier for you to notice.
 
 ## FAQ
+
+**The config window closes by itself right after opening.**
+
+Some hosts put every command in a job object and reap leftover processes when the
+command ends — the window gets killed along with it. sshhh handles this in two
+layers: the window is launched by a separate intermediate process, and after 25
+seconds the CLI hands the window off and exits normally so it isn't tied to the
+command's lifetime.
+
+If the window still gets reaped, sshhh remembers that and stops trying, telling
+the user to run this in their own terminal instead:
+
+```bash
+python scripts/sshhh.py config --here
+```
+
+Every window start and exception is logged to `~/.sshhh/console.log`.
 
 **I forgot the master password.**
 

@@ -24,6 +24,7 @@ EXIT_CANCELLED = 11    # 用户取消配置
 EXIT_TIMEOUT = 12      # 配置窗口超时
 EXIT_LOCKED = 13       # 保险库存在但无法自动解锁
 EXIT_HOST_ADDED = 14   # 刚添加了缺失的主机，重试即可
+EXIT_PENDING = 15      # 配置窗口已打开，正在等用户输入
 EXIT_NO_RUNTIME = 20   # 运行环境（venv/依赖）未就绪
 
 STATUS_NAMES = {
@@ -32,6 +33,7 @@ STATUS_NAMES = {
     EXIT_TIMEOUT: "TIMEOUT",
     EXIT_LOCKED: "LOCKED",
     EXIT_HOST_ADDED: "HOST_ADDED",
+    EXIT_PENDING: "SETUP_PENDING",
     EXIT_NO_RUNTIME: "NO_RUNTIME",
 }
 
@@ -41,6 +43,8 @@ STATUS_HINTS = {
     EXIT_TIMEOUT: "配置窗口超时。告诉用户在自己的终端里执行下一条命令手动完成配置。",
     EXIT_LOCKED: "保险库无法自动解锁。告诉用户在自己的终端里执行下一条命令。",
     EXIT_HOST_ADDED: "主机已添加，直接重试原命令即可。",
+    EXIT_PENDING: ("配置窗口已经打开，正在等用户输入。告诉用户去那个窗口里完成配置，"
+                   "完成后重试原命令；不要反复调用本命令，也不要重新开窗口。"),
     EXIT_NO_RUNTIME: "运行环境未就绪。告诉用户在自己的终端里执行下一条命令完成安装。",
 }
 

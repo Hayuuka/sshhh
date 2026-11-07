@@ -163,7 +163,7 @@ class MockConsole:
         self.queue.append((status, detail or {}))
         return self
 
-    def launch(self, task, payload, timeout):
+    def launch(self, task, payload, timeout, handoff=None):
         self.calls.append((task, payload))
         if self.queue:
             return self.queue.pop(0)
@@ -201,6 +201,7 @@ def reset_data():
 
 def main() -> int:
     port, stop = start_server()
+    real_available = console.available
     print(f"迷你 SSH 服务端：127.0.0.1:{port}\n")
 
     try:
@@ -400,6 +401,53 @@ def main() -> int:
             runtime_mod.find_base_python = orig_find2
             runtime_mod._create_venv = orig_create
             runtime_mod._install = orig_install
+
+        print("\n== 窗口交接与降级 ==")
+        reset_data()
+        mock = MockConsole().install()
+        mock.push("pending", {"elapsed": 25.0})
+        code, _, err = run_cli(["run", HOST_NAME, "echo hi"])
+        check("窗口交接 → SETUP_PENDING(15)",
+              code == protocol.EXIT_PENDING, str(code))
+        check("pending 状态行", "SSHHH_STATUS: SETUP_PENDING" in err, err)
+        check("让用户去窗口里完成", "窗口" in err, err)
+        check("要求 agent 不要反复调用", "不要反复调用" in err, err)
+
+        reset_data()
+        mock = MockConsole().install()
+        mock.push("gone", {"elapsed": 6.0})
+        code, _, err = run_cli(["run", HOST_NAME, "echo hi"])
+        check("窗口被外部回收 → TIMEOUT(12)",
+              code == protocol.EXIT_TIMEOUT, str(code))
+        check("指向自己终端里的 --here", "--here" in err, err)
+
+        print("\n== 弹窗不可用时的自动降级 ==")
+        reset_data()
+        paths.ensure_data_dir()
+        paths.no_window_marker().write_text("测试用标记", encoding="utf-8")
+        console.available = real_available
+        code, _, err = run_cli(["run", HOST_NAME, "echo hi"])
+        check("有降级标记 → 不再弹窗", code == protocol.EXIT_TIMEOUT, str(code))
+        check("手动命令自动带 --here", "config --here" in err, err)
+        paths.no_window_marker().unlink()
+        MockConsole().install()
+
+        print("\n== 进程存活判断 ==")
+        check("当前进程判定为活", console._pid_alive(os.getpid()))
+        check("不存在的 pid 判定为死", not console._pid_alive(999999))
+        check("pid 0 判定为死", not console._pid_alive(0))
+
+        print("\n== config --here 在非交互终端 ==")
+        reset_data()
+        MockConsole().install()
+        orig_stdin = sys.stdin
+        sys.stdin = io.StringIO()
+        try:
+            code, _, err = run_cli(["config", "--here"])
+        finally:
+            sys.stdin = orig_stdin
+        check("非 tty → 3", code == protocol.EXIT_CONFIG, str(code))
+        check("提示在真实终端里执行", "config --here" in err, err)
 
     finally:
         stop.set()
