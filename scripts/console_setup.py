@@ -18,6 +18,8 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+from lib import launcher  # noqa: E402
+
 LINE = "=" * 58
 THIN = "-" * 58
 
@@ -363,18 +365,47 @@ def _write_result(path: Path, data: dict) -> None:
 
 
 def main() -> int:
-    _bind_console()
-
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 5:
         print("参数错误", file=sys.stderr)
-        _log("参数错误，退出")
         return 2
 
     task = sys.argv[1]
-    payload = json.loads(sys.argv[2])
+    payload_path = Path(sys.argv[2])
     result_file = Path(sys.argv[3])
+    pid_file = Path(sys.argv[4])
 
-    _log(f"启动任务 {task}")
+    # 数据目录由父进程显式传入：窗口是 explorer 拉起的，
+    # 环境变量不一定还是调用方那一份，必须钉死，否则会读写到另一份密码库。
+    if len(sys.argv) >= 6:
+        os.environ["SSHHH_DATA_DIR"] = sys.argv[5]
+
+    # 一次只允许一个向导实例。窗口被重复拉起时（explorer 转发、
+    # 命令行被解析两次等），后到的这个立刻退出，不跟用户抢同一个控制台。
+    claim = pid_file.with_name(".claimed")
+    try:
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        return 0
+    except OSError:
+        pass
+
+    _bind_console()
+
+    try:
+        launcher.write_pid(pid_file)
+    except Exception:
+        pass
+
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log(f"读取参数失败：{exc}")
+        _write_result(result_file, {"status": "error", "error": "参数读取失败"})
+        return 2
+
+    _log(f"启动任务 {task}（pid {os.getpid()}，父进程 {os.getppid()}）")
     _title("sshhh 配置向导")
 
     try:

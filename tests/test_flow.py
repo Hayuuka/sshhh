@@ -449,6 +449,25 @@ def main() -> int:
         check("非 tty → 3", code == protocol.EXIT_CONFIG, str(code))
         check("提示在真实终端里执行", "config --here" in err, err)
 
+        print("\n== 窗口启动脚本 ==")
+        from lib import launcher as launcher_mod
+
+        work = _TMP / ".setup-testcmd"
+        cmd_file = launcher_mod.write_cmd(
+            work, r"C:\Python\python.exe", Path(r"D:\s\console_setup.py"), "setup",
+            work / "payload.json", work / "result.json", work / "pid.json",
+            work / "stderr.log", _TMP,
+        )
+        raw = cmd_file.read_bytes()
+        text = raw.decode("mbcs", "replace")
+        check("生成 run.cmd", cmd_file.exists())
+        check("stderr 走独立文件（避免和窗口日志抢句柄）",
+              "stderr.log" in text, text)
+        check("数据目录作为参数传入", str(_TMP) in text, text)
+        check("不含 UTF-8 BOM（cmd 解析不了）",
+              not raw.startswith(b"\xef\xbb\xbf"))
+        shutil.rmtree(work, ignore_errors=True)
+
     finally:
         stop.set()
         time.sleep(0.2)

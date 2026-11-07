@@ -117,7 +117,8 @@ def main() -> int:
         "SSHHH_STATUS", "SSHHH_MESSAGE", "SSHHH_HINT",
         "SSHHH_SETUP_TIMEOUT", "SSHHH_SETUP_HANDOFF",
         "SSHHH_DATA_DIR", "SSHHH_CALLER", "SSHHH_MASTER",
-        "RESULT_KEYS", "CREATE_NEW_CONSOLE", "PIP_INDEX_URL",
+        "RESULT_KEYS", "CREATE_NEW_CONSOLE", "CREATE_BREAKAWAY_FROM_JOB",
+        "PIP_INDEX_URL",
     }
     check("文档提到的状态名都有效", not unknown, f"未知：{sorted(unknown)}")
 
@@ -175,7 +176,7 @@ def main() -> int:
     check("SKILL.md 说明了窗口交接", "交接" in skill_md)
     check("交接时长与代码一致",
           f"{int(handoff_default)}" in protocol_md, str(handoff_default))
-    check("SKILL.md 建议首次调用 240 秒", "240 秒" in skill_md)
+    check("SKILL.md 建议首次调用 300 秒", "300 秒" in skill_md)
 
     print("\n== 运行时降级说明 ==")
     from lib import runtime  # noqa: E402
@@ -184,7 +185,7 @@ def main() -> int:
           str(runtime.PIP_INSTALL_TIMEOUT))
     check("pip 超时小于窗口超时（内层先超时）",
           runtime.PIP_INSTALL_TIMEOUT < paths.DEFAULT_SETUP_TIMEOUT)
-    check("SKILL.md 建议首次调用 240 秒", "240 秒" in skill_md)
+    check("SKILL.md 建议首次调用 300 秒", "300 秒" in skill_md)
     check("SKILL.md 覆盖「python 命令不存在」",
           "python 命令本身不存在" in skill_md)
     check("protocol.md 记录了 pip 超时数值",

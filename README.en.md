@@ -156,10 +156,11 @@ python scripts/sshhh.py run prod "df -h"
 ```
 
 The first call opens the configuration window. Once you're done, it connects.
+The window is a separate process — the AI's command finishing or timing out does
+not close it, so you can take your time.
 
-If the window keeps closing the moment it opens (some AI tools reap leftover
-processes when a command ends), use this instead — everything happens in your
-current terminal, no new window, nothing to reap:
+If the window does get closed, use this instead — everything happens in your
+current terminal, no new window:
 
 ```bash
 python scripts/sshhh.py config --here
@@ -267,13 +268,12 @@ behaviour leaves an audit trail, and is far easier for you to notice.
 **The config window closes by itself right after opening.**
 
 Some hosts put every command in a job object and reap leftover processes when the
-command ends — the window gets killed along with it. sshhh handles this in two
-layers: the window is launched by a separate intermediate process, and after 25
-seconds the CLI hands the window off and exits normally so it isn't tied to the
-command's lifetime.
+command ends — the window gets killed along with it. The window is now launched by
+**Windows Explorer**, so it is not in the script's process tree or job object: the
+script exiting, or the AI's command timing out, will not close it, and anything
+you were typing is safe.
 
-If the window still gets reaped, sshhh remembers that and stops trying, telling
-the user to run this in their own terminal instead:
+If it disappears anyway (say you closed it), sshhh falls back to a window-free path:
 
 ```bash
 python scripts/sshhh.py config --here

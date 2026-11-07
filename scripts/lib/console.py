@@ -1,39 +1,31 @@
-"""拉起一个新的控制台窗口，让用户在里面输入密码。
+"""拉起配置窗口并等待结果。
 
-为什么是控制台而不是 GUI：
-  * 纯标准库，`CREATE_NEW_CONSOLE` 一行就能开一个新窗口；
-  * 新控制台是真正的 tty，getpass 能正常隐藏输入；
-  * 不依赖 tkinter（宿主嵌入的 Python 往往没有）。
+窗口怎么开、为什么这么开，见 lib/launcher.py 的说明：交给 explorer 启动，
+让窗口不在宿主的作业对象里，命令结束后依然存活。
 
-为什么窗口要「隔一层」启动：
-  直接 Popen 的话，窗口是 sshhh.py 的子进程。agent 的命令超时、或者外部
-  taskkill /T，会把窗口一起杀掉——用户正输入主密码，窗口突然消失。
-  所以先起一个 spawn_console.py 中间进程，它拉起窗口后立刻退出，窗口的
-  父进程随即变成一个已结束的进程，之后杀 sshhh.py 带不走它。
-
-父进程不再 wait 子进程，而是轮询结果文件 + 检查窗口进程是否还活着：
+父进程不 wait 子进程，而是轮询结果文件 + 检查窗口进程是否还活着：
   * 结果文件出现 → 读状态
   * 窗口进程消失且没有结果 → 取消（用户点了 X）
-  * 到时间还没结果 → taskkill 窗口，返回 timeout
+  * 等满交接时间还没结果 → 返回 pending，把窗口留给用户，自己正常退出
+  * 等满硬超时 → taskkill 窗口，返回 timeout
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from . import paths
+from . import launcher, paths
 
-CREATE_NEW_CONSOLE = 0x00000010
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 _HERE = Path(__file__).resolve().parent
 _CONSOLE_SCRIPT = _HERE.parent / "console_setup.py"
-_SPAWN_SCRIPT = _HERE.parent / "spawn_console.py"
 
 OK = "ok"
 CANCEL = "cancel"
@@ -48,7 +40,7 @@ _RESULT_KEYS = frozenset({"status", "host", "error"})
 # 窗口启动后这么快就退出，基本可以判定为启动失败而不是用户关窗
 _FAST_EXIT = 3.0
 
-# 交接出去之后这么快就被杀掉，说明是宿主在回收进程，不是用户关窗
+# 交接出去之后这么快就被回收，说明是宿主在清理，不是用户关窗
 _KILLED_WINDOW = 15.0
 
 _PENDING_MARK = ".pending"
@@ -67,14 +59,11 @@ def launch(task: str, payload: dict, timeout: float,
            handoff: float | None = None) -> tuple[str, dict]:
     """打开配置窗口并等待结果。
 
-    返回 (状态, 结果详情)。状态为 ok / cancel / timeout / pending / gone / error。
+    返回 (状态, 结果详情)：ok / cancel / timeout / pending / gone / error。
 
-    handoff：等这么久还没结果、而窗口还活着，就返回 pending 并正常退出，
-    把窗口交给用户 —— 正常退出时窗口不会被本进程带走。
-
-    下一次调用会检查上次交出去的窗口还在不在：如果已经没了、配置又没完成，
-    说明这个宿主会在命令结束时回收残留进程，那就标记 .no-window，
-    之后不再弹窗，直接让用户在自己终端里配置。
+    handoff：等这么久还没结果、窗口又还活着，就返回 pending 并正常退出。
+    窗口本身已经不在本进程的作业对象里（见 launcher），所以即使本进程随后
+    被杀，窗口和用户正在输入的内容都不受影响。
     """
     paths.ensure_data_dir()
     started = time.time()
@@ -84,143 +73,89 @@ def launch(task: str, payload: dict, timeout: float,
     if gone:
         return GONE, {"elapsed": gone}
 
-    # 已经有一个窗口在等用户输入？直接等它，避免弹第二个窗口
     existing = _find_live_setup()
     if existing is not None:
-        result_file, pid = existing
+        result_file, pid, work = existing
         status, detail = _wait(result_file, pid, timeout, started, handoff)
         if status in (OK, CANCEL, PENDING):
             if status == PENDING:
                 _write_pending(pid)
             else:
                 _clear_pending()
+                _cleanup_work(work)
             return status, detail
+        _cleanup_work(work)
         # 那个窗口异常退出，继续走正常流程自己开一个
 
-    tag = f"{os.getpid()}-{int(time.time() * 1000)}"
-    result_file = paths.data_dir() / f".setup-{tag}.json"
-    pid_file = paths.data_dir() / f".setup-{tag}.pid"
-    _unlink(result_file, pid_file)
-
     if os.name != "nt":
-        return _launch_inline(task, payload, result_file, timeout)
+        return _launch_inline(task, payload, timeout)
 
-    cmd = [
-        sys.executable,
-        str(_SPAWN_SCRIPT),
-        str(pid_file),
-        sys.executable,
-        str(_CONSOLE_SCRIPT),
-        task,
-        json.dumps(payload, ensure_ascii=False),
-        str(result_file),
-    ]
+    tag = f"{os.getpid()}-{int(time.time() * 1000)}"
+    work = launcher.build_work_dir(paths.data_dir(), tag)
+    result_file = work / "result.json"
+    pid_file = work / "pid.json"
+    payload_file = work / "payload.json"
+    log_file = paths.data_dir() / "console.log"
+
     try:
-        # 中间进程只活几十毫秒，别让它闪一个黑框
-        subprocess.run(cmd, timeout=20, creationflags=_NO_WINDOW,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as exc:
-        _unlink(result_file, pid_file)
-        return ERROR, {"error": f"无法启动配置窗口：{exc}"}
+        payload_file.write_text(json.dumps(payload, ensure_ascii=False),
+                                encoding="utf-8")
+        cmd_file = launcher.write_cmd(
+            work, sys.executable, _CONSOLE_SCRIPT, task,
+            payload_file, result_file, pid_file, log_file,
+            paths.data_dir(),
+        )
+    except OSError as exc:
+        _cleanup_work(work)
+        return ERROR, {"error": f"无法准备配置窗口：{exc}"}
 
-    pid, spawn_error = _read_pid(pid_file)
+    problem = launcher.launch(cmd_file)
+    pid = 0 if problem else launcher.wait_for_pid(pid_file)
     if pid <= 0:
-        _unlink(result_file, pid_file)
-        return ERROR, {"error": f"无法启动配置窗口：{spawn_error or '未知原因'}"}
+        detail = {
+            "error": ("没能打开配置窗口"
+                      + (f"（{problem}）" if problem else "，窗口没有启动")),
+            "work_dir": str(work),
+        }
+        _cleanup_work(work)
+        return ERROR, detail
 
     status, detail = _wait(result_file, pid, timeout, started, handoff)
+    if status == ERROR:
+        detail = dict(detail)
+        detail["error"] = _with_stderr(str(detail.get("error", "")), work)
     if status == PENDING:
         _write_pending(pid)
     else:
         _clear_pending()
-        _unlink(result_file, pid_file)
+        _cleanup_work(work)
     return status, detail
 
 
-# --------------------------------------------------------------------------
-# 交接标记
-# --------------------------------------------------------------------------
-
-
-def _write_pending(pid: int) -> None:
-    mark = paths.data_dir() / _PENDING_MARK
+def _with_stderr(message: str, work: Path) -> str:
+    """把窗口的 stderr 尾巴拼进错误信息，方便一眼看出崩在哪。"""
     try:
-        mark.write_text(json.dumps({"pid": pid, "ts": time.time()}), encoding="utf-8")
+        raw = (work / "stderr.log").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        pass
+        return message
+    tail = raw.strip().splitlines()[-3:]
+    if not tail:
+        return message
+    return message + "\n" + "\n".join(tail)[-400:]
 
 
-def _clear_pending() -> None:
-    _unlink(paths.data_dir() / _PENDING_MARK)
-
-
-def _check_previous() -> float | None:
-    """上次交接出去的窗口还在吗？
-
-    返回窗口「交接后活了多少秒」仅当它死得可疑（大概率被宿主回收），
-    其余情况返回 None。
-    """
-    mark = paths.data_dir() / _PENDING_MARK
-    if not mark.exists():
-        return None
-    try:
-        data = json.loads(mark.read_text(encoding="utf-8"))
-        pid = int(data.get("pid", 0))
-        ts = float(data.get("ts", 0))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        _unlink(mark)
-        return None
-
-    if paths.vault_file().exists():
-        _unlink(mark)
-        return None
-    if pid > 0 and _pid_alive(pid):
-        # 窗口还开着，交给 _find_live_setup 继续等
-        return None
-
-    lived = round(time.time() - ts, 1) if ts else 0.0
-    _unlink(mark)
-    _reap_stale()
-    if lived and lived <= _KILLED_WINDOW:
-        # 交接后十来秒就被清掉，用户不可能这么快输完：是宿主在回收进程
-        _mark_no_window(lived)
-        return lived
-    return None
-
-
-def _reap_stale() -> None:
-    """清掉已经结束的窗口留下的 pid / 结果文件。"""
-    try:
-        stale = list(paths.data_dir().glob(".setup-*.pid"))
-    except OSError:
-        return
-    for pid_file in stale:
-        pid, _ = _read_pid(pid_file)
-        if pid <= 0 or not _pid_alive(pid):
-            _unlink(pid_file, pid_file.with_suffix(".json"))
-
-
-def _mark_no_window(lived: float) -> None:
-    try:
-        paths.no_window_marker().write_text(
-            f"检测到配置窗口在交接后 {lived} 秒被外部终止，"
-            "本环境不再尝试弹窗，改用当前终端配置（config --here）。\n",
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-
-
-def _launch_inline(task: str, payload: dict, result_file: Path,
-                   timeout: float) -> tuple[str, dict]:
+def _launch_inline(task: str, payload: dict, timeout: float) -> tuple[str, dict]:
     """非 Windows：没有「新控制台」概念，退化为在当前终端里跑。"""
-    cmd = [
-        sys.executable, str(_CONSOLE_SCRIPT), task,
-        json.dumps(payload, ensure_ascii=False), str(result_file),
-    ]
+    work = launcher.build_work_dir(paths.data_dir(), f"{os.getpid()}-{int(time.time()*1000)}")
+    result_file = work / "result.json"
+    payload_file = work / "payload.json"
+    payload_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    cmd = [sys.executable, str(_CONSOLE_SCRIPT), task, str(payload_file),
+           str(result_file), str(work / "pid.json"), str(paths.data_dir())]
     try:
         proc = subprocess.Popen(cmd, stdin=None)
     except Exception as exc:
+        _cleanup_work(work)
         return ERROR, {"error": f"无法启动配置窗口：{exc}"}
     try:
         proc.wait(timeout=timeout)
@@ -230,11 +165,11 @@ def _launch_inline(task: str, payload: dict, result_file: Path,
             proc.wait(timeout=5)
         except Exception:
             pass
-        _unlink(result_file)
+        _cleanup_work(work)
         return TIMEOUT, {}
 
     status, detail = _read_result(result_file)
-    _unlink(result_file)
+    _cleanup_work(work)
     if status is None:
         return CANCEL, {}
     return status, detail
@@ -272,8 +207,6 @@ def _wait(result_file: Path, pid: int, timeout: float, started: float,
 
         now = time.time()
         if handoff_at is not None and now >= handoff_at:
-            # 窗口还开着、用户还在输：正常退出把窗口交出去，
-            # 这样即使本进程随后被外部杀掉，也不会连带杀掉窗口。
             return PENDING, {"elapsed": round(now - started, 1)}
 
         if now >= deadline:
@@ -311,28 +244,109 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _find_live_setup() -> tuple[Path, int] | None:
+def _find_live_setup() -> tuple[Path, int, Path] | None:
     """找有没有别的进程已经弹了配置窗口。"""
+    data_dir = paths.data_dir()
     try:
-        candidates = sorted(paths.data_dir().glob(".setup-*.pid"))
+        works = sorted(data_dir.glob(".setup-*"))
     except OSError:
         return None
-    for pid_file in candidates:
-        pid, _ = _read_pid(pid_file)
+    for work in works:
+        if not work.is_dir():
+            continue
+        pid = launcher.read_pid(work / "pid.json")
         if pid > 0 and _pid_alive(pid):
-            result_file = pid_file.with_suffix(".json")
-            return result_file, pid
-        # 残留的旧文件，顺手清掉
-        _unlink(pid_file, pid_file.with_suffix(".json"))
+            return work / "result.json", pid, work
+        _cleanup_work(work)
     return None
 
 
-def _read_pid(path: Path) -> tuple[int, str]:
+def _reap_stale() -> None:
+    """清掉已经结束的窗口留下的工作目录。"""
+    data_dir = paths.data_dir()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return int(raw.get("pid", 0)), str(raw.get("error", ""))
+        works = list(data_dir.glob(".setup-*"))
+    except OSError:
+        return
+    for work in works:
+        if not work.is_dir():
+            continue
+        pid = launcher.read_pid(work / "pid.json")
+        if pid <= 0 or not _pid_alive(pid):
+            _cleanup_work(work)
+
+
+def _cleanup_work(work: Path) -> None:
+    try:
+        shutil.rmtree(work, ignore_errors=True)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 交接标记
+# --------------------------------------------------------------------------
+
+
+def _write_pending(pid: int) -> None:
+    mark = paths.data_dir() / _PENDING_MARK
+    try:
+        mark.write_text(json.dumps({"pid": pid, "ts": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_pending() -> None:
+    try:
+        (paths.data_dir() / _PENDING_MARK).unlink()
+    except OSError:
+        pass
+
+
+def _check_previous() -> float | None:
+    """上次交接出去的窗口还在吗？
+
+    返回它「交接后活了多少秒」仅当死得可疑（大概率被宿主清理），其余返回 None。
+    """
+    mark = paths.data_dir() / _PENDING_MARK
+    if not mark.exists():
+        return None
+    try:
+        data = json.loads(mark.read_text(encoding="utf-8"))
+        pid = int(data.get("pid", 0))
+        ts = float(data.get("ts", 0))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return 0, ""
+        _clear_pending()
+        return None
+
+    if paths.vault_file().exists():
+        _clear_pending()
+        return None
+    if pid > 0 and _pid_alive(pid):
+        return None
+
+    lived = round(time.time() - ts, 1) if ts else 0.0
+    _clear_pending()
+    if lived and lived <= _KILLED_WINDOW:
+        _mark_no_window(lived)
+        return lived
+    return None
+
+
+def _mark_no_window(lived: float) -> None:
+    try:
+        paths.no_window_marker().write_text(
+            f"检测到配置窗口在交接后 {lived} 秒被外部终止，"
+            "本环境不再尝试弹窗，改用当前终端配置（config --here）。\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 其它
+# --------------------------------------------------------------------------
 
 
 def _read_result(path: Path) -> tuple[str | None, dict]:
@@ -354,14 +368,6 @@ def _read_result(path: Path) -> tuple[str | None, dict]:
     if status not in (OK, CANCEL, ERROR):
         return None, {}
     return status, data
-
-
-def _unlink(*paths_: Path) -> None:
-    for p in paths_:
-        try:
-            p.unlink()
-        except OSError:
-            pass
 
 
 def _kill_tree(pid: int) -> None:
