@@ -237,6 +237,17 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
             ),
         )
     if status == "pending":
+        if detail.get("active"):
+            return protocol.emit(
+                protocol.EXIT_PENDING,
+                "已经有一个配置窗口在等用户输入",
+                hint=(
+                    "用户正在窗口里填主密码和服务器信息，这需要一两分钟，属于正常。\n"
+                    "不要重复调用本命令，也不要再开新窗口；等用户说填完了，"
+                    "再重试原命令一次。\n"
+                    "窗口标题是「sshhh setup」，如果用户说找不到，让他在任务栏里找一下。"
+                ),
+            )
         return protocol.emit(
             protocol.EXIT_PENDING,
             "配置窗口已打开，正在等待用户输入",
@@ -637,6 +648,12 @@ def cmd_status(argv: list[str]) -> int:
     _say(f"[--] 已配置 {len(hosts)} 台主机")
     for n, h in sorted(hosts.items()):
         _say(f"     {n}: {h.user}@{h.host}:{h.port} {h.description}")
+
+    from lib import console
+
+    active = console.find_active()
+    if active is not None:
+        _say(f"[!!] 有一个配置窗口正在运行（pid {active[1]}），用户可能正在里面输入")
     return 0
 
 

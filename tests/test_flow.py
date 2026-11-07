@@ -202,6 +202,7 @@ def reset_data():
 def main() -> int:
     port, stop = start_server()
     real_available = console.available
+    real_launch = console.launch
     print(f"迷你 SSH 服务端：127.0.0.1:{port}\n")
 
     try:
@@ -448,6 +449,23 @@ def main() -> int:
             sys.stdin = orig_stdin
         check("非 tty → 3", code == protocol.EXIT_CONFIG, str(code))
         check("提示在真实终端里执行", "config --here" in err, err)
+
+        print("\n== 已有配置窗口在运行时 ==")
+        reset_data()
+        fake = _TMP / ".setup-fake"
+        fake.mkdir(parents=True, exist_ok=True)
+        (fake / "pid.json").write_text(json.dumps({"pid": os.getpid()}),
+                                       encoding="utf-8")
+        found = console.find_active()
+        check("能发现正在运行的配置窗口",
+              found is not None and found[1] == os.getpid(), str(found))
+
+        status, detail = real_launch("setup", {}, 5, 5)
+        check("窗口已在运行时立即返回 pending",
+              status == console.PENDING, str(status))
+        check("标记为 active（用户在输入，不要再开窗口）",
+              detail.get("active") is True, str(detail))
+        shutil.rmtree(fake, ignore_errors=True)
 
         print("\n== 窗口启动脚本 ==")
         from lib import launcher as launcher_mod

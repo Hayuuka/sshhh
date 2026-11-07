@@ -76,16 +76,14 @@ def launch(task: str, payload: dict, timeout: float,
     existing = _find_live_setup()
     if existing is not None:
         result_file, pid, work = existing
-        status, detail = _wait(result_file, pid, timeout, started, handoff)
-        if status in (OK, CANCEL, PENDING):
-            if status == PENDING:
-                _write_pending(pid)
-            else:
-                _clear_pending()
-                _cleanup_work(work)
+        status, detail = _read_result(result_file)
+        if status is not None:
+            # 用户在窗口里填完了，只是上一次调用没等到结果
+            _clear_pending()
+            _cleanup_work(work)
             return status, detail
-        _cleanup_work(work)
-        # 那个窗口异常退出，继续走正常流程自己开一个
+        # 窗口还开着：用户正在输入。立刻返回，不要再开第二个、也不要拖着等
+        return PENDING, {"active": True, "pid": pid, "elapsed": 0.0}
 
     if os.name != "nt":
         return _launch_inline(task, payload, timeout)
@@ -242,6 +240,11 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def find_active() -> tuple[Path, int, Path] | None:
+    """有一个配置窗口正在运行就返回 (结果文件, pid, 工作目录)。"""
+    return _find_live_setup()
 
 
 def _find_live_setup() -> tuple[Path, int, Path] | None:

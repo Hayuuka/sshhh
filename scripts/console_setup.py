@@ -221,16 +221,39 @@ def _import_lib():
     return paths, store, vault, data_lock
 
 
+def _host_hints() -> None:
+    """添加主机前把每个字段讲清楚。"""
+    print("  名称     给这台机器起个短名，之后 `run <名称>` 用它定位")
+    print("           例如 hk、prod、db1，只在本机使用，随便起")
+    print("  地址     服务器的 IP 或域名，例如 192.168.1.10 或 example.com")
+    print("  用户名   登录账号，常见是 root")
+    print("  端口     SSH 端口，服务器没改过就是 22")
+    print("  密码     登录密码，输入时不会显示；万一填错，之后可以用")
+    print("           `setpass <名称>` 单独改，不用重配")
+    print()
+
+
+def _ask_host_info(default_user: str) -> tuple[str, str, int, str, str]:
+    """依次问地址 / 用户名 / 端口 / 备注 / 密码。名称由调用方问。"""
+    h = ask("地址")
+    u = ask("用户名", default=default_user)
+    p = ask_port("端口", default="22")
+    d = ask("备注（可留空）", required=False)
+    pw = ask_secret("SSH 密码")
+    return h, u, p, d, pw
+
+
 def do_setup(payload: dict) -> dict:
     paths, store, vault_mod, data_lock = _import_lib()
 
     _banner("第一次使用，需要先设置主密码和一台服务器")
 
     _section("1/2", "设置主密码（用来加密本地密码库）")
-    print("  这个密码不会保存在任何文件里，请务必记住。")
-    print("  它会被存进系统凭据管理器，之后 AI 调用时自动使用。")
+    print("  这个密码用来加密保存在本机的密码库，本身不会写进任何文件。")
+    print("  同时它会存进系统凭据管理器，之后 AI 调用时自动取用，不用再输。")
+    print("  忘了就只能删库重来，请务必记牢。")
     print()
-    master = ask_secret("主密码", confirm=True)
+    master = ask_secret("主密码（输入时不显示）", confirm=True)
 
     paths.ensure_data_dir()
     with data_lock(timeout=30):
@@ -245,14 +268,13 @@ def do_setup(payload: dict) -> dict:
         _err("系统凭据管理器不可用，之后需要设置环境变量 SSHHH_MASTER 才能自动连接")
 
     print()
+    print("  下面填一台服务器，窗口不会自己关，可以慢慢填。")
+    print()
     _section("2/2", "添加一台 SSH 服务器")
+    _host_hints()
 
-    name = ask("名称（例如 prod）")
-    h = ask("地址（IP 或域名）")
-    u = ask("用户名", default=payload.get("default_user") or "root")
-    p = ask_port("端口", default="22")
-    d = ask("备注（可留空）", required=False)
-    pw = ask_secret("SSH 密码")
+    name = ask("名称")
+    h, u, p, d, pw = _ask_host_info(payload.get("default_user") or "root")
 
     with data_lock(timeout=30):
         store.upsert_host(
@@ -261,7 +283,8 @@ def do_setup(payload: dict) -> dict:
         v = vault_mod.open_vault()
         v.set(name, pw)
 
-    return {"status": "ok", "host": name}
+    return {"status": "ok", "host": name,
+            "summary": f"{name} → {u}@{h}:{p}"}
 
 
 def do_add_host(payload: dict) -> dict:
@@ -271,7 +294,7 @@ def do_add_host(payload: dict) -> dict:
     _banner(f"添加服务器 {name}" if name else "添加一台 SSH 服务器")
 
     if not name:
-        name = ask("名称（例如 prod）")
+        name = ask("名称")
 
     # 先确保能解锁保险库，否则密码存不进去
     try:
@@ -287,11 +310,8 @@ def do_add_host(payload: dict) -> dict:
 
     print()
     _section("服务器信息", "")
-    h = ask("地址（IP 或域名）")
-    u = ask("用户名", default=payload.get("default_user") or "root")
-    p = ask_port("端口", default="22")
-    d = ask("备注（可留空）", required=False)
-    pw = ask_secret("SSH 密码")
+    _host_hints()
+    h, u, p, d, pw = _ask_host_info(payload.get("default_user") or "root")
 
     with data_lock(timeout=30):
         store.upsert_host(
@@ -300,7 +320,8 @@ def do_add_host(payload: dict) -> dict:
         v = vault_mod.open_vault()
         v.set(name, pw)
 
-    return {"status": "ok", "host": name}
+    return {"status": "ok", "host": name,
+            "summary": f"{name} → {u}@{h}:{p}"}
 
 
 def do_unlock(payload: dict) -> dict:
@@ -441,11 +462,15 @@ def main() -> int:
 
     print()
     print(THIN)
-    if result.get("host"):
+    summary = str(result.get("summary") or "")
+    if summary:
+        _ok(f"已保存：{summary}")
+    elif result.get("host"):
         _ok(f"已保存，AI 现在可以访问 {result['host']} 了")
     else:
         _ok("已保存")
-    _hold(5)
+    print("  回到对话里让 AI 重试那条命令即可，不需要再做别的。")
+    _hold(10)
     return 0
 
 
