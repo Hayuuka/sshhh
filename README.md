@@ -4,6 +4,7 @@
 
 Give your AI agent SSH access without ever putting the password into its context.
 
+[![Release](https://img.shields.io/github/v/release/Hayuuka/sshhh?color=blue)](https://github.com/Hayuuka/sshhh/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -131,17 +132,19 @@ python scripts/sshhh.py audit -n 20
 
 ### 1. 安装
 
-放到 skills 目录下（二选一）：
+**方式一：下载发布包**（最简单）
+
+从 [Releases](https://github.com/Hayuuka/sshhh/releases/latest) 下载 `sshhh-skill-vX.Y.Z.zip`，
+解压到 skills 目录：
+
+- 用户级（所有项目可用）：`~/.workbuddy/skills/sshhh/`
+- 项目级（团队共享）：`<项目>/.workbuddy/skills/sshhh/`
+
+**方式二：git clone**
 
 ```bash
-# 用户级：所有项目可用
-git clone <仓库地址> ~/.workbuddy/skills/sshhh
-
-# 项目级：团队共享
-git clone <仓库地址> .workbuddy/skills/sshhh
+git clone https://github.com/Hayuuka/sshhh.git ~/.workbuddy/skills/sshhh
 ```
-
-也可以下载 release 里的 zip 直接解压到该位置。
 
 ### 2. 用起来
 
