@@ -133,6 +133,32 @@ def main() -> int:
     legacy_lower = set(re.findall(r"~?/\.sshh\b|\.sshh/", skill_md + protocol_md))
     check("没有 .sshh 旧目录写法", not legacy_lower, f"发现：{sorted(legacy_lower)}")
 
+    print("\n== README（中英双语）==")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_en_path = ROOT / "README.en.md"
+    check("README.en.md 存在", readme_en_path.exists())
+    readme_en = readme_en_path.read_text(encoding="utf-8") if readme_en_path.exists() else ""
+
+    check("中文 README 有「数据存在哪里」小节", "## 数据存在哪里" in readme)
+    check("英文 README 有对应小节", "## Where your data lives" in readme_en)
+
+    # 数据文件名从代码取，防止文档与实际路径漂移
+    for label, text in (("中文", readme), ("英文", readme_en)):
+        check(f"{label} README 写了数据目录 ~/.sshhh/", "~/.sshhh/" in text)
+        check(f"{label} README 提到 {paths.vault_file().name}",
+              paths.vault_file().name in text)
+        check(f"{label} README 提到 {paths.hosts_file().name}",
+              paths.hosts_file().name in text)
+        check(f"{label} README 说明与 skill 安装位置无关",
+              ("不在 skill 目录里" in text) or ("independent of where the skill" in text))
+
+    check("中文 README 有英文版入口", "README.en.md" in readme)
+    check("英文 README 有中文版入口", "README.md" in readme_en)
+    check("英文 README 无 .sshh 旧目录写法",
+          not re.search(r"~?/\.sshh\b", readme_en))
+    check("英文 README 无 SSHH_ 旧标识",
+          not re.search(r"\bSSHH_[A-Z]+", readme_en))
+
     print("\n== 超时数值一致 ==")
     check("默认窗口超时 180 秒",
           f"{paths.DEFAULT_SETUP_TIMEOUT}" in skill_md

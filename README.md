@@ -4,7 +4,7 @@
 
 Give your AI agent SSH access without ever putting the password into its context.
 
-[![Release](https://img.shields.io/github/v/release/Hayuuka/sshhh?color=blue)](https://github.com/Hayuuka/sshhh/releases)
+[English](README.en.md) · [![Release](https://img.shields.io/github/v/release/Hayuuka/sshhh?color=blue)](https://github.com/Hayuuka/sshhh/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -155,6 +155,28 @@ python scripts/sshhh.py run prod "df -h"
 ```
 
 第一次会弹出配置窗口，填完就通了。
+
+## 数据存在哪里
+
+**不在 skill 目录里**，全部放在用户主目录下的 `~/.sshhh/`。
+这样升级、重装、或者删掉 skill 再装一次，配置都不会丢。
+
+| 路径 | 内容 |
+|---|---|
+| `~/.sshhh/vault.enc` | 加密后的密码（AES-GCM + scrypt）。没有主密码打不开 |
+| `~/.sshhh/hosts.toml` | 主机、端口、用户名、命令策略。**没有 password 字段** |
+| `~/.sshhh/known_hosts` | 主机指纹（TOFU） |
+| `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
+| `~/.sshhh/venv/` | 独立运行时，约 35 MB，只建一次 |
+| `~/.sshhh/.lock` | 跨进程文件锁 |
+
+Windows 上是 `C:\Users\<你的用户名>\.sshhh\`。
+
+主密码本身不写在任何文件里 —— 它保存在操作系统凭据库：
+Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service。
+所以拷走 `vault.enc` 也没用，没有主密码解不开。
+
+换电脑时把整个 `~/.sshhh/` 拷过去即可，主密码不变。
 
 ## 工作原理
 
