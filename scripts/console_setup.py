@@ -87,6 +87,19 @@ def _log_path() -> str:
         return "console.log"
 
 
+def _log_handles() -> None:
+    """记录标准流是不是控制台，出问题时一眼能看出来。"""
+    parts = []
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        try:
+            ok = bool(stream is not None and stream.isatty())
+        except Exception:
+            ok = False
+        parts.append(f"{name}={'tty' if ok else 'not-tty'}")
+    _log("句柄 " + " ".join(parts))
+
+
 
 # --------------------------------------------------------------------------
 # 界面
@@ -172,10 +185,64 @@ def _getch() -> None:
 # --------------------------------------------------------------------------
 
 
+def _read_line(prompt: str) -> str:
+    """从控制台读一行，不依赖 sys.stdin。
+
+    为什么不用 input()：窗口是 explorer → cmd → python 拉起来的，某些环境下
+    python 的 stdin 不是控制台句柄，input() 会把提示符写进 stderr（用户看不到），
+    然后立刻 EOF —— 表现就是「向导走到一半突然没了」。
+    直接用 msvcrt 读键盘，就没有这个问题。
+    """
+    print(prompt, end="", flush=True)
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except Exception:
+            return input()
+        chars: list[str] = []
+        try:
+            while True:
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    print()
+                    return "".join(chars)
+                if ch == "\x08":  # 退格
+                    if chars:
+                        chars.pop()
+                        print("\b \b", end="", flush=True)
+                    continue
+                if ch in ("\x00", "\xe0"):  # 方向键等功能键，吃掉第二个字节
+                    msvcrt.getwch()
+                    continue
+                if ch == "\x03":  # Ctrl+C
+                    raise KeyboardInterrupt
+                if ch == "\x1b":  # Esc 当取消
+                    raise KeyboardInterrupt
+                chars.append(ch)
+                print(ch, end="", flush=True)
+                if len(chars) > 512:
+                    print()
+                    return "".join(chars)
+        except OSError:
+            # 没有控制台（例如被重定向），退回标准输入
+            try:
+                return input()
+            except EOFError as exc:
+                raise RuntimeError(
+                    "这个窗口读不到键盘输入，请在终端里执行 config --here"
+                ) from exc
+    try:
+        return input()
+    except EOFError as exc:
+        raise RuntimeError(
+            "这个窗口读不到键盘输入，请在终端里执行 config --here"
+        ) from exc
+
+
 def ask(prompt: str, default: str = "", required: bool = True) -> str:
     while True:
         suffix = f" [{default}]" if default else ""
-        raw = input(f"  {prompt}{suffix}: ").strip()
+        raw = _read_line(f"  {prompt}{suffix}: ").strip()
         if not raw and default:
             return default
         if raw or not required:
@@ -427,6 +494,7 @@ def main() -> int:
         return 2
 
     _log(f"启动任务 {task}（pid {os.getpid()}，父进程 {os.getppid()}）")
+    _log_handles()
     _title("sshhh 配置向导")
 
     try:

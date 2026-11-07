@@ -486,6 +486,24 @@ def main() -> int:
               not raw.startswith(b"\xef\xbb\xbf"))
         shutil.rmtree(work, ignore_errors=True)
 
+        print("\n== 控制台读行（不依赖 stdin）==")
+        if os.name == "nt":
+            import types
+
+            keys = iter(["a", "b", "\x08", "c", "\r"])
+            fake = types.SimpleNamespace(getwch=lambda: next(keys))
+            real_msvcrt = sys.modules.get("msvcrt")
+            sys.modules["msvcrt"] = fake  # type: ignore[assignment]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    line = console_setup._read_line("提示: ")
+            finally:
+                if real_msvcrt is not None:
+                    sys.modules["msvcrt"] = real_msvcrt  # type: ignore[assignment]
+            check("退格被正确处理", line == "ac", line)
+        else:
+            check("非 Windows 跳过读行测试", True)
+
     finally:
         stop.set()
         time.sleep(0.2)
