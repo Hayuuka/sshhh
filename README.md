@@ -1,8 +1,8 @@
-# sshhh
+# sshhh      ssh嘘————————
 
-> 让 AI 能连你的 SSH 服务器，但它**永远看不到密码**。
-
-Give your AI agent SSH access without ever putting the password into its context.
+薅国内厂商agent的鸡蛋时，想偷懒却不敢直接把ssh用户密码直接丢给ai？
+让 AI 能连你的 SSH 服务器，但它**永远看不到密码**。
+一次配置，多agent共用
 
 [English](README.en.md) · [![Release](https://img.shields.io/github/v/release/Hayuuka/sshhh?color=blue)](https://github.com/Hayuuka/sshhh/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -13,7 +13,7 @@ Give your AI agent SSH access without ever putting the password into its context
 
 ## 适用场景
 
-- 让 **Claude Code / Cursor / Windsurf / Cline / WorkBuddy** 这类 AI 编程助手
+- 让 **Claude Code / Codex / DSH / Zcode / WorkBuddy** 这类 AI 编程助手
   帮你把代码部署到服务器，又不想把 SSH 密码写进 `.env` 或项目配置
 - 让 AI 帮忙排查线上问题：看日志、查磁盘、看服务状态、重启服务
 - 公司安全要求「生产环境密码不能进入任何第三方 AI 服务」
@@ -60,7 +60,7 @@ AI 全程接触不到明文，也不需要接触。
 
 配置固定存放在 `~/.sshhh/`，**与 skill 装在哪里无关**。
 
-你在 Claude Code、Cursor、WorkBuddy 各装一份这个 skill，它们读的是同一份
+你在 Claude Code、Zcode、WorkBuddy 各装一份这个 skill，它们读的是同一份
 配置，不会互相覆盖，也不需要重复设置密码。装十份也只配一次。
 
 ### 3. 零配置启动
