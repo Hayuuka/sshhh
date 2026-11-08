@@ -58,6 +58,24 @@ python scripts/sshhh.py run prod "df -h"
 | `NO_RUNTIME` | `setup` |
 | `CANCELLED` | 不要重试，问用户 |
 
+### 选项的位置
+
+`--sudo`、`--timeout`、`--stdin` 写在主机名之前或之后都等价：
+
+```bash
+python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
+python scripts/sshhh.py run --sudo prod "systemctl restart nginx"
+python scripts/sshhh.py run prod --timeout 600 "make build"
+```
+
+需要把 `--sudo` 这类字样**原样交给远端**时，用 `--` 分隔：
+
+```bash
+python scripts/sshhh.py run prod -- "--sudo some-tool --flag"
+```
+
+`--` 之后的内容原样传给远端，不做任何本地解析。
+
 ### 如果 python 命令本身不存在
 
 脚本要靠 Python 才能启动。如果执行时报 `command not found`、

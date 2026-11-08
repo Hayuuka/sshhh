@@ -68,7 +68,24 @@ class UsageError(Exception):
     pass
 
 
+# 可以写在位置参数之后的长选项（布尔型）。
+# 短选项不在此列：远端命令里的 `-n` / `-f` 很常见，不能吞。
+_LONG_BOOL_FLAGS = frozenset({"sudo"})
+
+
 def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
+    """解析参数。
+
+    长选项（`--timeout` / `--stdin` / `--sudo`）写在主机名之前或之后都等价：
+
+        run --sudo hk "systemctl restart nginx"
+        run hk --sudo "systemctl restart nginx"
+
+    短选项仍只识别第一个位置参数之前的，避免把远端命令里的 `-n` 当成本地选项。
+    需要把 `--sudo` 这类字样原样交给远端时，用 `--` 显式分隔：
+
+        run hk -- "--sudo something"
+    """
     opts: dict = {}
     pos: list[str] = []
     i = 0
@@ -77,16 +94,25 @@ def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
         if token == "--":
             pos.extend(argv[i + 1:])
             break
-        if token.startswith("--") and not pos:
-            name = token[2:]
-            if "=" in name:
-                k, v = name.split("=", 1)
-                opts[k] = v
-            elif name in value_flags:
-                i += 1
-                if i >= len(argv):
-                    raise UsageError(f"--{name} 需要一个值")
-                opts[name] = argv[i]
+        if token.startswith("--") and len(token) > 2:
+            name, sep, inline = token[2:].partition("=")
+            if name in value_flags:
+                if sep:
+                    opts[name] = inline
+                else:
+                    i += 1
+                    if i >= len(argv):
+                        raise UsageError(f"--{name} 需要一个值")
+                    opts[name] = argv[i]
+            elif name in _LONG_BOOL_FLAGS:
+                if sep:
+                    raise UsageError(f"--{name} 不接受值")
+                opts[name] = True
+            elif pos:
+                # 位置参数之后的未知长选项属于远端命令，原样保留
+                pos.append(token)
+            elif sep:
+                opts[name] = inline
             else:
                 opts[name] = True
         elif token.startswith("-") and len(token) > 1 and not pos:

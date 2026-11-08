@@ -166,10 +166,38 @@ def _tail(data: bytes | None, lines: int = 3, limit: int = 240) -> str:
 
 
 def _reexec(executable: Path) -> None:
-    """用目标解释器重新执行本脚本。"""
-    os.environ[_BOOT_FLAG] = "1"
+    """用目标解释器重新执行本脚本。
+
+    两个平台必须分开处理，因为 os.execv 的语义完全不同：
+
+    POSIX：原语级「原地换身」，进程号不变、文件描述符不变、父进程不变，
+    调用方一直在等这个进程，输出顺序天然正确。保持 os.execv。
+
+    Windows：CPython 是模拟实现 —— spawn 一个子进程后父进程立即退出，
+    且不等待。宿主看到命令结束时子进程还没写出 stdout，于是
+      * 输出丢失（宿主已读完捕获，子进程才写）
+      * 输出错位一轮（写进了下一次调用的捕获）
+    这两种都是 exit 0 + 空输出，agent 无从判断，比报错更危险。
+    所以 Windows 改为前台等待子进程，再透传退出码。
+
+    另外 Windows 的 os.execv 不做参数引号处理（`"df -h"` 会被拆成两个），
+    这里传 list 给 subprocess，由 list2cmdline 负责引用，顺带修掉。
+    """
     argv = [str(executable), str(_ENTRY), *sys.argv[1:]]
-    os.execv(str(executable), argv)
+
+    if os.name != "nt":
+        os.environ[_BOOT_FLAG] = "1"
+        os.execv(str(executable), argv)
+        return
+
+    env = dict(os.environ)
+    env[_BOOT_FLAG] = "1"
+    try:
+        proc = subprocess.run(argv, env=env)
+    except KeyboardInterrupt:
+        # 子进程同在一个控制台，也会收到 Ctrl+C，等它自己收尾即可
+        sys.exit(130)
+    sys.exit(proc.returncode)
 
 
 def ensure(argv: list[str] | None = None) -> None:

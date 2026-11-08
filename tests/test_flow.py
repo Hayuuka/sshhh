@@ -504,6 +504,41 @@ def main() -> int:
         else:
             check("非 Windows 跳过读行测试", True)
 
+        print("\n== 参数解析：长选项位置 ==")
+        import sshhh as _cli
+
+        vf = {"timeout", "stdin"}
+
+        o, p = _cli._parse(["hk", "--sudo", "systemctl restart nginx"], vf)
+        check("--sudo 写在主机之后生效", o.get("sudo") is True, str(o))
+        check("--sudo 不会被拼进命令", p == ["hk", "systemctl restart nginx"], str(p))
+
+        o, p = _cli._parse(["--sudo", "hk", "cmd"], vf)
+        check("--sudo 写在主机之前也生效", o.get("sudo") is True, str(o))
+
+        o, p = _cli._parse(["hk", "--timeout", "600", "make build"], vf)
+        check("--timeout 写在主机之后生效", o.get("timeout") == "600", str(o))
+        check("--timeout 的值不被拼进命令", p == ["hk", "make build"], str(p))
+
+        o, p = _cli._parse(["hk", "--timeout=600", "make"], vf)
+        check("--timeout=600 内联写法", o.get("timeout") == "600", str(o))
+
+        o, p = _cli._parse(["hk", "--", "--sudo systemctl restart nginx"], vf)
+        check("-- 之后原样传给远端", o == {} and p[1] == "--sudo systemctl restart nginx", str(p))
+
+        o, p = _cli._parse(["hk", "tail -n 100 /var/log/x.log"], vf)
+        check("远端命令里的短选项不被吞", o == {} and p[1] == "tail -n 100 /var/log/x.log", str(p))
+
+        o, p = _cli._parse(["hk", "--weird-flag", "x"], vf)
+        check("主机之后的未知长选项归远端", o == {} and p == ["hk", "--weird-flag", "x"], str(p))
+
+        try:
+            _cli._parse(["hk", "--sudo=1", "cmd"], vf)
+        except _cli.UsageError:
+            check("--sudo 带值被拒绝", True)
+        else:
+            check("--sudo 带值被拒绝", False, "没有报错")
+
     finally:
         stop.set()
         time.sleep(0.2)
