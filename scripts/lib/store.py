@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -20,7 +21,64 @@ HEADER = """\
 
 """
 
-_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+# TOML 裸键只允许 A-Za-z0-9_-；中文、空格、点号等一律要用带引号的键
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_HEADER_RE = re.compile(r"^(\s*)\[([^\[\]]+)\](\s*)$")
+
+
+def _key(name: str) -> str:
+    """把主机名写成 TOML 键：合法的用裸键，其余套双引号。
+
+    json 的双引号转义规则（\\" \\\\ \\n \\uXXXX）恰好是 TOML 基本字符串
+    的子集，所以直接复用它，省得自己处理控制字符。
+    """
+    return name if _BARE_KEY_RE.match(name) else json.dumps(name, ensure_ascii=False)
+
+
+def _section_path(line: str) -> list[str] | None:
+    """解析 `[hosts."名字".policy]` 这类段头的键路径。
+
+    交给 tomllib 解析，引号、转义、点号都由它兜住；不是合法段头则返回 None。
+    """
+    stripped = line.strip()
+    if not stripped.startswith("[") or stripped.startswith("[["):
+        return None
+    try:
+        node = tomllib.loads(stripped)
+    except tomllib.TOMLDecodeError:
+        return None
+    path: list[str] = []
+    while isinstance(node, dict) and len(node) == 1:
+        key = next(iter(node))
+        path.append(key)
+        node = node[key]
+    if not isinstance(node, dict) or node:
+        return None
+    return path or None
+
+
+def _heal_legacy(text: str) -> str:
+    """把历史上写坏的裸键段头补上引号：`[hosts.李家豪LJH]` → `[hosts."李家豪LJH"]`。
+
+    只改动整行解析不了的段头，正常文件原样返回，可安全地反复调用。
+    """
+    lines = text.splitlines()
+    changed = False
+    for idx, line in enumerate(lines):
+        if _section_path(line) is not None:
+            continue
+        m = _HEADER_RE.match(line)
+        if not m:
+            continue
+        parts = [_key(p.strip()) for p in m.group(2).split(".")]
+        fixed = f"{m.group(1)}[{'.'.join(parts)}]"
+        if _section_path(fixed) is None:
+            continue
+        lines[idx] = fixed
+        changed = True
+    if not changed:
+        return text
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
 
 class StoreError(Exception):
@@ -75,11 +133,18 @@ def load() -> dict[str, Host]:
     if not path.exists():
         return {}
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        raise StoreError(f"hosts.toml 解析失败：{exc}") from None
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise StoreError(f"hosts.toml 读取失败：{exc}") from None
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        # 旧版本把中文别名写成了裸键，整份清单会解析不了。
+        # 先按老格式修一遍再试，这样升级后不必手工改文件。
+        try:
+            raw = tomllib.loads(_heal_legacy(text))
+        except tomllib.TOMLDecodeError:
+            raise StoreError(f"hosts.toml 解析失败：{exc}") from None
 
     hosts: dict[str, Host] = {}
     for name, item in (raw.get("hosts") or {}).items():
@@ -109,15 +174,14 @@ def get(name: str) -> Host | None:
 
 
 def _section_index(text: str, name: str) -> tuple[int, int] | None:
-    """返回 [hosts.name] 段的 (起始行, 结束行)。"""
+    """返回 [hosts.<name>] 段的 (起始行, 结束行)。"""
     lines = text.splitlines()
     start = None
     for idx, line in enumerate(lines):
-        m = _SECTION_RE.match(line)
-        if not m:
+        path = _section_path(line)
+        if path is None:
             continue
-        parts = [p.strip() for p in m.group(1).split(".")]
-        if len(parts) >= 2 and parts[0] == "hosts" and parts[1] == name:
+        if len(path) >= 2 and path[0] == "hosts" and path[1] == name:
             if start is None:
                 start = idx
         elif start is not None:
@@ -131,9 +195,9 @@ def upsert_host(host: Host) -> None:
     """新增或更新一台主机（保留文件中的其它内容与注释）。"""
     path = paths.hosts_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = path.read_text(encoding="utf-8") if path.exists() else HEADER
+    text = _heal_legacy(path.read_text(encoding="utf-8")) if path.exists() else HEADER
 
-    block = [f"[hosts.{host.name}]"]
+    block = [f"[hosts.{_key(host.name)}]"]
     if host.description:
         block.append(f'description = "{_esc(host.description)}"')
     block.append(f'host = "{_esc(host.host)}"')
@@ -153,8 +217,7 @@ def upsert_host(host: Host) -> None:
         # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
         section_end = start + 1
         while section_end < end:
-            m = _SECTION_RE.match(lines[section_end])
-            if m:
+            if _section_path(lines[section_end]) is not None:
                 break
             section_end += 1
         new_lines = lines[:start] + block + [""] + lines[section_end:]
@@ -167,7 +230,7 @@ def remove_host(name: str) -> bool:
     path = paths.hosts_file()
     if not path.exists():
         return False
-    text = path.read_text(encoding="utf-8")
+    text = _heal_legacy(path.read_text(encoding="utf-8"))
     span = _section_index(text, name)
     if span is None:
         return False
@@ -183,19 +246,17 @@ def set_policy(name: str, allow: list[str], deny: list[str]) -> None:
     path = paths.hosts_file()
     if not path.exists():
         raise StoreError(f"主机 {name} 不存在")
-    text = path.read_text(encoding="utf-8")
+    text = _heal_legacy(path.read_text(encoding="utf-8"))
     lines = text.splitlines()
 
     # 定位已有的 policy 段并删除
     start = None
     end = None
     for idx, line in enumerate(lines):
-        m = _SECTION_RE.match(line)
-        if not m:
+        path_ = _section_path(line)
+        if path_ is None:
             continue
-        parts = [p.strip() for p in m.group(1).split(".")]
-        is_policy = (len(parts) == 3 and parts[0] == "hosts"
-                     and parts[1] == name and parts[2] == "policy")
+        is_policy = (path_ == ["hosts", name, "policy"])
         if is_policy and start is None:
             start = idx
         elif start is not None:
@@ -206,7 +267,7 @@ def set_policy(name: str, allow: list[str], deny: list[str]) -> None:
         text = "\n".join(lines).rstrip("\n") + "\n"
 
     if allow or deny:
-        block = [f"[hosts.{name}.policy]"]
+        block = [f"[hosts.{_key(name)}.policy]"]
         if allow:
             block.append("allow = [" + ", ".join(_q(a) for a in allow) + "]")
         if deny:
@@ -219,8 +280,14 @@ def set_policy(name: str, allow: list[str], deny: list[str]) -> None:
 
 
 def _q(value: str) -> str:
-    """TOML 单引号字面量，正则里的反斜杠无需转义。"""
-    return "'" + value.replace("'", "''") + "'"
+    """TOML 单引号字面量，正则里的反斜杠无需转义。
+
+    字面量字符串里没有任何办法表示单引号（写两个是无效语法，会让整份清单解析失败），
+    这种情况退回双引号基本字符串。
+    """
+    if "'" in value:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return "'" + value + "'"
 
 
 def _esc(value: str) -> str:
