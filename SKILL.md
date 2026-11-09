@@ -48,6 +48,10 @@ python scripts/sshhh.py run prod "df -h"
 | `setup` | 只安装运行环境，不连服务器 |
 | `migrate <旧目录>` | 从旧版 sshx 项目迁移主机和密码 |
 
+`put` / `get` 和 `run` 受同一套主机策略约束：远端路径不在 `allow_put` /
+`allow_get` 里同样会被拒绝（退出码 1）。被拒绝时的正确做法是告诉用户需要
+放行哪个路径，而不是换一条路径或换一种传输方式重试。
+
 状态码与善后命令的对应关系：
 
 | 收到 | 先试 |
@@ -193,6 +197,7 @@ SSHHH_STATUS: <状态名>
    需要看某服务配置时先问用户。
 
 5. **遇到「命令被策略拒绝」不要绕路**（换写法、编码、`bash -c` 嵌套），
+   也不要改用 `put` / `get` 去达成同样的目的 —— 文件通道同样有策略，
    直接告诉用户需要什么权限。
 
 6. **配置窗口需要用户本人操作**，你无法也不需要代替他输入。
@@ -226,6 +231,10 @@ python scripts/sshhh.py put prod ./nginx.conf /etc/nginx/nginx.conf
 python scripts/sshhh.py status      # 数据目录、密码库、主机列表
 python scripts/sshhh.py audit -n 20 # 最近的调用记录
 ```
+
+审计覆盖 `run` / `put` / `get` / `test` / `setpass` / `unlock` / `migrate`，
+以及每一次成功解密（action 为 `vault.open`）。被策略拒绝的动作记成
+`run.denied` / `transfer.denied`。
 
 常见错误：
 

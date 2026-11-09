@@ -97,17 +97,33 @@ SSHHH_HINT: 请告诉用户在自己的终端里执行：python "..." config
 首次运行自动在 `~/.sshhh/venv` 建独立虚拟环境并安装依赖，
 之后所有调用都复用它。系统的 Python 环境一动不动。
 
-### 6. 可以限制 AI 能跑什么命令
+### 6. 可以限制 AI 能跑什么命令、能碰哪些文件
 
-在主机配置里加白名单或黑名单（正则，整条命令匹配）：
+在主机配置里加规则（正则，命令匹配整条命令，文件规则匹配**远端路径**）：
 
 ```toml
 [hosts.prod.policy]
-allow = ['^df -h$', '^systemctl status ', '^docker ps']
-deny  = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status ', '^docker ps']
+deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
+allow_get = ['^/var/log/']
+deny_put  = ['^/etc/']
 ```
 
-白名单模式下一旦不匹配就拒绝，AI 想绕过会在审计日志里留痕。
+| 字段 | 管什么 | 匹配对象 |
+|---|---|---|
+| `allow` / `deny` | `run` 执行的命令 | 整条命令 |
+| `allow_put` / `deny_put` | `put` 上传 | 远端**目标**路径 |
+| `allow_get` / `deny_get` | `get` 下载 | 远端**源**路径 |
+
+规则：
+
+- 白名单非空时，不匹配就拒绝；`deny` 优先于 `allow`。
+- **配了 `allow` 命令白名单的主机，文件通道默认关闭**，必须显式写
+  `allow_put` / `allow_get` 才能传文件 —— 否则「只允许 `df -h`」的机器
+  仍然能被 `get /etc/shadow` 掏空。
+- 只配 `deny` 的主机，文件通道照常可用，除非路径命中 `deny_put` / `deny_get`。
+- 被拒绝时不会连接主机，退出码为 1，并在审计日志里留一条 `*.denied` 记录。
 
 ### 7. 输出自动脱敏
 
@@ -116,8 +132,17 @@ deny  = ['^rm -rf', 'shutdown', 'mkfs']
 
 ### 8. 审计日志
 
-每次连接都记一条 JSONL：时间、主机、命令、退出码、耗时。
-命令写入前已经过脱敏，日志里不会有密码。
+所有触达凭据或远端的动作都会记一条 JSONL。命令、路径写入前已脱敏，日志里不会有密码。
+
+| action | 记什么 |
+|---|---|
+| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时 |
+| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、结果 |
+| `test` | 探测了哪台机器、结果如何 |
+| `setpass` | 哪台主机的密码被改动（不含密码本身） |
+| `unlock` | 解锁事件，含自动解锁失败的尝试 |
+| `migrate` | 凭据库迁移的来源与条数 |
+| `vault.open` | 每一次成功解密：调用方 pid、命令行、工作目录 |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -172,7 +197,7 @@ python scripts/sshhh.py config --here
 
 | 路径 | 内容 |
 |---|---|
-| `~/.sshhh/vault.enc` | 加密后的密码（AES-GCM + scrypt）。没有主密码打不开 |
+| `~/.sshhh/vault.enc` | 加密后的密码（AES-GCM + scrypt）。没有主密码打不开，**头部也不含条目名** |
 | `~/.sshhh/hosts.toml` | 主机、端口、用户名、命令策略。**没有 password 字段** |
 | `~/.sshhh/known_hosts` | 主机指纹（TOFU） |
 | `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
@@ -250,13 +275,15 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 
 **防不住什么**（如实说明）
 
-拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密。
+拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
+`python -c "from lib import vault; vault.open_vault()"` 一行就够。
 这是操作系统级别的边界，任何本地工具都绕不过去。
 
 想真正做到密不透风，只能把主密码留在脑子里、每次手动输入 —— 但那样 AI 就没法自动跑了。
 
 实际收益是：**AI 想偷密码，必须主动写代码去调内部接口**，而不是读一下文件就拿到。
-这种行为会留在审计日志里，也更容易被你发现。
+每次成功解密都会往审计日志里写一条 `vault.open`（调用方 pid、命令行、工作目录），
+所以这条路**拦不住，但会留痕**，事后能查到，也更容易被你发现。
 
 ## 常见问题
 

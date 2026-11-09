@@ -489,7 +489,7 @@ def cmd_list(argv: list[str]) -> int:
 
 
 def cmd_test(argv: list[str]) -> int:
-    from lib import protocol, store, vault
+    from lib import audit, protocol, store, vault
     from lib.transport import Client, TransportError
 
     _, pos = _parse(argv, set())
@@ -507,18 +507,26 @@ def cmd_test(argv: list[str]) -> int:
         return protocol.emit(protocol.EXIT_LOCKED, str(exc))
     password = v.get(name)
 
-    _say(f"连接 {name} ({host.user}@{host.host}:{host.port}) ...")
+    target = f"{host.user}@{host.host}:{host.port}"
+    _say(f"连接 {name} ({target}) ...")
     client = Client(host, password, store.Settings())
     try:
         with client:
             r = client.run("echo __SSHHH_OK__; uname -s; hostname", timeout=20)
     except TransportError as exc:
+        audit.write("test", host=name, user=host.user, command=target,
+                    ok=False, error=str(exc))
         _warn(f"[sshhh] 连接失败：{exc}")
         return 4
 
     if "__SSHHH_OK__" not in r.stdout:
-        _warn("[sshhh] 连接建立但测试命令未返回预期输出")
+        error = "连接建立但测试命令未返回预期输出"
+        audit.write("test", host=name, user=host.user, command=target,
+                    ok=False, error=error, duration_ms=r.duration_ms)
+        _warn(f"[sshhh] {error}")
         return 4
+    audit.write("test", host=name, user=host.user, command=target,
+                duration_ms=r.duration_ms)
     _say(f"[ok] 连接成功（{r.duration_ms} ms）")
     for line in r.stdout.splitlines():
         if line and line != "__SSHHH_OK__":
@@ -527,7 +535,7 @@ def cmd_test(argv: list[str]) -> int:
 
 
 def _transfer(argv: list[str], direction: str) -> int:
-    from lib import protocol, store, vault
+    from lib import audit, protocol, store, vault
     from lib.transport import Client, TransportError
 
     _, pos = _parse(argv, set())
@@ -543,23 +551,43 @@ def _transfer(argv: list[str], direction: str) -> int:
     except vault.VaultError as exc:
         return protocol.emit(protocol.EXIT_LOCKED, str(exc))
 
+    local = os.path.expanduser(a if direction == "put" else b)
+    remote = b if direction == "put" else a
+    # 审计里按数据流向写：put 是「本地 → 远端」，get 反过来，一眼能看出往哪走
+    summary = (f"put {local} -> {remote}" if direction == "put"
+               else f"get {remote} -> {local}")
+
+    # 文件通道必须和 run 一样过策略。只配了命令白名单的主机，默认连传文件都不许：
+    # 否则「只允许 df -h」的机器照样能被 get /etc/shadow 掏空。
+    reason = host.policy.check_transfer(direction, remote)
+    if reason:
+        audit.write("transfer.denied", host=name, user=host.user,
+                    command=summary, ok=False, error=reason)
+        _warn(f"[sshhh] 文件传输被策略拒绝：{reason}")
+        return 1
+
     client = Client(host, v.get(name), store.Settings())
     try:
         with client:
             sftp = client._ssh.open_sftp()  # noqa: SLF001
             try:
                 if direction == "put":
-                    sftp.put(os.path.expanduser(a), b)
+                    sftp.put(local, remote)
                 else:
-                    sftp.get(a, os.path.expanduser(b))
+                    sftp.get(remote, local)
             finally:
                 sftp.close()
     except TransportError as exc:
+        audit.write(f"transfer.{direction}", host=name, user=host.user,
+                    command=summary, ok=False, error=str(exc))
         _warn(f"[sshhh] {exc}")
         return 4
     except OSError as exc:
+        audit.write(f"transfer.{direction}", host=name, user=host.user,
+                    command=summary, ok=False, error=str(exc))
         _warn(f"[sshhh] 文件传输失败：{exc}")
         return 4
+    audit.write(f"transfer.{direction}", host=name, user=host.user, command=summary)
     _say(f"[ok] {direction} 完成：{a} -> {b}")
     return 0
 
@@ -607,7 +635,7 @@ def cmd_config(argv: list[str]) -> int:
 
 
 def cmd_setpass(argv: list[str]) -> int:
-    from lib import store, vault
+    from lib import audit, store, vault
 
     _, pos = _parse(argv, set())
     if not pos:
@@ -623,32 +651,47 @@ def cmd_setpass(argv: list[str]) -> int:
     except vault.VaultError:
         status, detail = _launch("unlock", {})
         if status != "ok":
-            return _setup_failed(status, detail, "unlock")
+            code = _setup_failed(status, detail, "unlock")
+            audit.write("setpass", host=name, user=host.user, ok=False,
+                        error=f"密码库未解锁（{status}），密码未修改")
+            return code
 
     status, detail = _launch("add_host", {"host_name": name, "reset_password": True})
     if status != "ok":
-        return _setup_failed(status, detail, "config")
+        code = _setup_failed(status, detail, "config")
+        audit.write("setpass", host=name, user=host.user, ok=False,
+                    error=str(detail.get("error") or status))
+        return code
+    audit.write("setpass", host=name, user=host.user)
     _say(f"[ok] {name} 的密码已更新")
     return 0
 
 
 def cmd_unlock(argv: list[str]) -> int:
-    from lib import vault
+    from lib import audit, vault
 
     _parse(argv, set())
     if not paths.vault_file().exists():
+        audit.write("unlock", ok=False, error="尚未初始化")
         _warn("[sshhh] 还没有初始化，请先执行 config")
         return 3
     try:
         vault.open_vault()
+    except vault.VaultError as exc:
+        # 自动解锁失败本身就是安全相关事件，先记一笔再让用户输入
+        audit.write("unlock", ok=False, command="钥匙串自动解锁失败", error=str(exc))
+    else:
+        audit.write("unlock", ok=True, command="钥匙串自动解锁")
         _say("[ok] 密码库当前可自动解锁，无需操作")
         return 0
-    except vault.VaultError:
-        pass
 
     status, detail = _launch("unlock", {})
     if status != "ok":
-        return _setup_failed(status, detail, "unlock")
+        code = _setup_failed(status, detail, "unlock")
+        audit.write("unlock", ok=False, command="等待用户输入",
+                    error=str(detail.get("error") or status))
+        return code
+    audit.write("unlock", ok=True, command="用户输入")
     _say("[ok] 已解锁")
     return 0
 
@@ -696,6 +739,9 @@ def cmd_audit(argv: list[str]) -> int:
         flag = "ok " if rec.get("ok") else "ERR"
         ts = str(rec.get("ts", ""))[5:19].replace("T", " ")
         cmd = rec.get("command", "")
+        if len(cmd) > 80:
+            # vault.open 的命令行摘要很长，展示时收一收；完整内容在 audit.log 里
+            cmd = cmd[:80] + "…"
         extra = f"  « {cmd}" if cmd else ""
         err = f"  ({rec['error']})" if rec.get("error") else ""
         _say(f"{flag} {ts}  {rec.get('action')} {rec.get('host')}{extra}{err}")
@@ -706,7 +752,7 @@ def cmd_migrate(argv: list[str]) -> int:
     """从旧版 sshx 项目（agentssh）迁移主机与密码。"""
     import tomllib
 
-    from lib import store, vault
+    from lib import audit, store, vault
 
     _, pos = _parse(argv, set())
     if not pos:
@@ -717,9 +763,13 @@ def cmd_migrate(argv: list[str]) -> int:
     old_cfg = old_dir / "sshx.toml"
 
     if not old_vault_path.exists():
+        audit.write("migrate", ok=False, command=str(old_dir),
+                    error="找不到旧密码库")
         _warn(f"[sshhh] 找不到旧密码库：{old_vault_path}")
         return 3
     if paths.vault_file().exists():
+        audit.write("migrate", ok=False, command=str(old_dir),
+                    error="目标位置已有密码库")
         _warn(f"[sshhh] 目标位置已有密码库：{paths.vault_file()}")
         _warn("[sshhh] 请先备份并移走它，再执行迁移")
         return 3
@@ -735,6 +785,8 @@ def cmd_migrate(argv: list[str]) -> int:
     try:
         old_v = vault.Vault.open(old_vault_path, master=master, allow_keyring=False)
     except vault.VaultError:
+        audit.write("migrate", ok=False, command=str(old_dir),
+                    error="旧主密码错误，未做任何修改")
         _warn("[sshhh] 主密码错误，无法读取旧密码库")
         return 3
 
@@ -764,8 +816,14 @@ def cmd_migrate(argv: list[str]) -> int:
             pol = item.get("policy") or {}
             allow = [str(x) for x in (pol.get("allow") or [])]
             deny = [str(x) for x in (pol.get("deny") or [])]
-            if allow or deny:
-                store.set_policy(name, allow, deny)
+            allow_put = [str(x) for x in (pol.get("allow_put") or [])]
+            allow_get = [str(x) for x in (pol.get("allow_get") or [])]
+            deny_put = [str(x) for x in (pol.get("deny_put") or [])]
+            deny_get = [str(x) for x in (pol.get("deny_get") or [])]
+            if allow or deny or allow_put or allow_get or deny_put or deny_get:
+                store.set_policy(name, allow, deny, allow_put=allow_put,
+                                 allow_get=allow_get, deny_put=deny_put,
+                                 deny_get=deny_get)
             migrated.append(name)
 
     if vault.keyring_save(paths.vault_file(), master):
@@ -773,6 +831,8 @@ def cmd_migrate(argv: list[str]) -> int:
     else:
         _warn("[!] 凭据管理器不可用，之后需设置环境变量 SSHHH_MASTER")
 
+    audit.write("migrate", command=f"{old_dir}（{len(new_v.names())} 条密码 / "
+                                   f"{len(migrated)} 台主机）")
     _say(f"[ok] 已迁移 {len(new_v.names())} 条密码、{len(migrated)} 台主机"
          f"（{', '.join(migrated) or '无'}）")
     _say(f"     新数据目录：{paths.data_dir()}")

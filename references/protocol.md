@@ -238,3 +238,25 @@ agent 调用时 ─────────────────┘
 | `venv/` | 共享运行时（首次调用时创建，约 35 MB） |
 
 环境变量 `SSHHH_DATA_DIR` 可覆盖此目录，**仅供测试隔离使用**。
+
+## 策略与审计的覆盖范围
+
+策略（`[hosts.<名称>.policy]`）分两组，互不代替：
+
+| 字段 | 管什么 | 匹配对象 |
+|------|--------|----------|
+| `allow` / `deny` | `run` | 整条命令 |
+| `allow_put` / `deny_put` | `put` | 远端目标路径 |
+| `allow_get` / `deny_get` | `get` | 远端源路径 |
+
+- 白名单非空时不匹配即拒绝；`deny` 优先。
+- 配了 `allow` 命令白名单的主机，文件通道默认关闭（需显式 `allow_put` / `allow_get`）。
+- 拒绝发生在连接之前：不建连、退出码 1、写 `run.denied` / `transfer.denied`。
+
+审计（`audit.log`）覆盖所有触达凭据或远端的动作，`action` 取值：
+
+`run`、`run.denied`、`transfer.put`、`transfer.get`、`transfer.denied`、
+`test`、`setpass`、`unlock`、`migrate`、`vault.open`。
+
+`vault.open` 记录的是「谁解密了密码库」：pid、调用方命令行、工作目录。
+它拦不住同用户进程直接调用 `lib.vault`（操作系统级边界），但能让这条路留痕。

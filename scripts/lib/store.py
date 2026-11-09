@@ -87,8 +87,20 @@ class StoreError(Exception):
 
 @dataclass
 class Policy:
+    """主机策略。
+
+    `allow` / `deny` 管 `run` 的命令；`allow_put` / `deny_put` 等管文件
+    通道，匹配的是**远端路径**（put 看目标、get 看源）。命令策略和文件策略
+    分开配置，是因为它们拦的是完全不同的东西：一条白名单管不住
+    `get /etc/shadow`。
+    """
+
     allow: list[str] = field(default_factory=list)
     deny: list[str] = field(default_factory=list)
+    allow_put: list[str] = field(default_factory=list)
+    allow_get: list[str] = field(default_factory=list)
+    deny_put: list[str] = field(default_factory=list)
+    deny_get: list[str] = field(default_factory=list)
 
     def check(self, command: str) -> str | None:
         for pat in self.deny:
@@ -101,9 +113,38 @@ class Policy:
             return "未命中任何允许规则（该主机处于白名单模式）"
         return None
 
+    def check_transfer(self, direction: str, remote_path: str) -> str | None:
+        """校验 put / get 的远端路径。返回 None 表示放行。
+
+        默认关闭：主机一旦配了命令白名单（`allow`），文件通道就必须
+        显式用 `allow_put` / `allow_get` 打开。否则「只允许 df -h 的机器」
+        仍然可以 `get /etc/shadow` —— 白名单等于没配。
+        """
+        is_put = direction == "put"
+        allow = self.allow_put if is_put else self.allow_get
+        deny = self.deny_put if is_put else self.deny_get
+        label = "上传" if is_put else "下载"
+
+        for pat in deny:
+            if re.search(pat, remote_path):
+                return f"{label}命中禁止规则 /{pat}/"
+        if allow:
+            for pat in allow:
+                if re.search(pat, remote_path):
+                    return None
+            return f"远端路径未命中任何允许规则（{label}处于白名单模式）"
+        if self.allow:
+            key = "allow_put" if is_put else "allow_get"
+            return f"该主机启用了命令白名单，{label}默认关闭（需配置 {key}）"
+        return None
+
     @property
     def active(self) -> bool:
-        return bool(self.allow or self.deny)
+        return bool(
+            self.allow or self.deny
+            or self.allow_put or self.allow_get
+            or self.deny_put or self.deny_get
+        )
 
 
 @dataclass
@@ -164,6 +205,10 @@ def load() -> dict[str, Host]:
             policy=Policy(
                 allow=[str(x) for x in (pol.get("allow") or [])],
                 deny=[str(x) for x in (pol.get("deny") or [])],
+                allow_put=[str(x) for x in (pol.get("allow_put") or [])],
+                allow_get=[str(x) for x in (pol.get("allow_get") or [])],
+                deny_put=[str(x) for x in (pol.get("deny_put") or [])],
+                deny_get=[str(x) for x in (pol.get("deny_get") or [])],
             ),
         )
     return hosts
@@ -241,8 +286,15 @@ def remove_host(name: str) -> bool:
     return True
 
 
-def set_policy(name: str, allow: list[str], deny: list[str]) -> None:
-    """覆盖写入 [hosts.<name>.policy] 段；两个列表都为空则删除该段。"""
+def set_policy(name: str, allow: list[str], deny: list[str], *,
+               allow_put: list[str] | None = None,
+               allow_get: list[str] | None = None,
+               deny_put: list[str] | None = None,
+               deny_get: list[str] | None = None) -> None:
+    """覆盖写入 [hosts.<name>.policy] 段；全部为空则删除该段。
+
+    文件通道的四条规则是关键字参数，老调用方（只传 allow / deny）不受影响。
+    """
     path = paths.hosts_file()
     if not path.exists():
         raise StoreError(f"主机 {name} 不存在")
@@ -266,12 +318,20 @@ def set_policy(name: str, allow: list[str], deny: list[str]) -> None:
         del lines[start:(end if end is not None else len(lines))]
         text = "\n".join(lines).rstrip("\n") + "\n"
 
-    if allow or deny:
-        block = [f"[hosts.{_key(name)}.policy]"]
-        if allow:
-            block.append("allow = [" + ", ".join(_q(a) for a in allow) + "]")
-        if deny:
-            block.append("deny = [" + ", ".join(_q(d) for d in deny) + "]")
+    rules = [
+        ("allow", allow),
+        ("deny", deny),
+        ("allow_put", allow_put or []),
+        ("allow_get", allow_get or []),
+        ("deny_put", deny_put or []),
+        ("deny_get", deny_get or []),
+    ]
+    block = [f"[hosts.{_key(name)}.policy]"]
+    for key, values in rules:
+        if values:
+            block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
+
+    if len(block) > 1:
         path.write_text(
             text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n", encoding="utf-8"
         )

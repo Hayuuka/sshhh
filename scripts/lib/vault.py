@@ -11,6 +11,7 @@ import json
 import os
 import secrets as _secrets
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -115,6 +116,33 @@ def keyring_forget(vault_path: Path, service: str | None = None) -> None:
 # --------------------------------------------------------------------------
 
 
+def _audit_open(path: Path, master: str | None,
+                values: Iterable[object] = ()) -> None:
+    """记录一次成功的解密。
+
+    同用户的进程可以绕过 sshhh.py 直接调本模块，这是操作系统级边界，
+    代码层面堵不住。但可以让它留下痕迹：pid、工作目录、命令行写进
+    audit.log，事后能查到「是谁在什么时候解开了密码库」。
+
+    命令行里如果夹带了主密码或库里已有的密码，一律先替换成 [REDACTED]：
+    审计日志本身不能成为新的泄漏点。
+    """
+    try:
+        from . import audit
+
+        text = (f"pid={os.getpid()} exe={os.path.basename(sys.executable)} "
+                f"cwd={os.getcwd()} argv={' '.join(sys.argv)}")
+        if master:
+            text = text.replace(master, "[REDACTED]")
+        for value in values:
+            if isinstance(value, str) and len(value) >= 4:
+                text = text.replace(value, "[REDACTED]")
+        audit.write("vault.open", command=text)
+    except Exception:  # noqa: BLE001
+        # 审计写不进去也不能让解密失败
+        pass
+
+
 class Vault:
     def __init__(self, path: Path):
         self.path = path
@@ -179,9 +207,10 @@ class Vault:
             try:
                 v._key = _derive(cand, salt, n, r, p)
                 v._data = v._decrypt()
-                return v
             except InvalidTag:
                 continue
+            _audit_open(path, cand, v._data.values())
+            return v
 
         raise VaultError("主密码错误或钥匙串中没有可用的主密码")
 
@@ -200,7 +229,9 @@ class Vault:
         plain = json.dumps(self._data, ensure_ascii=False).encode("utf-8")
         ct = AESGCM(self._key).encrypt(nonce, plain, _AAD)
         out = dict(self._header)
-        out["entries"] = sorted(self._data)
+        # 头部不写条目名：谁能拷走 vault.enc，谁就能枚举「这台机器上有哪些凭据」
+        # （值解不开，清单却一目了然）。旧版本写过这个字段，顺手清掉。
+        out.pop("entries", None)
         out["nonce"] = _b64e(nonce)
         out["ct"] = _b64e(ct)
 

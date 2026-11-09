@@ -95,18 +95,36 @@ No guessing, no trial and error.
 First run creates an isolated venv at `~/.sshhh/venv` and installs dependencies
 there. Every later call reuses it. Your system Python stays untouched.
 
-### 6. Restrict what the agent can run
+### 6. Restrict what the agent can run — and which files it can touch
 
-Add allow or deny rules per host (regex, matched against the whole command):
+Add rules per host. Command rules are regexes matched against the whole command;
+file rules are matched against the **remote path**:
 
 ```toml
 [hosts.prod.policy]
-allow = ['^df -h$', '^systemctl status ', '^docker ps']
-deny  = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status ', '^docker ps']
+deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
+allow_get = ['^/var/log/']
+deny_put  = ['^/etc/']
 ```
 
-In allow-list mode, anything unmatched is refused. An attempt to bypass leaves a
-trace in the audit log.
+| Field | Governs | Matched against |
+|---|---|---|
+| `allow` / `deny` | commands run via `run` | the whole command |
+| `allow_put` / `deny_put` | uploads via `put` | the remote **destination** path |
+| `allow_get` / `deny_get` | downloads via `get` | the remote **source** path |
+
+Rules:
+
+- When an allow-list is present, anything unmatched is refused; `deny` wins over `allow`.
+- **A host with an `allow` command list has its file channel closed by default.**
+  You must add `allow_put` / `allow_get` explicitly — otherwise a box that only
+  permits `df -h` could still be emptied with `get /etc/shadow`.
+- Hosts with only `deny` rules keep file transfer working, unless the path
+  matches `deny_put` / `deny_get`.
+- A refusal happens before connecting, returns exit code 1, and writes a `*.denied`
+  audit record.
 
 ### 7. Automatic output redaction
 
@@ -115,9 +133,19 @@ config file — it is replaced with `[REDACTED]` before reaching the agent.
 
 ### 8. Audit log
 
-Every connection appends a JSONL record: timestamp, host, command, exit code,
-duration. Commands are redacted before being written, so the log never contains
+Every action that touches credentials or a remote host appends a JSONL record.
+Commands and paths are redacted before being written, so the log never contains
 a password.
+
+| action | Recorded |
+|---|---|
+| `run` / `run.denied` | command executed or refused, exit code, duration |
+| `transfer.put` / `transfer.get` / `transfer.denied` | direction, local and remote paths, result |
+| `test` | which machine was probed, and the result |
+| `setpass` | which host's password changed (never the password) |
+| `unlock` | unlock events, including failed automatic attempts |
+| `migrate` | source directory and record counts |
+| `vault.open` | every successful decryption: caller pid, command line, working directory |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -175,7 +203,7 @@ upgrading or reinstalling the skill never touches your configuration.
 
 | Path | Contents |
 |---|---|
-| `~/.sshhh/vault.enc` | Encrypted passwords (AES-GCM + scrypt). Useless without the master password |
+| `~/.sshhh/vault.enc` | Encrypted passwords (AES-GCM + scrypt). Useless without the master password, and **the header does not list entry names** |
 | `~/.sshhh/hosts.toml` | Host list, port, user, policy rules. **No password field** |
 | `~/.sshhh/known_hosts` | Host key fingerprints (TOFU) |
 | `~/.sshhh/audit.log` | JSONL audit trail, redacted |
@@ -253,15 +281,18 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 **What it does not protect against** (stated plainly)
 
 A program that already has your OS account privileges can call this project's
-Python API and decrypt the vault. That is an operating-system boundary; no local
-tool can cross it.
+Python API and decrypt the vault. One line of
+`python -c "from lib import vault; vault.open_vault()"` is enough. That is an
+operating-system boundary; no local tool can cross it.
 
 To be airtight you would keep the master password in your head and type it every
 time — but then the agent can't run unattended.
 
 The real improvement is this: **for the AI to steal the password, it has to
-actively write code against internal APIs** rather than just read a file. That
-behaviour leaves an audit trail, and is far easier for you to notice.
+actively write code against internal APIs** rather than just read a file. Every
+successful decryption appends a `vault.open` audit record (caller pid, command
+line, working directory), so that path **cannot be blocked, but it does leave a
+trail** you can inspect afterwards.
 
 ## FAQ
 

@@ -39,7 +39,7 @@ os.environ["SSHHH_DATA_DIR"] = str(_TMP)
 os.environ["SSHHH_MASTER"] = MASTER
 
 import sshhh as cli  # noqa: E402
-from lib import audit, console, paths, protocol, store, vault  # noqa: E402
+from lib import audit, console, paths, protocol, store, transport, vault  # noqa: E402
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -177,6 +177,52 @@ class MockConsole:
     @property
     def tasks(self) -> list[str]:
         return [t for t, _ in self.calls]
+
+
+class FakeSftp:
+    def __init__(self):
+        self.calls: list[tuple[str, str, str]] = []
+
+    def put(self, local, remote):
+        self.calls.append(("put", local, remote))
+
+    def get(self, remote, local):
+        self.calls.append(("get", remote, local))
+
+    def close(self):
+        pass
+
+
+class FakeSsh:
+    def __init__(self, sftp: FakeSftp):
+        self._sftp = sftp
+
+    def open_sftp(self) -> FakeSftp:
+        return self._sftp
+
+
+class FakeClient:
+    """替换 lib.transport.Client：只记录传输参数，不真连 SFTP。
+
+    迷你 SSH 服务端不实现 sftp 子系统，这里替换掉客户端才能验证
+    「策略放行之后确实按 put/get 的正确方向调用了传输」。
+    """
+
+    last: "FakeClient | None" = None
+
+    def __init__(self, host=None, password=None, settings=None, redactor=None):
+        self.sftp = FakeSftp()
+        FakeClient.last = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def _ssh(self) -> FakeSsh:  # noqa: SLF001 —— 对齐真实 Client 的内部结构
+        return FakeSsh(self.sftp)
 
 
 def run_cli(args: list[str]) -> tuple[int, str, str]:
@@ -356,6 +402,119 @@ def main() -> int:
         print("\n== 配置文件结构 ==")
         raw = paths.hosts_file().read_text(encoding="utf-8")
         check("hosts.toml 是合法 TOML", "password" not in raw, raw)
+
+        print("\n== 密码库头部 ==")
+        v_head = vault.open_vault()
+        v_head.set("entry-name-canary-7f3", "x")
+        raw_vault = paths.vault_file().read_text(encoding="utf-8")
+        check("vault.enc 不再写 entries 字段", '"entries"' not in raw_vault, raw_vault[:300])
+        check("vault.enc 头部不暴露条目名",
+              "entry-name-canary-7f3" not in raw_vault, raw_vault[:300])
+
+        # 老版本把条目名明文写在头部，读一次再写一次应该把它清掉
+        legacy = json.loads(raw_vault)
+        legacy["entries"] = ["legacy-leaked-name", HOST_NAME]
+        paths.vault_file().write_text(json.dumps(legacy), encoding="utf-8")
+        vault.open_vault().set("touch", "1")
+        raw_after = paths.vault_file().read_text(encoding="utf-8")
+        check("旧文件的 entries 在下次写入时被清除", '"entries"' not in raw_after, raw_after[:300])
+        check("遗留的条目名不再出现", "legacy-leaked-name" not in raw_after, raw_after[:300])
+
+        print("\n== 审计覆盖 ==")
+        reset_data()
+        v = vault.Vault.create(paths.vault_file(), MASTER)
+        v.set(HOST_NAME, SSH_PASSWORD)
+        store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1",
+                                     user=USER, port=port))
+        MockConsole().install()
+
+        code, _, err = run_cli(["test", HOST_NAME])
+        check("test 连通成功", code == 0, err)
+        code, _, err = run_cli(["unlock"])
+        check("unlock 无需操作时返回 0", code == 0, err)
+        code, _, err = run_cli(["setpass", HOST_NAME])
+        check("setpass 走配置窗口并成功", code == 0, err)
+
+        actions = [r.get("action") for r in audit.tail(50)]
+        for action in ("vault.open", "test", "unlock", "setpass"):
+            check(f"审计记录了 {action}", action in actions, str(actions))
+        check("审计仍不含密码",
+              SSH_PASSWORD not in paths.audit_file().read_text(encoding="utf-8"))
+
+        # 模拟「直接 import lib.vault 解密」：这条路拦不住，但必须留痕
+        saved_argv = sys.argv[:]
+        inline = f"from lib import vault; vault.open_vault()  # {MASTER} {SSH_PASSWORD}"
+        sys.argv = ["-c", inline]
+        try:
+            vault.open_vault()
+        finally:
+            sys.argv = saved_argv
+        opens = [r for r in audit.tail(5) if r.get("action") == "vault.open"]
+        check("直接调用 vault 也写 vault.open", bool(opens), str(audit.tail(5)))
+        last_open = opens[-1] if opens else {}
+        check("记录里有调用方 pid",
+              str(os.getpid()) in last_open.get("command", ""), str(opens))
+        check("记录里保留了命令行摘要",
+              "vault.open_vault()" in last_open.get("command", ""), str(last_open))
+        check("命令行里的主密码被脱敏",
+              MASTER not in json.dumps(last_open, ensure_ascii=False), str(last_open))
+        check("命令行里的密码被脱敏",
+              SSH_PASSWORD not in json.dumps(last_open, ensure_ascii=False), str(last_open))
+
+        print("\n== 文件通道受策略约束 ==")
+        reset_data()
+        v = vault.Vault.create(paths.vault_file(), MASTER)
+        v.set(HOST_NAME, SSH_PASSWORD)
+        store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1",
+                                     user=USER, port=port))
+        store.set_policy(HOST_NAME, ["^df -h$"], [])
+        MockConsole().install()
+
+        code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow")])
+        check("命令白名单主机的 get 默认被拒", code == 1, str(code))
+        check("提示文件传输被策略拒绝", "策略拒绝" in err, err)
+        check("拒绝发生在建连之前", not (_TMP / "shadow").exists())
+
+        code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/etc/rc.local"])
+        check("未放行的 put 同样被拒", code == 1, str(code))
+
+        actions = [r.get("action") for r in audit.tail(30)]
+        check("写了 transfer.denied 审计", "transfer.denied" in actions, str(actions))
+
+        # 显式放行后应真的调用传输（用假 Client，不依赖服务端 SFTP 子系统）
+        store.set_policy(HOST_NAME, ["^df -h$"], [],
+                         allow_put=["^/tmp/"], allow_get=["^/var/log/"])
+        real_client = transport.Client
+        transport.Client = FakeClient
+        try:
+            code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/tmp/a.txt"])
+            check("allow_put 放行后执行", code == 0, err)
+            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            check("put 方向与路径正确",
+                  calls == [("put", os.path.expanduser(str(_TMP / "a.txt")), "/tmp/a.txt")],
+                  str(calls))
+
+            remote_log = "/var/log/syslog"
+            local_log = os.path.expanduser(str(_TMP / "syslog"))
+            code, _, err = run_cli(["get", HOST_NAME, remote_log, local_log])
+            check("allow_get 放行后执行", code == 0, err)
+            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            check("get 方向与路径正确",
+                  calls == [("get", remote_log, local_log)],
+                  str(calls))
+
+            code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow2")])
+            check("白名单外的路径仍被拒", code == 1, str(code))
+        finally:
+            transport.Client = real_client
+
+        put_recs = [r for r in audit.tail(30) if r.get("action") == "transfer.put"]
+        check("传输成功也写审计", len(put_recs) == 1, str(put_recs))
+        check("审计含远端路径",
+              "/tmp/a.txt" in (put_recs[0].get("command", "") if put_recs else ""),
+              str(put_recs))
+        check("传输审计不含密码",
+              SSH_PASSWORD not in paths.audit_file().read_text(encoding="utf-8"))
 
         print("\n== Python 版本过低时的指引 ==")
         from lib import runtime as runtime_mod
@@ -538,6 +697,27 @@ def main() -> int:
             check("--sudo 带值被拒绝", True)
         else:
             check("--sudo 带值被拒绝", False, "没有报错")
+
+        print("\n== 迁移也写审计 ==")
+        reset_data()
+        old_dir = _TMP / "old-sshx"
+        old_v = vault.Vault.create(old_dir / "vault.enc", MASTER)
+        old_v.set("legacy-host", "old-password-value")
+        (old_dir / "sshx.toml").write_text(
+            '[hosts.legacy-host]\nhost = "10.0.0.9"\nuser = "root"\n',
+            encoding="utf-8",
+        )
+        MockConsole().install()
+        code, _, err = run_cli(["migrate", str(old_dir)])
+        check("迁移成功", code == 0, err)
+        check("主机迁过来了", "legacy-host" in store.load(), str(store.load()))
+
+        migrate_recs = [r for r in audit.tail(20) if r.get("action") == "migrate"]
+        check("迁移写了审计", len(migrate_recs) == 1, str(audit.tail(20)))
+        check("迁移审计不含密码",
+              all("old-password-value" not in json.dumps(r, ensure_ascii=False)
+                  for r in migrate_recs),
+              str(migrate_recs))
 
     finally:
         stop.set()

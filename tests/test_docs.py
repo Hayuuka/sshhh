@@ -195,6 +195,45 @@ def main() -> int:
     check("hint 文案是「升级」不是「首次安装」",
           "升级" in skill_md)
 
+    print("\n== 策略与审计的覆盖范围（文档承诺 vs 实际实现）==")
+    import inspect
+
+    from lib import vault as vault_mod  # noqa: E402
+
+    transfer_src = inspect.getsource(sshhh._transfer)
+    check("put/get 执行前做策略校验", "check_transfer" in transfer_src)
+    check("put/get 被拒时返回 1（与 run 一致）", "return 1" in transfer_src)
+    check("put/get 写审计", "audit.write" in transfer_src)
+    check("拒绝时写 transfer.denied", "transfer.denied" in transfer_src)
+
+    audited = {
+        "run": sshhh.cmd_run,
+        "test": sshhh.cmd_test,
+        "setpass": sshhh.cmd_setpass,
+        "unlock": sshhh.cmd_unlock,
+        "migrate": sshhh.cmd_migrate,
+    }
+    for label, fn in audited.items():
+        check(f"{label} 写审计", "audit.write" in inspect.getsource(fn))
+
+    flush_src = inspect.getsource(vault_mod.Vault._flush)
+    check("vault.enc 不再写 entries 字段", 'out["entries"]' not in flush_src)
+    check("旧文件里的 entries 会被清掉", 'pop("entries"' in flush_src)
+    check("解密成功写 vault.open 审计",
+          "vault.open" in inspect.getsource(vault_mod))
+
+    for action in ("transfer.put", "transfer.denied", "vault.open",
+                   "unlock", "migrate"):
+        check(f"README 审计表列出 {action}", action in readme, action)
+    check("README 说明文件通道也受策略约束",
+          "allow_put" in readme and "allow_get" in readme)
+    check("README 说明白名单主机的文件通道默认关闭",
+          "文件通道默认关闭" in readme)
+    check("protocol.md 记录了同一套策略",
+          "allow_put" in protocol_md and "vault.open" in protocol_md)
+    check("SKILL.md 提醒 put/get 同样受策略约束",
+          "allow_put" in skill_md and "allow_get" in skill_md)
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

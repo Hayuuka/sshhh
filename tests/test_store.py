@@ -98,6 +98,42 @@ def main() -> int:
     check("清空后段被删掉", store.get("prod.cn").policy.active is False
           and "[hosts.\"prod.cn\".policy]" not in raw())
 
+    print("\n== 文件通道策略 ==")
+    store.set_policy("prod.cn", ["^df -h$"], [], allow_put=["^/tmp/"],
+                     allow_get=["^/var/log/"], deny_put=["^/etc/"])
+    h = store.get("prod.cn")
+    check("四条文件规则都写进清单",
+          h is not None and h.policy.allow_put == ["^/tmp/"]
+          and h.policy.allow_get == ["^/var/log/"]
+          and h.policy.deny_put == ["^/etc/"], raw())
+    check("含文件规则的清单仍是合法 TOML", bool(tomllib.loads(raw())))
+    check("allow_get 命中的路径放行",
+          h.policy.check_transfer("get", "/var/log/syslog") is None)
+    check("allow_get 之外的路径被拒",
+          h.policy.check_transfer("get", "/etc/shadow") is not None)
+    check("deny_put 命中即拒",
+          h.policy.check_transfer("put", "/etc/rc.local") is not None)
+
+    store.set_policy("prod.cn", ["^df -h$"], [])
+    h = store.get("prod.cn")
+    reason = h.policy.check_transfer("put", "/tmp/x")
+    check("命令白名单主机未配 allow_put 时文件通道默认关闭",
+          reason is not None and "allow_put" in reason, str(reason))
+    reason = h.policy.check_transfer("get", "/etc/shadow")
+    check("get 方向的提示指向 allow_get",
+          reason is not None and "allow_get" in reason, str(reason))
+
+    store.set_policy("prod.cn", [], ["^rm"])
+    h = store.get("prod.cn")
+    check("只配 deny 的主机不禁文件通道",
+          h.policy.check_transfer("put", "/etc/rc.local") is None
+          and h.policy.check_transfer("get", "/etc/shadow") is None)
+
+    store.set_policy("prod.cn", [], [], allow_put=["^/tmp/"])
+    check("只配文件规则也算策略生效", store.get("prod.cn").policy.active is True)
+    check("没有策略的主机文件通道照常",
+          store.get("李家豪LJH").policy.check_transfer("get", "/etc/shadow") is None)
+
     print("\n== 含单引号的规则不会写坏清单 ==")
     store.set_policy("my host", [], ["^it's"])
     h = store.get("my host")
