@@ -214,9 +214,107 @@ def test_audit_does_not_leak_argv() -> None:
     check("--stdin-file 文件不存在时报错", detail is not None, str(detail))
 
 
+def test_setpass_keeps_fields() -> None:
+    """setpass 复用 add_host 流程，旧实现整段重写 Host → sudo / key_file 被清空。"""
+
+    import contextlib
+    import io
+
+    import console_setup
+    from lib import vault
+
+    print("\n== #30 setpass 不丢 sudo / key_file / description ==")
+    reset()
+    master = "p0-master-setpass-3c9"
+    os.environ["SSHHH_MASTER"] = master
+    v = vault.Vault.create(paths.vault_file(), master)
+    v.set("prod", "old-password-1")
+    store.upsert_host(store.Host(
+        name="prod", host="10.1.2.3", user="deploy", port=2222,
+        description="生产", sudo=True,
+        key_file="/home/deploy/.ssh/id_ed25519", allow_shell=True,
+    ))
+    store.set_policy("prod", [r"^df -h$"], [r"^rm -rf.*"])
+
+    asked: list[str] = []
+    orig = (console_setup.ask, console_setup.ask_port, console_setup.ask_secret)
+    # 模拟用户「一路回车」：ask 返回默认值，密码输入新的
+    console_setup.ask = lambda prompt, default="", required=True: (
+        asked.append(prompt), default)[1]
+    console_setup.ask_port = lambda prompt, default="22": (
+        asked.append(prompt), int(default))[1]
+    console_setup.ask_secret = lambda prompt, confirm=False: "new-password-2"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            console_setup.do_add_host({"host_name": "prod", "reset_password": True})
+    finally:
+        console_setup.ask, console_setup.ask_port, console_setup.ask_secret = orig
+
+    h = store.get("prod")
+    check("sudo 保留", h is not None and h.sudo is True, str(h))
+    check("key_file 保留", h is not None and h.key_file
+          == "/home/deploy/.ssh/id_ed25519", str(h))
+    check("description 保留", h is not None and h.description == "生产", str(h))
+    check("端口保留", h is not None and h.port == 2222, str(h))
+    check("allow_shell 保留", h is not None and h.allow_shell is True, str(h))
+    check("命令策略保留", h is not None and h.policy.allow == [r"^df -h$"], str(h))
+    check("密码已更新", vault.open_vault().get("prod") == "new-password-2")
+    check("reset_password 不再重问地址 / 端口",
+          not any(("地址" in a) or ("端口" in a) for a in asked), str(asked))
+
+    print("\n== #30 走完整编辑流程（config）也不丢字段 ==")
+    asked.clear()
+    console_setup.ask = lambda prompt, default="", required=True: (
+        asked.append(prompt), default)[1]
+    console_setup.ask_port = lambda prompt, default="22": (
+        asked.append(prompt), int(default))[1]
+    console_setup.ask_secret = lambda prompt, confirm=False: "new-password-3"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            console_setup.do_add_host({"host_name": "prod"})
+    finally:
+        console_setup.ask, console_setup.ask_port, console_setup.ask_secret = orig
+
+    h = store.get("prod")
+    check("一路回车后字段仍然在", h is not None and h.sudo is True
+          and h.key_file == "/home/deploy/.ssh/id_ed25519"
+          and h.description == "生产" and h.port == 2222, str(h))
+    check("地址没被清空", h is not None and h.host == "10.1.2.3", str(h))
+    check("这次确实问了地址和端口",
+          any("地址" in a for a in asked) and any("端口" in a for a in asked),
+          str(asked))
+
+    print("\n== #30 新主机仍按输入创建 ==")
+    answers = {"名称": "fresh", "地址": "9.9.9.9", "用户名": "root",
+               "备注（可留空）": "新机器"}
+    console_setup.ask = lambda prompt, default="", required=True: (
+        answers.get(prompt, default))
+    console_setup.ask_port = lambda prompt, default="22": 2200
+    console_setup.ask_secret = lambda prompt, confirm=False: "fresh-password"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            console_setup.do_add_host({})
+    finally:
+        console_setup.ask, console_setup.ask_port, console_setup.ask_secret = orig
+
+    fresh = store.get("fresh")
+    check("新主机创建成功", fresh is not None, str(fresh))
+    check("字段按输入落盘",
+          fresh is not None and fresh.host == "9.9.9.9"
+          and fresh.user == "root" and fresh.port == 2200
+          and fresh.description == "新机器", str(fresh))
+    check("新主机不会被凭空加上 sudo / 密钥",
+          fresh is not None and fresh.sudo is False and fresh.key_file is None,
+          str(fresh))
+    check("新主机密码入 vault",
+          vault.open_vault().get("fresh") == "fresh-password")
+    os.environ.pop("SSHHH_MASTER", None)
+
+
 def main() -> int:
     test_policy_bypass_cases()
     test_audit_does_not_leak_argv()
+    test_setpass_keeps_fields()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

@@ -351,6 +351,12 @@ password = "@vault:shared"
 password = "@vault:shared"
 ```
 
+**Q：改密码会不会把主机配置弄丢？**
+
+不会。`setpass <主机>` 只问新密码，地址、端口、用户名、`sudo`、`key_file`、
+命令策略、`allow_shell` 全部原样保留。走 `config` 重填同一台主机时，中括号里
+是现值，直接回车就是保持不变。
+
 **Q：sudo 怎么处理？**
 
 主机配置里写 `sudo = true`，或用 `--sudo`。密码通过 stdin 传给 `sudo -S`，
