@@ -18,7 +18,7 @@
 - 让 AI 帮忙排查线上问题：看日志、查磁盘、看服务状态、重启服务
 - 公司安全要求「生产环境密码不能进入任何第三方 AI 服务」
 - 同时用好几个 AI 工具，不想为每个都配一遍密码
-- 想限制 AI 只能跑只读命令，禁止 `rm -rf`、`shutdown`
+- 想限制 AI 只能跑只读命令，禁止 `rm -rf`、`shutdown`（防手滑，不是安全边界，见 6.1）
 - 给 AI 临时开一次服务器权限，事后能查它到底跑了什么
 
 ## 为什么需要它
@@ -97,14 +97,20 @@ SSHHH_HINT: 请告诉用户在自己的终端里执行：python "..." config
 首次运行自动在 `~/.sshhh/venv` 建独立虚拟环境并安装依赖，
 之后所有调用都复用它。系统的 Python 环境一动不动。
 
+**多个 agent 同时首跑也只会建一次**：建 venv + 装依赖全程由一把独立的
+自举锁（`~/.sshhh/.bootstrap`）串行化，后到的进程等前一个装完后复查、
+直接复用。否则两个进程会同时 `rmtree` + `pip install`，互相把对方的
+半成品环境删掉，最后留下一个怎么都装不好的 venv。等锁超过 300 秒会返回
+`NO_RUNTIME` 并说明原因，不会无限挂住。
+
 ### 6. 可以限制 AI 能跑什么命令、能碰哪些文件
 
-在主机配置里加规则（正则，命令匹配整条命令，文件规则匹配**远端路径**）：
+在主机配置里加规则（正则；命令规则要求**整条命令**匹配，文件规则匹配**远端路径**）：
 
 ```toml
 [hosts.prod.policy]
-allow     = ['^df -h$', '^systemctl status ', '^docker ps']
-deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status .*', '^docker ps$']
+deny      = ['^rm -rf.*', '^shutdown$', '^mkfs.*']
 allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
 allow_get = ['^/var/log/']
 deny_put  = ['^/etc/']
@@ -112,12 +118,19 @@ deny_put  = ['^/etc/']
 
 | 字段 | 管什么 | 匹配对象 |
 |---|---|---|
-| `allow` / `deny` | `run` 执行的命令 | 整条命令 |
-| `allow_put` / `deny_put` | `put` 上传 | 远端**目标**路径 |
-| `allow_get` / `deny_get` | `get` 下载 | 远端**源**路径 |
+| `allow` / `deny` | `run` 执行的命令 | 整条命令（`fullmatch`） |
+| `allow_put` / `deny_put` | `put` 上传 | 远端**目标**路径（前缀匹配） |
+| `allow_get` / `deny_get` | `get` 下载 | 远端**源**路径（前缀匹配） |
 
 规则：
 
+- 命令规则是 `fullmatch`，不是「字符串里出现过」。`allow = ['^df -h$']` 放行
+  `df -h`，放不过 `x; df -h`；写 `^rm -rf` 只能拦住**正好等于** `rm -rf` 的命令，
+  要拦那一族就写 `^rm -rf.*`。
+- **命令里含 shell 元字符（`;` `&` `|` `$` 反引号 `>` `<` 换行）默认拒绝**——
+  这类写法能把一条命令变成一串命令，让任何按整串写的规则失效。确实需要
+  （例如 `2>/dev/null`、`a && b`）就在主机段里加 `allow_shell = true`，
+  那时规则只对整条命令原样生效。
 - 白名单非空时，不匹配就拒绝；`deny` 优先于 `allow`。
 - **配了 `allow` 命令白名单的主机，文件通道默认关闭**，必须显式写
   `allow_put` / `allow_get` 才能传文件 —— 否则「只允许 `df -h`」的机器
@@ -125,10 +138,42 @@ deny_put  = ['^/etc/']
 - 只配 `deny` 的主机，文件通道照常可用，除非路径命中 `deny_put` / `deny_get`。
 - 被拒绝时不会连接主机，退出码为 1，并在审计日志里留一条 `*.denied` 记录。
 
+### 6.1 这套规则的定位：防手滑，非安全边界
+
+「能限制 agent 跑什么命令」这句话要说清楚，否则比没有更危险：
+
+- `hosts.toml` 和 `scripts/` 下的代码，对**同一个操作系统用户**的进程都是可写的。
+  agent 想绕开规则，改一行配置、或者直接 `import lib.transport` 都能绕。
+- 所以本地策略是**防手滑**：让「顺手 `rm -rf`」「顺手 `get /etc/shadow`」
+  这类误操作多一道摩擦、多一条审计记录，而不是一道拦得住有意者的墙。
+- 真正的强制只能在服务端做（受限 `authorized_keys` + 服务端包装脚本），
+  那才是 agent 无法绕过的边界。本项目当前默认档（基线模式）不含该能力，
+  文档里不承诺「限制住了 agent」。
+- 同理：审计日志同用户可改，是**留痕**不是防篡改。
+
+这一段的取舍写进了 [docs/DESIGN.md](docs/DESIGN.md)（第 1、3 节），改措辞请先改那里。
+
 ### 7. 输出自动脱敏
 
 远端命令如果把密码打出来了（比如误执行 `echo $PASS`、`cat` 了某个配置文件），
 转给 AI 之前会被替换成 `[REDACTED]`。
+
+### 7.1 输出有长度上限（默认 50 KiB）
+
+AI 的上下文很贵，也很容易被灌满：`cat` 一个大文件、`find /`、构建日志动辄几千行，
+真正有用的信息会被挤出去，还按 token 计费。所以 `run` 回传的输出默认截到
+**50 KiB**，保留头尾、中间换成一行提示：
+
+```
+[sshhh] 输出已截断（原始 1834221 字节，只保留开头约 30720 与结尾约 20480 字节）；
+需要完整内容请缩小命令范围，或用 --max-bytes / --tail 调整
+```
+
+- `--tail N` 只回传最后 N 行（排障最常用）
+- `--max-bytes N` 改上限，`0` = 不限制
+- 远端 stderr 同样受限制
+- 截断事件与原始大小会写进审计（`truncated` / `bytes` 字段），事后能看出
+  「这次其实有 1.8 MB，只是被截了」
 
 ### 8. 审计日志
 
@@ -136,13 +181,13 @@ deny_put  = ['^/etc/']
 
 | action | 记什么 |
 |---|---|
-| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时 |
-| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、结果 |
+| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时；被截断时带 `truncated` 与原始字节数 |
+| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、字节数、结果 |
 | `test` | 探测了哪台机器、结果如何 |
 | `setpass` | 哪台主机的密码被改动（不含密码本身） |
 | `unlock` | 解锁事件，含自动解锁失败的尝试 |
 | `migrate` | 凭据库迁移的来源与条数 |
-| `vault.open` | 每一次成功解密：调用方 pid、命令行、工作目录 |
+| `vault.open` | 每一次成功解密：调用方 pid、命令行前两个参数、工作目录 |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -152,6 +197,11 @@ python scripts/sshhh.py audit -n 20
 
 首次连接自动记录主机密钥，之后严格校验。目标机被换掉时会明确报错，
 不会静默连到别处。
+
+指纹库（`~/.sshhh/known_hosts`）写坏了也**不会**退化成「谁都信」：解析不了
+就在发送凭据之前中止本次连接（退出码 4），并说明是哪一行坏了、该找用户确认。
+写入是加锁 + 原子替换，多个 agent 同时首连不会互相写坏；每次只替换该主机
+自己的条目，手写注释和其它主机原样保留。
 
 ## 快速开始
 
@@ -203,6 +253,7 @@ python scripts/sshhh.py config --here
 | `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
 | `~/.sshhh/console.log` | 配置窗口的诊断日志，只记流程和异常，不含任何输入 |
 | `~/.sshhh/venv/` | 独立运行时，约 35 MB，只建一次 |
+| `~/.sshhh/tmp/` | `get` 允许落盘的临时目录（数据目录内唯一的可写位置） |
 | `~/.sshhh/.lock` | 跨进程文件锁 |
 
 Windows 上是 `C:\Users\<你的用户名>\.sshhh\`。
@@ -260,7 +311,33 @@ sequenceDiagram
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
+
+# 输出长度：默认 50 KiB，超了保留头尾；--tail 只看尾巴，--max-bytes 0 不限制
+python scripts/sshhh.py run prod --tail 50 "journalctl -u nginx"
+python scripts/sshhh.py run prod --max-bytes 200000 "cat /var/log/app.log"
+
+# 给远端命令喂标准输入（内容不进 argv，也就不进进程列表和审计）
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
+
+`put` / `get` 除了远端策略，还有几道**本地**约束（防止一次传输把本地环境搞坏）：
+
+| 约束 | 说明 |
+|---|---|
+| `get` 的本地目标 | 必须在当前目录或其子目录，或 `~/.sshhh/tmp/`。**不允许写进 `~/.sshhh/`**，否则一次 `get` 就能覆盖 `hosts.toml`、`known_hosts`、`vault.enc` |
+| `put` 的本地源 | 不允许来自 `~/.sshhh/`，否则能把整库密文送到远端；源文件不存在直接报错 |
+| 单次大小 | 默认上限 64 MiB，超限报错并提示怎么放宽，**不会**悄悄截断 |
+| 单次时长 | 默认 300 秒，对端不发数据时按超时报错，不会挂到天荒地老 |
+
+两个上限都可用 `--max-bytes` / `--timeout` 单次放宽：
+
+```bash
+python scripts/sshhh.py get prod /var/log/app/big.log ./big.log --max-bytes 200000000
+```
+
+路径判断都在 `realpath` 归一之后做，符号链接和 `..` 绕不过去；传输被中止时会删掉
+本地的半截文件，避免「看起来传完了」的假象。
 
 ## 安全模型
 
@@ -275,7 +352,10 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 
 **防不住什么**（如实说明）
 
-拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
+- **本地策略可以被绕过**：`hosts.toml` 与 `scripts/` 对同用户的进程可写，改掉规则
+  或直接调 `lib.transport` 都行。它是**防手滑，非安全边界**（见 6.1）。
+- **审计日志可以被改写**：同用户进程有写权限，留痕不等于防篡改。
+- 拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
 `python -c "from lib import vault; vault.open_vault()"` 一行就够。
 这是操作系统级别的边界，任何本地工具都绕不过去。
 
@@ -322,6 +402,12 @@ password = "@vault:shared"
 password = "@vault:shared"
 ```
 
+**Q：改密码会不会把主机配置弄丢？**
+
+不会。`setpass <主机>` 只问新密码，地址、端口、用户名、`sudo`、`key_file`、
+命令策略、`allow_shell` 全部原样保留。走 `config` 重填同一台主机时，中括号里
+是现值，直接回车就是保持不变。
+
 **Q：sudo 怎么处理？**
 
 主机配置里写 `sudo = true`，或用 `--sudo`。密码通过 stdin 传给 `sudo -S`，
@@ -338,9 +424,11 @@ password = "@vault:shared"
 py -3.14 -m venv .venv
 .venv/Scripts/python.exe -m pip install paramiko cryptography keyring
 
-# 跑测试（93 项）
+# 跑测试
 .venv/Scripts/python.exe tests/test_flow.py   # 主流程与状态码
-.venv/Scripts/python.exe tests/test_lock.py   # 并发锁
+.venv/Scripts/python.exe tests/test_p0.py     # P0 真值修复（策略 / 审计 / 传输 / 输出）
+.venv/Scripts/python.exe tests/test_lock.py   # 并发锁与自举竞态
+.venv/Scripts/python.exe tests/test_store.py  # 主机清单读写
 py -3.14 tests/test_docs.py                   # 文档与代码一致性
 ```
 

@@ -76,7 +76,8 @@ _LONG_BOOL_FLAGS = frozenset({"sudo"})
 def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
     """解析参数。
 
-    长选项（`--timeout` / `--stdin` / `--sudo`）写在主机名之前或之后都等价：
+    长选项（`--timeout` / `--stdin-file` / `--sudo` / `--stdin`）写在主机名
+    之前或之后都等价：
 
         run --sudo hk "systemctl restart nginx"
         run hk --sudo "systemctl restart nginx"
@@ -354,18 +355,100 @@ def cmd_setup(argv: list[str]) -> int:
     return 0
 
 
+def _stdin_data(opts: dict) -> str | None:
+    """取要喂给远端命令的标准输入。
+
+    内容一律不经过 argv —— argv 会进进程列表，也会进审计（#29）：
+
+        cat schema.sql | sshhh run prod --stdin - "mysql -u app"
+        sshhh run prod --stdin-file ./schema.sql "mysql -u app"
+
+    `--stdin` 只接受 `-`（标准输入）。旧写法 `--stdin <值>` 直接报错而不是
+    默默忽略：那个值会变成命令的一部分，等于把秘密写进审计日志。
+    """
+    if "stdin" in opts:
+        value = str(opts["stdin"])
+        if value != "-":
+            raise UsageError(
+                "--stdin 只接受 -（表示从标准输入读取）。\n"
+                "旧的 --stdin <值> 写法已删除：值会进 argv、进程列表和审计日志。\n"
+                "请改用：cat 文件 | sshhh run <主机> --stdin - <命令>\n"
+                "        或：sshhh run <主机> --stdin-file <文件> <命令>"
+            )
+        return sys.stdin.read() or None
+    if "stdin-file" in opts:
+        source = str(opts["stdin-file"])
+        if source == "-":
+            return sys.stdin.read() or None
+        try:
+            return Path(source).expanduser().read_text(encoding="utf-8") or None
+        except OSError as exc:
+            raise UsageError(f"读不了 --stdin-file {source}：{exc}") from None
+    return None
+
+
+def _int_opt(opts: dict, flag: str, default: int,
+             allow_zero: bool) -> tuple[int, bool]:
+    """读一个整数选项，返回 (值, 是否出现过)。"""
+    if flag not in opts:
+        return default, False
+    raw = str(opts[flag])
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise UsageError(f"--{flag} 需要一个整数，收到 {raw!r}") from None
+    if value < 0 or (value == 0 and not allow_zero):
+        raise UsageError(
+            f"--{flag} 需要{'非负整数（0 = 不限制）' if allow_zero else '正整数'}，"
+            f"收到 {value}"
+        )
+    return value, True
+
+
+def _float_opt(opts: dict, flag: str) -> float | None:
+    if flag not in opts:
+        return None
+    raw = str(opts[flag])
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise UsageError(f"--{flag} 需要一个数字，收到 {raw!r}") from None
+    if value <= 0:
+        raise UsageError(f"--{flag} 需要正数，收到 {value}")
+    return value
+
+
+def _output_opts(opts: dict) -> tuple[int, int | None]:
+    """解析 `--max-bytes` / `--tail`。
+
+    默认 50 KiB 上限：够看一份日志尾巴、一份 `df -h`，又不至于把会话上下文
+    灌满。`--max-bytes 0` 表示不限制，`--tail N` 只回传最后 N 行。
+    """
+    from lib import output
+
+    max_bytes, _ = _int_opt(opts, "max-bytes", output.DEFAULT_MAX_BYTES,
+                            allow_zero=True)
+    tail_lines, present = _int_opt(opts, "tail", 0, allow_zero=False)
+    return max_bytes, (tail_lines if present else None)
+
+
 def cmd_run(argv: list[str]) -> int:
-    from lib import audit, protocol, store, vault
+    from lib import audit, output, protocol, store, vault
     from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
-    opts, pos = _parse(argv, {"timeout", "stdin"})
+    opts, pos = _parse(argv, {"timeout", "stdin", "stdin-file",
+                              "max-bytes", "tail"})
     if not pos:
         raise UsageError('用法：sshhh run <主机> "<命令>"')
     name = pos[0]
     command = " ".join(pos[1:]).strip()
     if not command:
         raise UsageError('缺少要执行的命令，例如：sshhh run prod "df -h"')
+
+    # 选项本身先校验一遍：参数写错就报 2，不要先去弹配置窗口
+    timeout = _float_opt(opts, "timeout")
+    max_bytes, tail_lines = _output_opts(opts)
 
     # --- 1. 没有密码库：先配置 -------------------------------------------
     if not paths.vault_file().exists():
@@ -420,15 +503,15 @@ def cmd_run(argv: list[str]) -> int:
     redactor = Redactor([password] if password else [])
     safe_cmd = redactor.clean(command)
 
-    reason = host.policy.check(command)
+    reason = host.policy.check(command, allow_shell=host.allow_shell)
     if reason:
         audit.write("run.denied", host=name, user=host.user, command=safe_cmd,
                     ok=False, error=reason)
         _warn(f"[sshhh] 命令被策略拒绝：{reason}")
         return 1
 
-    timeout = float(opts["timeout"]) if "timeout" in opts else None
-    stdin_data = str(opts["stdin"]) if "stdin" in opts else None
+    # stdin 放到策略检查之后再读：被拒的命令不该先把调用方的管道吃掉
+    stdin_data = _stdin_data(opts)
 
     client = Client(host, password, store.Settings(), redactor)
     try:
@@ -443,17 +526,25 @@ def cmd_run(argv: list[str]) -> int:
         _warn(f"[sshhh] {exc}")
         return protocol.EXIT_NETWORK
 
-    sys.stdout.write(result.stdout)
-    if result.stdout and not result.stdout.endswith("\n") and sys.stdout.isatty():
+    stdout_text, out_info = output.shape(
+        result.stdout, max_bytes=max_bytes, tail_lines=tail_lines)
+    stderr_text, err_info = output.shape(
+        result.stderr, max_bytes=max_bytes, tail_lines=tail_lines)
+
+    sys.stdout.write(stdout_text)
+    if stdout_text and not stdout_text.endswith("\n") and sys.stdout.isatty():
         sys.stdout.write("\n")
     sys.stdout.flush()
-    if result.stderr:
-        sys.stderr.write(result.stderr)
+    if stderr_text:
+        sys.stderr.write(stderr_text)
         sys.stderr.flush()
 
+    truncated = out_info["truncated"] or err_info["truncated"]
     audit.write("run", host=name, user=host.user, command=safe_cmd,
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
-                ok=result.exit_code == 0)
+                ok=result.exit_code == 0, truncated=truncated,
+                original_bytes=max(out_info["original_bytes"],
+                                   err_info["original_bytes"]))
     return result.exit_code
 
 
@@ -534,11 +625,59 @@ def cmd_test(argv: list[str]) -> int:
     return 0
 
 
+def _norm(path: str | Path) -> str:
+    """归一成本地可比较的绝对路径：展开 ~、解析符号链接、Windows 上统一大小写。"""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def _inside(child: str, parent: str) -> bool:
+    if child == parent:
+        return True
+    return child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def _guard_local_path(direction: str, path: str) -> str | None:
+    """文件通道的本地路径约束。返回拒绝原因，None 表示放行。
+
+    `put` 的本地源由调用方指定，`get` 的本地目标也是 —— 两边都不设防的话，
+    `get prod /etc/shadow ~/.sshhh/hosts.toml` 能把密码库/清单写坏（DoS），
+    `put prod ~/.sshhh/vault.enc /tmp/x` 能把整库密文送到远端（#32）。
+    realpath 归一之后再判断，防止用符号链接、`..` 或大小写变体绕过去。
+    """
+    target = _norm(path)
+    data_dir = _norm(paths.data_dir())
+    tmp_dir = _norm(paths.data_dir() / "tmp")
+
+    if direction == "get":
+        if _inside(target, tmp_dir):
+            return None
+        if _inside(target, data_dir):
+            return (f"下载目标不能落在 sshhh 数据目录内（{data_dir}）："
+                    "那里是密码库、主机清单和指纹库")
+        try:
+            cwd = _norm(os.getcwd())
+        except OSError:
+            cwd = ""
+        if cwd and _inside(target, cwd):
+            return None
+        return (f"下载目标必须在当前目录（{cwd or '（未知）'}）或其子目录，"
+                f"或 {tmp_dir} 内；收到的是 {target}")
+
+    if _inside(target, data_dir):
+        return (f"上传源不能是 sshhh 数据目录里的文件（{data_dir}）："
+                "那里是密码库、主机清单和指纹库")
+    if not os.path.exists(target):
+        return f"上传源不存在：{target}"
+    if not os.path.isfile(target):
+        return f"上传源不是普通文件：{target}"
+    return None
+
+
 def _transfer(argv: list[str], direction: str) -> int:
     from lib import audit, protocol, store, vault
     from lib.transport import Client, TransportError
 
-    _, pos = _parse(argv, set())
+    opts, pos = _parse(argv, {"max-bytes", "timeout"})
     if len(pos) < 3:
         raise UsageError(f"用法：sshhh {direction} <主机> <本地> <远端>")
     name, a, b = pos[0], pos[1], pos[2]
@@ -566,17 +705,26 @@ def _transfer(argv: list[str], direction: str) -> int:
         _warn(f"[sshhh] 文件传输被策略拒绝：{reason}")
         return 1
 
+    reason = _guard_local_path(direction, local)
+    if reason:
+        audit.write("transfer.denied", host=name, user=host.user,
+                    command=summary, ok=False, error=reason)
+        _warn(f"[sshhh] 本地路径被拒绝：{reason}")
+        return 1
+
+    cap, has_cap = _int_opt(opts, "max-bytes", 0, allow_zero=True)
+    max_bytes = cap if has_cap else None
+    timeout = _float_opt(opts, "timeout")
+
     client = Client(host, v.get(name), store.Settings())
     try:
         with client:
-            sftp = client._ssh.open_sftp()  # noqa: SLF001
-            try:
-                if direction == "put":
-                    sftp.put(local, remote)
-                else:
-                    sftp.get(remote, local)
-            finally:
-                sftp.close()
+            if direction == "put":
+                size = client.put_file(local, remote, max_bytes=max_bytes,
+                                       timeout=timeout)
+            else:
+                size = client.get_file(remote, local, max_bytes=max_bytes,
+                                       timeout=timeout)
     except TransportError as exc:
         audit.write(f"transfer.{direction}", host=name, user=host.user,
                     command=summary, ok=False, error=str(exc))
@@ -587,8 +735,9 @@ def _transfer(argv: list[str], direction: str) -> int:
                     command=summary, ok=False, error=str(exc))
         _warn(f"[sshhh] 文件传输失败：{exc}")
         return 4
-    audit.write(f"transfer.{direction}", host=name, user=host.user, command=summary)
-    _say(f"[ok] {direction} 完成：{a} -> {b}")
+    audit.write(f"transfer.{direction}", host=name, user=host.user,
+                command=f"{summary}（{size} 字节）")
+    _say(f"[ok] {direction} 完成：{a} -> {b}（{size} 字节）")
     return 0
 
 
@@ -791,40 +940,45 @@ def cmd_migrate(argv: list[str]) -> int:
         return 3
 
     paths.ensure_data_dir()
-    new_v = vault.Vault.create(paths.vault_file(), master)
-    for name in old_v.names():
-        value = old_v.get(name)
-        if value:
-            new_v.set(name, value)
-
     migrated: list[str] = []
-    if old_cfg.exists():
-        raw = tomllib.loads(old_cfg.read_text(encoding="utf-8"))
-        for name, item in (raw.get("hosts") or {}).items():
-            if not isinstance(item, dict) or not item.get("host"):
-                continue
-            host = store.Host(
-                name=name,
-                host=str(item["host"]),
-                user=str(item.get("user", "root")),
-                port=int(item.get("port", 22)),
-                description=str(item.get("description", "")),
-                sudo=bool(item.get("sudo", False)),
-                key_file=item.get("key_file") or None,
-            )
-            store.upsert_host(host)
-            pol = item.get("policy") or {}
-            allow = [str(x) for x in (pol.get("allow") or [])]
-            deny = [str(x) for x in (pol.get("deny") or [])]
-            allow_put = [str(x) for x in (pol.get("allow_put") or [])]
-            allow_get = [str(x) for x in (pol.get("allow_get") or [])]
-            deny_put = [str(x) for x in (pol.get("deny_put") or [])]
-            deny_get = [str(x) for x in (pol.get("deny_get") or [])]
-            if allow or deny or allow_put or allow_get or deny_put or deny_get:
-                store.set_policy(name, allow, deny, allow_put=allow_put,
-                                 allow_get=allow_get, deny_put=deny_put,
-                                 deny_get=deny_get)
-            migrated.append(name)
+    # 整个迁移（新密码库 + 主机 + 策略）放在一把锁里：中途被并发写打断会留下
+    # 一半迁移过去的状态，比什么都不做更难查（#9）。
+    from lib.lock import data_lock
+
+    with data_lock(timeout=60):
+        new_v = vault.Vault.create(paths.vault_file(), master)
+        for name in old_v.names():
+            value = old_v.get(name)
+            if value:
+                new_v.set(name, value)
+
+        if old_cfg.exists():
+            raw = tomllib.loads(old_cfg.read_text(encoding="utf-8"))
+            for name, item in (raw.get("hosts") or {}).items():
+                if not isinstance(item, dict) or not item.get("host"):
+                    continue
+                host = store.Host(
+                    name=name,
+                    host=str(item["host"]),
+                    user=str(item.get("user", "root")),
+                    port=int(item.get("port", 22)),
+                    description=str(item.get("description", "")),
+                    sudo=bool(item.get("sudo", False)),
+                    key_file=item.get("key_file") or None,
+                )
+                store.upsert_host(host)
+                pol = item.get("policy") or {}
+                allow = [str(x) for x in (pol.get("allow") or [])]
+                deny = [str(x) for x in (pol.get("deny") or [])]
+                allow_put = [str(x) for x in (pol.get("allow_put") or [])]
+                allow_get = [str(x) for x in (pol.get("allow_get") or [])]
+                deny_put = [str(x) for x in (pol.get("deny_put") or [])]
+                deny_get = [str(x) for x in (pol.get("deny_get") or [])]
+                if allow or deny or allow_put or allow_get or deny_put or deny_get:
+                    store.set_policy(name, allow, deny, allow_put=allow_put,
+                                     allow_get=allow_get, deny_put=deny_put,
+                                     deny_get=deny_get)
+                migrated.append(name)
 
     if vault.keyring_save(paths.vault_file(), master):
         _say("[ok] 主密码已存入系统凭据管理器")

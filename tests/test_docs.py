@@ -116,7 +116,7 @@ def main() -> int:
     unknown = mentioned - names - {
         "SSHHH_STATUS", "SSHHH_MESSAGE", "SSHHH_HINT",
         "SSHHH_SETUP_TIMEOUT", "SSHHH_SETUP_HANDOFF",
-        "SSHHH_DATA_DIR", "SSHHH_CALLER", "SSHHH_MASTER",
+        "SSHHH_DATA_DIR", "SSHHH_MASTER",
         "RESULT_KEYS", "CREATE_NEW_CONSOLE", "CREATE_BREAKAWAY_FROM_JOB",
         "PIP_INDEX_URL",
     }
@@ -172,7 +172,7 @@ def main() -> int:
           f"{paths.MIN_SETUP_TIMEOUT}" in protocol_md
           and f"{paths.MAX_SETUP_TIMEOUT}" in protocol_md)
     check("并发锁 30 秒有说明", "30 秒" in protocol_md)
-    check("四个超时被明确区分", "四个超时不要混" in protocol_md)
+    check("各个超时被明确区分", "超时不要混" in protocol_md)
     check("SKILL.md 说明了窗口交接", "交接" in skill_md)
     check("交接时长与代码一致",
           f"{int(handoff_default)}" in protocol_md, str(handoff_default))
@@ -190,6 +190,13 @@ def main() -> int:
           "python 命令本身不存在" in skill_md)
     check("protocol.md 记录了 pip 超时数值",
           str(runtime.PIP_INSTALL_TIMEOUT) in protocol_md)
+    check("protocol.md 记录自举锁上限（#10）",
+          str(runtime.BOOTSTRAP_LOCK_TIMEOUT) in protocol_md,
+          str(runtime.BOOTSTRAP_LOCK_TIMEOUT))
+    check("protocol.md 说明自举锁独立于数据锁",
+          ".bootstrap" in protocol_md)
+    check("SKILL.md 覆盖「另一个进程正在准备环境」",
+          "正在首次准备运行环境" in skill_md)
     check("protocol.md 承认检测不到「完全没装 Python」",
           "机器完全没装 Python" in protocol_md)
     check("hint 文案是「升级」不是「首次安装」",
@@ -233,6 +240,109 @@ def main() -> int:
           "allow_put" in protocol_md and "vault.open" in protocol_md)
     check("SKILL.md 提醒 put/get 同样受策略约束",
           "allow_put" in skill_md and "allow_get" in skill_md)
+
+    print("\n== B 层定性：三份文档口径一致（#28）==")
+    # 定位错误比实现 bug 更重要：三份文档都必须承认本地策略不是安全边界，
+    # 否则 README 一句「能限制 agent 跑什么命令」就会变成安全承诺。
+    for label, text in (("README.md", readme), ("SKILL.md", skill_md),
+                        ("protocol.md", protocol_md)):
+        check(f"{label} 写明「防手滑，非安全边界」", "防手滑" in text, "")
+        check(f"{label} 承认本地策略可被绕过",
+              ("可写" in text) or ("可被绕过" in text) or ("绕不过" in text), "")
+    check("README 说明命令规则是 fullmatch", "fullmatch" in readme)
+    check("README 说明元字符默认拒绝",
+          "元字符" in readme and "默认拒绝" in readme)
+    check("README 记载 allow_shell 开关", "allow_shell" in readme)
+    check("protocol.md 记载 allow_shell 开关", "allow_shell" in protocol_md)
+    check("SKILL.md 记载元字符默认拒绝", "元字符" in skill_md)
+    check("README 旧示例已改成 fullmatch 写法",
+          "'^systemctl status '" not in readme, "仍是未锚定的旧示例")
+
+    print("\n== 审计字段口径（#29）==")
+    check("protocol.md 说明 vault.open 只留前两个 argv 参数",
+          "前两个" in protocol_md)
+    check("README 不再宣称 caller 字段", "caller pid" not in readme)
+    check("英文 README 不再宣称 caller 字段", "caller pid" not in readme_en)
+    for label, text in (("README.md", readme), ("SKILL.md", skill_md),
+                        ("protocol.md", protocol_md)):
+        check(f"{label} 不再把 --stdin <值> 当用法",
+              '--stdin "mysql' not in text and "--stdin 密" not in text, "")
+    check("SKILL.md 说明 --stdin 只接受 -", "--stdin -" in skill_md)
+    check("文档里没有残留 SSHHH_CALLER",
+          "SSHHH_CALLER" not in (skill_md + protocol_md + readme))
+
+    print("\n== TOFU 与指纹库（#31）==")
+    check("README 说明指纹库损坏不退化成『谁都信』",
+          "退化成「谁都信」" in readme, "")
+    check("SKILL.md 给出『主机指纹库损坏』的处置",
+          "主机指纹库损坏" in skill_md, "")
+    import inspect
+
+    from lib import transport as transport_mod  # noqa: E402
+
+    load_src = inspect.getsource(transport_mod.load_known_hosts)
+    check("加载失败路径会抛错而不是 pass",
+          "TransportError" in load_src and "except Exception:\n        pass" not in load_src)
+    check("指纹库写入走原子替换 + 锁",
+          "atomic_write_text" in inspect.getsource(transport_mod.remember_host_keys)
+          and "data_lock" in inspect.getsource(transport_mod.remember_host_keys))
+    check("不再整文件 HostKeys.save 重写",
+          "keys.save" not in inspect.getsource(transport_mod.Client))
+
+    print("\n== 文件通道的本地约束（#32）==")
+    from lib import store as store_mod  # noqa: E402
+
+    settings = store_mod.Settings()
+    size_label = f"{settings.transfer_max_bytes // (1024 * 1024)} MiB"
+    timeout_label = f"{int(settings.transfer_timeout)} 秒"
+    check(f"README 记载传输上限 {size_label}", size_label in readme, size_label)
+    check(f"README 记载传输超时 {timeout_label}", timeout_label in readme)
+    check("README 说明 get 不能写数据目录", "不允许写进" in readme)
+    check("README 说明 put 源不能来自数据目录", "不允许来自" in readme)
+    check("SKILL.md 说明 get 的落盘范围", "~/.sshhh/tmp/" in skill_md)
+    check("SKILL.md 给出 --max-bytes", "--max-bytes" in skill_md)
+    check("protocol.md 记录本地约束表", "文件通道的本地约束" in protocol_md)
+    check("protocol.md 说明半截文件会被删",
+          "半截文件" in protocol_md)
+
+    import inspect as _inspect
+
+    guard_src = _inspect.getsource(sshhh._guard_local_path)
+    check("路径判断用 realpath 归一",
+          "realpath" in _inspect.getsource(sshhh), "")
+    check("get/put 都过本地路径检查", "check_transfer" in _inspect.getsource(sshhh._transfer)
+          and "_guard_local_path" in _inspect.getsource(sshhh._transfer))
+    check("转移实现走 Client.put_file/get_file",
+          "put_file" in _inspect.getsource(sshhh._transfer)
+          and "get_file" in _inspect.getsource(sshhh._transfer))
+    check("上传源存在性在本地就查了", "os.path.exists" in guard_src, guard_src[:120])
+
+    print("\n== 输出长度控制（#24）==")
+    from lib import output as output_mod  # noqa: E402
+
+    limit_label = f"{output_mod.DEFAULT_MAX_BYTES // 1024} KiB"
+    check(f"README 记载默认上限 {limit_label}", limit_label in readme, limit_label)
+    check("README 给出 --tail", "--tail" in readme)
+    check("README 说明截断进审计", "truncated" in readme)
+    check("SKILL.md 说明截断提示怎么读", "[sshhh] 输出已截断" in skill_md)
+    check("SKILL.md 给出 --tail 用法", "--tail" in skill_md)
+    check("protocol.md 有截断小节", "## 输出截断" in protocol_md)
+    check("protocol.md 说明 tail 优先于 max-bytes",
+          "优先于" in protocol_md and "--tail" in protocol_md)
+
+    print("\n== 写入原子性与锁纪律（#9）==")
+    store_src = _inspect.getsource(store_mod)
+    for fn_name in ("upsert_host", "remove_host", "set_policy"):
+        fn_src = _inspect.getsource(getattr(store_mod, fn_name))
+        check(f"{fn_name} 自己加锁", "data_lock()" in fn_src, fn_name)
+        check(f"{fn_name} 走原子替换",
+              "_write_hosts" in fn_src or "atomic_write_text" in fn_src, fn_name)
+    check("不再直接 write_text 落盘", "path.write_text(" not in store_src)
+    check("protocol.md 说明锁下沉",
+          "下沉" in protocol_md and "原子替换" in protocol_md)
+    check("protocol.md 说明锁可重入", "可重入" in protocol_md)
+    mig_src = _inspect.getsource(sshhh.cmd_migrate)
+    check("migrate 全程持锁", "data_lock(" in mig_src, mig_src[:120])
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

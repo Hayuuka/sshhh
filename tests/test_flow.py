@@ -36,6 +36,10 @@ FAILED = 0
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-test-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+
+# 传输用的本地文件放在数据目录之外：数据目录里的路径现在会被拒绝（#32）
+_FILES = Path(tempfile.mkdtemp(prefix="sshhh-files-"))
+(_FILES / "a.txt").write_text("hello\n", encoding="utf-8")
 os.environ["SSHHH_MASTER"] = MASTER
 
 import sshhh as cli  # noqa: E402
@@ -179,28 +183,6 @@ class MockConsole:
         return [t for t, _ in self.calls]
 
 
-class FakeSftp:
-    def __init__(self):
-        self.calls: list[tuple[str, str, str]] = []
-
-    def put(self, local, remote):
-        self.calls.append(("put", local, remote))
-
-    def get(self, remote, local):
-        self.calls.append(("get", remote, local))
-
-    def close(self):
-        pass
-
-
-class FakeSsh:
-    def __init__(self, sftp: FakeSftp):
-        self._sftp = sftp
-
-    def open_sftp(self) -> FakeSftp:
-        return self._sftp
-
-
 class FakeClient:
     """替换 lib.transport.Client：只记录传输参数，不真连 SFTP。
 
@@ -211,7 +193,7 @@ class FakeClient:
     last: "FakeClient | None" = None
 
     def __init__(self, host=None, password=None, settings=None, redactor=None):
-        self.sftp = FakeSftp()
+        self.calls: list[tuple[str, str, str]] = []
         FakeClient.last = self
 
     def __enter__(self):
@@ -220,9 +202,13 @@ class FakeClient:
     def __exit__(self, *exc):
         return False
 
-    @property
-    def _ssh(self) -> FakeSsh:  # noqa: SLF001 —— 对齐真实 Client 的内部结构
-        return FakeSsh(self.sftp)
+    def put_file(self, local, remote, *, max_bytes=None, timeout=None) -> int:
+        self.calls.append(("put", local, remote))
+        return 0
+
+    def get_file(self, remote, local, *, max_bytes=None, timeout=None) -> int:
+        self.calls.append(("get", remote, local))
+        return 0
 
 
 def run_cli(args: list[str]) -> tuple[int, str, str]:
@@ -238,6 +224,7 @@ def run_cli(args: list[str]) -> tuple[int, str, str]:
 def reset_data():
     shutil.rmtree(_TMP, ignore_errors=True)
     _TMP.mkdir(parents=True, exist_ok=True)
+    (_TMP / "tmp").mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -287,8 +274,11 @@ def main() -> int:
         reset_data()
         v = vault.Vault.create(paths.vault_file(), MASTER)
         v.set(HOST_NAME, SSH_PASSWORD)
+        # allow_shell：下面的脱敏用例要把带 & < 的密码原样 echo 出去，
+        # #28 之后含元字符的命令默认被拒，这里显式放开（与脱敏逻辑无关）。
         store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1",
-                                     user=USER, port=port, description="测试"))
+                                     user=USER, port=port, description="测试",
+                                     allow_shell=True))
 
         mock = MockConsole().install()
         code, out, err = run_cli(["run", HOST_NAME, "echo hello-world"])
@@ -312,6 +302,34 @@ def main() -> int:
         audit_text = paths.audit_file().read_text(encoding="utf-8")
         check("审计日志无密码", SSH_PASSWORD not in audit_text)
         check("审计有记录", '"action": "run"' in audit_text, audit_text[-200:])
+
+        print("\n== 输出长度控制 ==")
+        code, out, _ = run_cli(["run", HOST_NAME, "echo hello-world",
+                                "--max-bytes", "8"])
+        check("默认有上限，超了会截断", "[sshhh] 输出已截断" in out, out)
+        check("保留开头", "hell" in out, out)
+        check("保留结尾", "rld" in out, out)
+        check("提示里给出原始大小", "字节" in out, out)
+
+        recs = [r for r in audit.tail(10) if r.get("action") == "run"]
+        check("截断事件进审计", any(r.get("truncated") for r in recs), str(recs[-1]))
+        check("审计记下原始字节数",
+              any(isinstance(r.get("bytes"), int) and r["bytes"] > 0 for r in recs),
+              str(recs[-1]))
+
+        code, out, _ = run_cli(["run", HOST_NAME, "echo a; echo b; echo c",
+                                "--tail", "2"])
+        check("--tail 只回传最后 N 行", out.strip().endswith("b\nc"), out)
+        check("丢弃的部分有提示", "[sshhh] 只回传最后 2 行" in out, out)
+
+        code, out, _ = run_cli(["run", HOST_NAME, "echo untouched",
+                                "--max-bytes", "0"])
+        check("--max-bytes 0 = 不限制", "untouched" in out
+              and "[sshhh]" not in out, out)
+
+        code, _, err = run_cli(["run", HOST_NAME, "echo x", "--max-bytes", "abc"])
+        check("非法 --max-bytes 报参数错误", code == 2, str(code))
+        check("提示是用法问题", "--max-bytes" in err, err)
 
         print("\n== 回传文件字段白名单 ==")
         import console_setup
@@ -379,17 +397,38 @@ def main() -> int:
         check("错误信息不含密码",
               "wrong-password-here" not in (out + err), err)
 
+        print("\n== 指纹库损坏时中止 ==")
+        paths.known_hosts_file().write_text("坏文件 随便写的内容\n", encoding="utf-8")
+        code, out, err = run_cli(["run", HOST_NAME, "echo hi"])
+        check("指纹库损坏 → 4（网络/校验类）",
+              code == protocol.EXIT_NETWORK, str(code))
+        check("提示指纹库损坏", "指纹库损坏" in err, err)
+        check("没有执行远端命令", "hi" not in out, out)
+        check("提示里有修复方向", "known_hosts" in err, err)
+        paths.known_hosts_file().unlink()
+
         print("\n== 命令策略 ==")
         reset_data()
         v = vault.Vault.create(paths.vault_file(), MASTER)
         v.set(HOST_NAME, SSH_PASSWORD)
         h = store.Host(name=HOST_NAME, host="127.0.0.1", user=USER, port=port)
         store.upsert_host(h)
-        store.set_policy(HOST_NAME, [], [r"^rm -rf"])
+        # fullmatch 语义：要拦一整族就得写 .*（旧写法 ^rm -rf 只拦正好那一条）
+        store.set_policy(HOST_NAME, [], [r"^rm -rf.*"])
         MockConsole().install()
         code, _, err = run_cli(["run", HOST_NAME, "rm -rf /tmp/x"])
         check("deny 规则生效", code == 1, str(code))
         check("拒绝提示", "策略拒绝" in err, err)
+
+        code, _, err = run_cli(["run", HOST_NAME, "df -h && rm -rf /tmp/x"])
+        check("含 shell 元字符默认拒绝", code == 1, str(code))
+        check("提示里点明元字符", "元字符" in err, err)
+
+        store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1", user=USER,
+                                     port=port, allow_shell=True))
+        code, _, err = run_cli(["run", HOST_NAME, "echo a && echo b"])
+        check("allow_shell 主机放行 &&", code == 0, err)
+        store.upsert_host(h)
 
         print("\n== 只读命令 ==")
         code, out, _ = run_cli(["list"])
@@ -470,12 +509,14 @@ def main() -> int:
         store.set_policy(HOST_NAME, ["^df -h$"], [])
         MockConsole().install()
 
-        code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow")])
+        code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow",
+                               str(_TMP / "tmp" / "shadow")])
         check("命令白名单主机的 get 默认被拒", code == 1, str(code))
         check("提示文件传输被策略拒绝", "策略拒绝" in err, err)
-        check("拒绝发生在建连之前", not (_TMP / "shadow").exists())
+        check("拒绝发生在建连之前", not (_TMP / "tmp" / "shadow").exists())
 
-        code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/etc/rc.local"])
+        code, _, err = run_cli(["put", HOST_NAME, str(_FILES / "a.txt"),
+                               "/etc/rc.local"])
         check("未放行的 put 同样被拒", code == 1, str(code))
 
         actions = [r.get("action") for r in audit.tail(30)]
@@ -487,24 +528,54 @@ def main() -> int:
         real_client = transport.Client
         transport.Client = FakeClient
         try:
-            code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/tmp/a.txt"])
+            src = str(_FILES / "a.txt")
+            code, _, err = run_cli(["put", HOST_NAME, src, "/tmp/a.txt"])
             check("allow_put 放行后执行", code == 0, err)
-            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            calls = FakeClient.last.calls if FakeClient.last else []
             check("put 方向与路径正确",
-                  calls == [("put", os.path.expanduser(str(_TMP / "a.txt")), "/tmp/a.txt")],
+                  calls == [("put", os.path.expanduser(src), "/tmp/a.txt")],
                   str(calls))
 
             remote_log = "/var/log/syslog"
-            local_log = os.path.expanduser(str(_TMP / "syslog"))
+            local_log = os.path.expanduser(str(_TMP / "tmp" / "syslog"))
             code, _, err = run_cli(["get", HOST_NAME, remote_log, local_log])
-            check("allow_get 放行后执行", code == 0, err)
-            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            check("allow_get 放行后执行（目标在数据目录 tmp/ 内）", code == 0, err)
+            calls = FakeClient.last.calls if FakeClient.last else []
             check("get 方向与路径正确",
                   calls == [("get", remote_log, local_log)],
                   str(calls))
 
-            code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow2")])
+            code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow",
+                                   str(_TMP / "tmp" / "shadow2")])
             check("白名单外的路径仍被拒", code == 1, str(code))
+
+            print("\n== 文件通道的本地路径约束（#32）==")
+            hosts_before = paths.hosts_file().read_text(encoding="utf-8")
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_TMP / "hosts.toml")])
+            check("get 不能写进数据目录", code == 1, str(code))
+            check("提示指向数据目录", "数据目录" in err, err)
+            check("hosts.toml 没被动过",
+                  paths.hosts_file().read_text(encoding="utf-8") == hosts_before)
+
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_TMP / "vault.enc")])
+            check("get 不能覆盖密码库", code == 1, str(code))
+
+            code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "vault.enc"),
+                                   "/tmp/vault.enc"])
+            check("put 不能把密码库送到远端", code == 1, str(code))
+            check("提示指向数据目录", "数据目录" in err, err)
+
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_FILES / "outside.log")])
+            check("get 目标不在 cwd 也不在 tmp/ 时被拒", code == 1, str(code))
+            check("提示说明允许的范围", "当前目录" in err, err)
+
+            code, _, err = run_cli(["put", HOST_NAME, str(_FILES / "missing.txt"),
+                                   "/tmp/missing.txt"])
+            check("put 源文件不存在时报错而不是崩", code == 1, str(code))
+            check("提示源不存在", "不存在" in err, err)
         finally:
             transport.Client = real_client
 
@@ -723,6 +794,7 @@ def main() -> int:
         stop.set()
         time.sleep(0.2)
         shutil.rmtree(_TMP, ignore_errors=True)
+        shutil.rmtree(_FILES, ignore_errors=True)
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

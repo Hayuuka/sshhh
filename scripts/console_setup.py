@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
 import json
 import os
@@ -288,7 +289,7 @@ def _import_lib():
     return paths, store, vault, data_lock
 
 
-def _host_hints() -> None:
+def _host_hints(existing=None) -> None:
     """添加主机前把每个字段讲清楚。"""
     print("  名称     给这台机器起个短名，之后 `run <名称>` 用它定位")
     print("           例如 hk、prod、db1，只在本机使用，随便起")
@@ -297,15 +298,25 @@ def _host_hints() -> None:
     print("  端口     SSH 端口，服务器没改过就是 22")
     print("  密码     登录密码，输入时不会显示；万一填错，之后可以用")
     print("           `setpass <名称>` 单独改，不用重配")
+    if existing is not None:
+        print()
+        print("  这台机器已经配置过：中括号里是现在的值，直接回车表示保持不变。")
+        print("  sudo / 密钥 / 命令策略等这个向导不问的字段一律原样保留。")
     print()
 
 
-def _ask_host_info(default_user: str) -> tuple[str, str, int, str, str]:
-    """依次问地址 / 用户名 / 端口 / 备注 / 密码。名称由调用方问。"""
-    h = ask("地址")
-    u = ask("用户名", default=default_user)
-    p = ask_port("端口", default="22")
-    d = ask("备注（可留空）", required=False)
+def _ask_host_info(existing=None):
+    """依次问地址 / 用户名 / 端口 / 备注 / 密码。
+
+    已有主机时把现值作为默认值：回车即「不改」。返回值里的前四项因此
+    可以直接覆盖，**没问到的字段（sudo / key_file / policy）由调用方
+    用 dataclasses.replace 保住**，不会被悄悄清空（#30）。
+    """
+    h = ask("地址", default=existing.host if existing else "")
+    u = ask("用户名", default=existing.user if existing else "root")
+    p = ask_port("端口", default=str(existing.port) if existing else "22")
+    d = ask("备注（可留空）", default=existing.description if existing else "",
+            required=False)
     pw = ask_secret("SSH 密码")
     return h, u, p, d, pw
 
@@ -341,7 +352,7 @@ def do_setup(payload: dict) -> dict:
     _host_hints()
 
     name = ask("名称")
-    h, u, p, d, pw = _ask_host_info(payload.get("default_user") or "root")
+    h, u, p, d, pw = _ask_host_info()
 
     with data_lock(timeout=30):
         store.upsert_host(
@@ -358,10 +369,14 @@ def do_add_host(payload: dict) -> dict:
     paths, store, vault_mod, data_lock = _import_lib()
 
     name = payload.get("host_name") or ""
+    reset_password = bool(payload.get("reset_password"))
+    existing = store.get(name) if name else None
+
     _banner(f"添加服务器 {name}" if name else "添加一台 SSH 服务器")
 
     if not name:
         name = ask("名称")
+        existing = store.get(name)
 
     # 先确保能解锁保险库，否则密码存不进去
     try:
@@ -376,19 +391,38 @@ def do_add_host(payload: dict) -> dict:
             _ok("主密码已保存到系统凭据管理器")
 
     print()
-    _section("服务器信息", "")
-    _host_hints()
-    h, u, p, d, pw = _ask_host_info(payload.get("default_user") or "root")
+    if reset_password and existing is not None:
+        # setpass 只改密码：地址 / 端口 / 用户名一个字都不该重问，
+        # 更不该借这次写入把 sudo / key_file / 备注抹掉（#30）。
+        _section("修改密码", f"{name} 的连接信息保持不变")
+        pw = ask_secret("新的 SSH 密码")
+        h = u = p = d = None
+    else:
+        _section("服务器信息", "")
+        _host_hints(existing)
+        h, u, p, d, pw = _ask_host_info(existing)
 
     with data_lock(timeout=30):
-        store.upsert_host(
-            store.Host(name=name, host=h, user=u, port=p, description=d)
-        )
+        # 锁内重读：向导展示默认值到落盘之间，别的 agent 可能刚改过这台主机。
+        # 以磁盘上的最新值为基底，只覆盖这次问到（且非空）的字段。
+        current = store.get(name) or existing
+        if current is not None:
+            host = dataclasses.replace(
+                current,
+                host=h or current.host,
+                user=u or current.user,
+                port=p or current.port,
+                description=current.description if d is None else d,
+            )
+        else:
+            host = store.Host(name=name, host=h, user=u, port=p,
+                              description=d or "")
+        store.upsert_host(host)
         v = vault_mod.open_vault()
         v.set(name, pw)
 
-    return {"status": "ok", "host": name,
-            "summary": f"{name} → {u}@{h}:{p}"}
+    target = f"{host.user}@{host.host}:{host.port}"
+    return {"status": "ok", "host": name, "summary": f"{name} → {target}"}
 
 
 def do_unlock(payload: dict) -> dict:

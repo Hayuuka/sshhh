@@ -34,7 +34,7 @@ python scripts/sshhh.py run prod "df -h"
 
 | 命令 | 说明 |
 |------|------|
-| `run <主机> <命令>` | 执行远端命令，退出码透传 |
+| `run <主机> <命令>` | 执行远端命令，退出码透传；输出默认截到 50 KiB（`--max-bytes` / `--tail` 可调） |
 | `list` | 列出已配置的主机 |
 | `test <主机>` | 连通性测试 |
 | `put <主机> <本地> <远端>` | 上传文件 |
@@ -52,6 +52,24 @@ python scripts/sshhh.py run prod "df -h"
 `allow_get` 里同样会被拒绝（退出码 1）。被拒绝时的正确做法是告诉用户需要
 放行哪个路径，而不是换一条路径或换一种传输方式重试。
 
+文件通道还有几条本地约束，踩到会直接返回 1（拒绝）或 4（传输失败）：
+
+- `get` 的本地目标必须在当前目录或其子目录，或 `~/.sshhh/tmp/` 下。
+  **不要往 `~/.sshhh/` 里写**（会被拒绝），也不要指望能写到任意绝对路径。
+- `put` 的本地源文件必须在 `~/.sshhh/` 之外，而且必须存在。
+- 单次传输默认上限 64 MiB / 300 秒，超过就报错并提示怎么放宽，
+  不会静默截断。需要时用 `--max-bytes <字节>`、`--timeout <秒>`。
+
+主机策略是**防手滑，非安全边界**：它是为了让误操作多一道摩擦并留一条记录，
+不是「agent 被限制住了」。所以不要把它当成授权依据（「有策略拦着，所以这条
+命令随便跑」这种推理不成立），也不要把「策略会拦住我」当成理由去试探边界。
+`hosts.toml` 与脚本对同用户进程都可写，真正的强制只能在服务端做。
+
+命令规则用 `fullmatch` 匹配整条命令，且**含 shell 元字符（`;` `&` `|` `$`
+反引号 `>` `<` 换行）的命令默认被拒**（该主机配了 `allow_shell = true` 才放行）。
+遇到这种拒绝，不要用 `bash -c`、`sh -c`、编码之类的方式拼出等价命令绕过，
+那正是该拒绝要防的行为。
+
 状态码与善后命令的对应关系：
 
 | 收到 | 先试 |
@@ -64,13 +82,44 @@ python scripts/sshhh.py run prod "df -h"
 
 ### 选项的位置
 
-`--sudo`、`--timeout`、`--stdin` 写在主机名之前或之后都等价：
+`--sudo`、`--timeout`、`--stdin`、`--stdin-file` 写在主机名之前或之后都等价：
 
 ```bash
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run --sudo prod "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 ```
+
+需要给远端命令喂标准输入时，用管道配 `--stdin -`，或直接读文件：
+
+```bash
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
+```
+
+**不要用 `--stdin <值>` 那种写法**（已删除，会直接报错）：值会进 argv、进程
+列表和审计日志。要传的内容里有密码，就走管道或 `--stdin-file`。
+
+### 输出长度（默认有上限，先看提示）
+
+`run` 回传的输出默认上限 **50 KiB**：超过时保留开头和结尾，中间替换成一行
+
+```
+[sshhh] 输出已截断（原始 N 字节，只保留开头约 … 与结尾约 … 字节）；需要完整内容请缩小命令范围，或用 --max-bytes / --tail 调整
+```
+
+看到这行说明**你拿到的不是全部输出**。正确反应是缩小范围再跑一次，
+而不是把这行当噪音忽略，也不要据此下「日志里只有这些」的结论：
+
+```bash
+python scripts/sshhh.py run prod --timeout 60 "tail -n 200 /var/log/app.log"  # 先取尾巴
+python scripts/sshhh.py run prod --tail 50 "journalctl -u nginx"              # 只回最后 50 行
+python scripts/sshhh.py run prod --max-bytes 500000 "grep -c ERROR big.log"   # 确实要全量
+```
+
+- `--tail N`：只回传最后 N 行（排障最常用）
+- `--max-bytes N`：改上限，`0` 表示不限制（慎用，几万行会灌满上下文）
+- 远端 stderr 同样受这个上限约束
 
 需要把 `--sudo` 这类字样**原样交给远端**时，用 `--` 分隔：
 
@@ -147,7 +196,7 @@ SSHHH_STATUS: <状态名>
 `CONFIGURED` 和 `HOST_ADDED` 最多重试一次。重试后仍是这两个状态，停下来
 问用户，不要循环调用。
 
-`NO_RUNTIME` 有两种完全不同的成因，`SSHHH_HINT` 里已经写好了该转告用户的话，
+`NO_RUNTIME` 有三种完全不同的成因，`SSHHH_HINT` 里已经写好了该转告用户的话，
 照抄即可，不要自己猜：
 
 - **Python 版本低于 3.9** —— 机器上有 Python，但太旧。让用户去
@@ -155,6 +204,9 @@ SSHHH_STATUS: <状态名>
   这种情况**不要建议他跑 `setup`**，因为旧 Python 跑不了脚本。
 - **依赖下载失败** —— 让用户在自己的终端跑 `setup`，必要时先设
   `PIP_INDEX_URL` 换国内镜像源。
+- **另一个 agent 正在首次准备运行环境** —— 说明有别的调用正在建 venv / 装依赖，
+  你等的那把锁超时了。**等 30 秒到 1 分钟再重试一次**，不要连着重试刷屏，
+  也不要自己删 `~/.sshhh/venv`。
 
 ## 触发配置窗口的三种情况
 
@@ -198,7 +250,8 @@ SSHHH_STATUS: <状态名>
 
 5. **遇到「命令被策略拒绝」不要绕路**（换写法、编码、`bash -c` 嵌套），
    也不要改用 `put` / `get` 去达成同样的目的 —— 文件通道同样有策略，
-   直接告诉用户需要什么权限。
+   直接告诉用户需要什么权限。注意这套策略是**防手滑，非安全边界**：
+   它拦不住有意绕过的人，所以不要用它给用户打包票说「AI 被限制住了」。
 
 6. **配置窗口需要用户本人操作**，你无法也不需要代替他输入。
 
@@ -241,6 +294,8 @@ python scripts/sshhh.py audit -n 20 # 最近的调用记录
 - `认证失败` → 密码不对，让用户执行 `setpass <主机>`
 - `连接超时` → 网络或防火墙，先 `test <主机>` 确认
 - `主机密钥校验失败` → 目标机可能重装过，让用户确认后清理 `~/.sshhh/known_hosts`
+- `主机指纹库损坏`（退出码 4）→ 连接在发出凭据之前就中止了。不要自己改这个
+  文件，也不要删；把「哪个文件、第几行坏了」转告用户，由他决定修还是删
 - `未知主机`（退出码 3）→ 清单里没这台机器，用 `list` 确认名称，或直接 `run` 触发添加
 
 详细协议见 `references/protocol.md`。

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import paths
+from .fsutil import atomic_write_text, read_text
+from .lock import data_lock
 
 HEADER = """\
 # sshhh 主机清单 —— 由程序自动维护，也可以手写
@@ -85,6 +87,28 @@ class StoreError(Exception):
     pass
 
 
+# 命令里出现这些字符就默认拒绝。它们让「一条命令」变成「一串命令」，
+# 任何按整条字符串写的 allow / deny 规则都会被绕开（#28）。
+_SHELL_META = frozenset(";&|$`\n\r<>")
+
+_META_LABEL = {
+    "\n": "\\n", "\r": "\\r",
+}
+
+
+def _matches(pattern: str, text: str) -> bool:
+    """整条字符串匹配一条规则。
+
+    用 fullmatch 而不是 search：`allow = ['df -h']` 在 search 下会放过
+    `x; rm -rf /; df -h`。规则写坏（非法正则）时退化成字面全串比较，
+    不让一条笔误把整台机器变成「不设防」或「完全不可用」。
+    """
+    try:
+        return re.fullmatch(pattern, text) is not None
+    except re.error:
+        return pattern == text
+
+
 @dataclass
 class Policy:
     """主机策略。
@@ -93,6 +117,11 @@ class Policy:
     通道，匹配的是**远端路径**（put 看目标、get 看源）。命令策略和文件策略
     分开配置，是因为它们拦的是完全不同的东西：一条白名单管不住
     `get /etc/shadow`。
+
+    定性（重要）：这是**防手滑，非安全边界**。hosts.toml 和本文件对同用户
+    的进程都可写，agent 想绕开随时能绕开（改文件、直接调 lib）。真正的强制
+    只能在服务端做。这里的价值是让「顺手犯的错」付出一点摩擦成本，并留下
+    拒绝记录，而不是拦住有意绕过的调用方。
     """
 
     allow: list[str] = field(default_factory=list)
@@ -102,13 +131,25 @@ class Policy:
     deny_put: list[str] = field(default_factory=list)
     deny_get: list[str] = field(default_factory=list)
 
-    def check(self, command: str) -> str | None:
+    def check(self, command: str, *, allow_shell: bool = False) -> str | None:
+        """校验一条 `run` 命令。返回 None 表示放行，否则返回拒绝原因。
+
+        `allow_shell=True` 的主机跳过元字符检查（例如需要 `2>/dev/null`
+        或 `a && b` 的场景），代价是 allow / deny 只对整条命令原样生效。
+        """
+        if not allow_shell:
+            meta = sorted({_META_LABEL.get(ch, ch) for ch in command
+                           if ch in _SHELL_META})
+            if meta:
+                return ("命令包含 shell 元字符（" + "、".join(meta)
+                        + "），默认拒绝；确需使用请在主机配置里加 "
+                          "allow_shell = true")
         for pat in self.deny:
-            if re.search(pat, command):
+            if _matches(pat, command):
                 return f"命中禁止规则 /{pat}/"
         if self.allow:
             for pat in self.allow:
-                if re.search(pat, command):
+                if _matches(pat, command):
                     return None
             return "未命中任何允许规则（该主机处于白名单模式）"
         return None
@@ -156,6 +197,9 @@ class Host:
     description: str = ""
     sudo: bool = False
     key_file: str | None = None
+    # 允许命令里出现 shell 元字符（`;` `&&` `|` 重定向等）。默认关闭，
+    # 见 Policy.check：#28 之后含元字符的命令默认拒绝。
+    allow_shell: bool = False
     policy: Policy = field(default_factory=Policy)
 
 
@@ -163,6 +207,10 @@ class Host:
 class Settings:
     connect_timeout: float = 15.0
     command_timeout: float = 300.0
+    # 单次 put / get 的字节上限与整体超时。默认 64 MiB / 300 秒：
+    # 够传配置、日志、发布包，又不至于一次 get 把磁盘填满或挂到天荒地老（#32）。
+    transfer_max_bytes: int = 64 * 1024 * 1024
+    transfer_timeout: float = 300.0
 
     @property
     def known_hosts(self) -> Path:
@@ -174,7 +222,7 @@ def load() -> dict[str, Host]:
     if not path.exists():
         return {}
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_text(path)
     except OSError as exc:
         raise StoreError(f"hosts.toml 读取失败：{exc}") from None
     try:
@@ -202,6 +250,7 @@ def load() -> dict[str, Host]:
             description=str(item.get("description", "")),
             sudo=bool(item.get("sudo", False)),
             key_file=item.get("key_file") or None,
+            allow_shell=bool(item.get("allow_shell", False)),
             policy=Policy(
                 allow=[str(x) for x in (pol.get("allow") or [])],
                 deny=[str(x) for x in (pol.get("deny") or [])],
@@ -237,53 +286,69 @@ def _section_index(text: str, name: str) -> tuple[int, int] | None:
 
 
 def upsert_host(host: Host) -> None:
-    """新增或更新一台主机（保留文件中的其它内容与注释）。"""
-    path = paths.hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = _heal_legacy(path.read_text(encoding="utf-8")) if path.exists() else HEADER
+    """新增或更新一台主机（保留文件中的其它内容与注释）。
 
-    block = [f"[hosts.{_key(host.name)}]"]
-    if host.description:
-        block.append(f'description = "{_esc(host.description)}"')
-    block.append(f'host = "{_esc(host.host)}"')
-    block.append(f"port = {host.port}")
-    block.append(f'user = "{_esc(host.user)}"')
-    if host.sudo:
-        block.append("sudo = true")
-    if host.key_file:
-        block.append(f'key_file = "{_esc(host.key_file)}"')
+    写入本身在 data_lock 内完成，调用方**不需要**自己加锁（#9）；落盘走
+    tmp + os.replace，否则并发读会拿到截断的 TOML，表现为「清单解析失败」。
+    """
+    with data_lock():
+        path = paths.hosts_file()
+        text = _heal_legacy(read_text(path)) if path.exists() else HEADER
 
-    span = _section_index(text, host.name)
-    if span is None:
-        text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
-    else:
-        start, end = span
-        lines = text.splitlines()
-        # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
-        section_end = start + 1
-        while section_end < end:
-            if _section_path(lines[section_end]) is not None:
-                break
-            section_end += 1
-        new_lines = lines[:start] + block + [""] + lines[section_end:]
-        text = "\n".join(new_lines).rstrip("\n") + "\n"
+        block = [f"[hosts.{_key(host.name)}]"]
+        if host.description:
+            block.append(f'description = "{_esc(host.description)}"')
+        block.append(f'host = "{_esc(host.host)}"')
+        block.append(f"port = {host.port}")
+        block.append(f'user = "{_esc(host.user)}"')
+        if host.sudo:
+            block.append("sudo = true")
+        if host.allow_shell:
+            block.append("allow_shell = true")
+        if host.key_file:
+            block.append(f'key_file = "{_esc(host.key_file)}"')
 
-    path.write_text(text, encoding="utf-8")
+        span = _section_index(text, host.name)
+        if span is None:
+            text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
+        else:
+            start, end = span
+            lines = text.splitlines()
+            # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
+            section_end = start + 1
+            while section_end < end:
+                if _section_path(lines[section_end]) is not None:
+                    break
+                section_end += 1
+            new_lines = lines[:start] + block + [""] + lines[section_end:]
+            text = "\n".join(new_lines).rstrip("\n") + "\n"
+
+        _write_hosts(text)
 
 
 def remove_host(name: str) -> bool:
-    path = paths.hosts_file()
-    if not path.exists():
-        return False
-    text = _heal_legacy(path.read_text(encoding="utf-8"))
-    span = _section_index(text, name)
-    if span is None:
-        return False
-    start, end = span
-    lines = text.splitlines()
-    del lines[start:end]
-    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
-    return True
+    with data_lock():
+        path = paths.hosts_file()
+        if not path.exists():
+            return False
+        text = _heal_legacy(read_text(path))
+        span = _section_index(text, name)
+        if span is None:
+            return False
+        start, end = span
+        lines = text.splitlines()
+        del lines[start:end]
+        _write_hosts("\n".join(lines).rstrip("\n") + "\n")
+        return True
+
+
+def _write_hosts(text: str) -> None:
+    """清单落盘：原子替换 + 权限收紧。
+
+    内容里有主机名、用户名、策略，没有密码；但仍按 0600 写，省得别人顺手
+    读到「这台机器上有哪些生产环境」。
+    """
+    atomic_write_text(paths.hosts_file(), text, mode=0o600)
 
 
 def set_policy(name: str, allow: list[str], deny: list[str], *,
@@ -295,48 +360,47 @@ def set_policy(name: str, allow: list[str], deny: list[str], *,
 
     文件通道的四条规则是关键字参数，老调用方（只传 allow / deny）不受影响。
     """
-    path = paths.hosts_file()
-    if not path.exists():
-        raise StoreError(f"主机 {name} 不存在")
-    text = _heal_legacy(path.read_text(encoding="utf-8"))
-    lines = text.splitlines()
+    with data_lock():
+        path = paths.hosts_file()
+        if not path.exists():
+            raise StoreError(f"主机 {name} 不存在")
+        text = _heal_legacy(read_text(path))
+        lines = text.splitlines()
 
-    # 定位已有的 policy 段并删除
-    start = None
-    end = None
-    for idx, line in enumerate(lines):
-        path_ = _section_path(line)
-        if path_ is None:
-            continue
-        is_policy = (path_ == ["hosts", name, "policy"])
-        if is_policy and start is None:
-            start = idx
-        elif start is not None:
-            end = idx
-            break
-    if start is not None:
-        del lines[start:(end if end is not None else len(lines))]
-        text = "\n".join(lines).rstrip("\n") + "\n"
+        # 定位已有的 policy 段并删除
+        start = None
+        end = None
+        for idx, line in enumerate(lines):
+            path_ = _section_path(line)
+            if path_ is None:
+                continue
+            is_policy = (path_ == ["hosts", name, "policy"])
+            if is_policy and start is None:
+                start = idx
+            elif start is not None:
+                end = idx
+                break
+        if start is not None:
+            del lines[start:(end if end is not None else len(lines))]
+            text = "\n".join(lines).rstrip("\n") + "\n"
 
-    rules = [
-        ("allow", allow),
-        ("deny", deny),
-        ("allow_put", allow_put or []),
-        ("allow_get", allow_get or []),
-        ("deny_put", deny_put or []),
-        ("deny_get", deny_get or []),
-    ]
-    block = [f"[hosts.{_key(name)}.policy]"]
-    for key, values in rules:
-        if values:
-            block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
+        rules = [
+            ("allow", allow),
+            ("deny", deny),
+            ("allow_put", allow_put or []),
+            ("allow_get", allow_get or []),
+            ("deny_put", deny_put or []),
+            ("deny_get", deny_get or []),
+        ]
+        block = [f"[hosts.{_key(name)}.policy]"]
+        for key, values in rules:
+            if values:
+                block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
 
-    if len(block) > 1:
-        path.write_text(
-            text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n", encoding="utf-8"
-        )
-    else:
-        path.write_text(text, encoding="utf-8")
+        if len(block) > 1:
+            _write_hosts(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n")
+        else:
+            _write_hosts(text)
 
 
 def _q(value: str) -> str:

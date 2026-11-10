@@ -30,6 +30,11 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 PIP_UPGRADE_TIMEOUT = 60
 PIP_INSTALL_TIMEOUT = 150
 
+# 自举锁的等待上限。要覆盖「建 venv 180s + 升级 pip 60s + 装依赖 150s」的
+# 最坏情况，但不能无限等：等不到就返回 NO_RUNTIME 让调用方稍后重试，比挂到
+# agent 自己的命令超时为止要好。
+BOOTSTRAP_LOCK_TIMEOUT = 300
+
 
 class RuntimeError_(Exception):
     """运行环境无法就绪。消息应当是人类可读、可转告用户的。"""
@@ -227,15 +232,35 @@ def ensure(argv: list[str] | None = None) -> None:
     if venv_py.exists() and deps_ok(venv_py):
         _reexec(venv_py)
 
-    # 需要新建
-    base = find_base_python()
-    if not base:
-        raise PythonTooOldError(
-            "当前 Python 版本低于 3.9，且系统里没有找到更新的版本"
-        )
-    if not _create_venv(base):
-        raise RuntimeError_(f"创建虚拟环境失败：{paths.venv_dir()}")
-    problem = _install(venv_py)
-    if problem:
-        raise RuntimeError_(problem)
-    _reexec(venv_py)
+    # 需要新建。多 agent 同时首跑是核心场景（README 就是冲着这个写的），
+    # 所以整个「检查 → 建 venv → 装依赖」必须串行：_create_venv 开头会 rmtree，
+    # 后到的进程会把前一个正在 pip install 的目录删掉，最后留下一个怎么都装不好
+    # 的坏环境（#10）。
+    from .lock import LockTimeout, bootstrap_lock
+
+    ready = False
+    try:
+        with bootstrap_lock(timeout=BOOTSTRAP_LOCK_TIMEOUT):
+            # 拿到锁后再复查一次：等锁的这段时间里，别人可能已经装好了
+            if venv_py.exists() and deps_ok(venv_py):
+                ready = True
+            else:
+                base = find_base_python()
+                if not base:
+                    raise PythonTooOldError(
+                        "当前 Python 版本低于 3.9，且系统里没有找到更新的版本"
+                    )
+                if not _create_venv(base):
+                    raise RuntimeError_(f"创建虚拟环境失败：{paths.venv_dir()}")
+                problem = _install(venv_py)
+                if problem:
+                    raise RuntimeError_(problem)
+                ready = True
+    except LockTimeout:
+        raise RuntimeError_(
+            "另一个 sshhh 进程正在首次准备运行环境（建虚拟环境 + 装依赖），"
+            f"请等它结束再重试；锁文件：{paths.bootstrap_lock_file()}"
+        ) from None
+
+    if ready:
+        _reexec(venv_py)

@@ -116,28 +116,35 @@ def keyring_forget(vault_path: Path, service: str | None = None) -> None:
 # --------------------------------------------------------------------------
 
 
+# 审计里保留几个命令行参数。整串 sys.argv 落盘等于把「调用方随手写在命令里的
+# 秘密」也落盘 —— `run prod --stdin S3cret mysql -pS3cret` 会原样进 audit.log，
+# 而 redactor 只认得主密码和库里已有的值（#29）。前两个参数足够定位调用方式。
+_ARGV_KEEP = 2
+
+
 def _audit_open(path: Path, master: str | None,
                 values: Iterable[object] = ()) -> None:
     """记录一次成功的解密。
 
     同用户的进程可以绕过 sshhh.py 直接调本模块，这是操作系统级边界，
-    代码层面堵不住。但可以让它留下痕迹：pid、工作目录、命令行写进
-    audit.log，事后能查到「是谁在什么时候解开了密码库」。
+    代码层面堵不住。但可以让它留下痕迹：pid、可执行文件、工作目录、命令行
+    前缀写进 audit.log，事后能查到「是谁在什么时候解开了密码库」。
 
-    命令行里如果夹带了主密码或库里已有的密码，一律先替换成 [REDACTED]：
-    审计日志本身不能成为新的泄漏点。
+    落盘前用与命令输出同一套 redactor 过一遍：主密码、库里已有的密码、
+    以及任何 `password=...` 形态的片段都替换成 [REDACTED]。审计日志本身
+    不能成为新的泄漏点。
     """
     try:
         from . import audit
+        from .redact import Redactor
 
+        argv_head = " ".join(sys.argv[:_ARGV_KEEP])
         text = (f"pid={os.getpid()} exe={os.path.basename(sys.executable)} "
-                f"cwd={os.getcwd()} argv={' '.join(sys.argv)}")
+                f"cwd={os.getcwd()} argv={argv_head}")
+        redactor = Redactor([v for v in values if isinstance(v, str)])
         if master:
-            text = text.replace(master, "[REDACTED]")
-        for value in values:
-            if isinstance(value, str) and len(value) >= 4:
-                text = text.replace(value, "[REDACTED]")
-        audit.write("vault.open", command=text)
+            redactor.add(master)
+        audit.write("vault.open", command=redactor.clean(text))
     except Exception:  # noqa: BLE001
         # 审计写不进去也不能让解密失败
         pass

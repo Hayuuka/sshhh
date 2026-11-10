@@ -95,15 +95,22 @@ No guessing, no trial and error.
 First run creates an isolated venv at `~/.sshhh/venv` and installs dependencies
 there. Every later call reuses it. Your system Python stays untouched.
 
+**Several agents bootstrapping at once only build it once**: venv creation and
+`pip install` are serialized behind a dedicated bootstrap lock
+(`~/.sshhh/.bootstrap`); later processes wait, re-check, and reuse the result.
+Without it two processes would `rmtree` and `pip install` over each other and
+leave a venv that never works. Waiting past 300 s returns `NO_RUNTIME` with the
+reason instead of hanging.
+
 ### 6. Restrict what the agent can run — and which files it can touch
 
-Add rules per host. Command rules are regexes matched against the whole command;
-file rules are matched against the **remote path**:
+Add rules per host. Command rules are regexes that must match the **entire**
+command (`fullmatch`); file rules are matched against the **remote path**:
 
 ```toml
 [hosts.prod.policy]
-allow     = ['^df -h$', '^systemctl status ', '^docker ps']
-deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status .*', '^docker ps$']
+deny      = ['^rm -rf.*', '^shutdown$', '^mkfs.*']
 allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
 allow_get = ['^/var/log/']
 deny_put  = ['^/etc/']
@@ -111,12 +118,19 @@ deny_put  = ['^/etc/']
 
 | Field | Governs | Matched against |
 |---|---|---|
-| `allow` / `deny` | commands run via `run` | the whole command |
+| `allow` / `deny` | commands run via `run` | the whole command (`fullmatch`) |
 | `allow_put` / `deny_put` | uploads via `put` | the remote **destination** path |
 | `allow_get` / `deny_get` | downloads via `get` | the remote **source** path |
 
 Rules:
 
+- Command rules use `fullmatch`, not "contains". `allow = ['^df -h$']` permits
+  `df -h` but not `x; df -h`; `^rm -rf` only blocks a command that is exactly
+  `rm -rf` — write `^rm -rf.*` to block the family.
+- **Commands containing shell metacharacters (`;` `&` `|` `$` backtick `>` `<`
+  newline) are refused by default**, because they can turn one command into a
+  chain and defeat any whole-string rule. If you need them (e.g. `2>/dev/null`,
+  `a && b`), set `allow_shell = true` in that host's section.
 - When an allow-list is present, anything unmatched is refused; `deny` wins over `allow`.
 - **A host with an `allow` command list has its file channel closed by default.**
   You must add `allow_put` / `allow_get` explicitly — otherwise a box that only
@@ -126,10 +140,40 @@ Rules:
 - A refusal happens before connecting, returns exit code 1, and writes a `*.denied`
   audit record.
 
+### 6.1 What these rules are (and are not): prevents slips, not a security boundary
+
+- `hosts.toml` and the code under `scripts/` are writable by any process running
+  as the same OS user. An agent that wants to get around the rules can edit the
+  file or import `lib.transport` directly.
+- So the local policy **prevents slips, not a security boundary**: it adds friction
+  and an audit trail to accidents like a stray `rm -rf` or `get /etc/shadow`, and
+  it cannot stop a caller that deliberately bypasses it.
+- Real enforcement can only live on the server (restricted `authorized_keys` plus
+  a server-side wrapper). That is not part of the default baseline mode, and this
+  README does not claim the agent is "restricted".
+- Likewise the audit log is a record, not tamper protection: the same user can edit it.
+
 ### 7. Automatic output redaction
 
 If a remote command prints the password — a stray `echo $PASS`, a `cat` of some
 config file — it is replaced with `[REDACTED]` before reaching the agent.
+
+### 7.1 Output is capped (50 KiB by default)
+
+Agent context is expensive and easy to drown: `cat` of a big file, `find /`, a
+build log — thousands of lines that push out what actually matters and get billed
+per token. So `run` returns at most **50 KiB**, keeping the head and the tail and
+replacing the middle with one line:
+
+```
+[sshhh] 输出已截断（原始 1834221 字节，只保留开头约 30720 与结尾约 20480 字节）；…
+```
+
+- `--tail N` returns just the last N lines (the usual debugging case)
+- `--max-bytes N` changes the cap, `0` means unlimited
+- remote stderr gets the same treatment
+- the truncation and the original size go into the audit log (`truncated` / `bytes`),
+  so later you can tell "that run produced 1.8 MB" from "we only returned this much"
 
 ### 8. Audit log
 
@@ -139,13 +183,13 @@ a password.
 
 | action | Recorded |
 |---|---|
-| `run` / `run.denied` | command executed or refused, exit code, duration |
-| `transfer.put` / `transfer.get` / `transfer.denied` | direction, local and remote paths, result |
+| `run` / `run.denied` | command executed or refused, exit code, duration; `truncated` + original byte count when capped |
+| `transfer.put` / `transfer.get` / `transfer.denied` | direction, local and remote paths, byte count, result |
 | `test` | which machine was probed, and the result |
 | `setpass` | which host's password changed (never the password) |
 | `unlock` | unlock events, including failed automatic attempts |
 | `migrate` | source directory and record counts |
-| `vault.open` | every successful decryption: caller pid, command line, working directory |
+| `vault.open` | every successful decryption: pid, interpreter, working directory, first two argv tokens |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -265,7 +309,25 @@ Common flags:
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
+
+# feed stdin to a remote command (never via argv, so never in ps or the audit log)
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
+
+`put` / `get` also enforce **local** path rules, so one transfer cannot wreck the
+local setup:
+
+| Rule | Detail |
+|---|---|
+| `get` target | Must be inside the current directory or `~/.sshhh/tmp/`. Writing into `~/.sshhh/` is refused — otherwise one `get` could overwrite `hosts.toml`, `known_hosts` or `vault.enc` |
+| `put` source | Must live outside `~/.sshhh/` (or the vault ciphertext could be shipped off-box) and must exist |
+| Size | 64 MiB per transfer by default; exceeding it is an error with the exact flag to raise it, never a silent truncation |
+| Duration | 300 s per transfer by default; a stalled peer errors out instead of hanging |
+
+Both limits can be raised per call with `--max-bytes` / `--timeout`. Paths are
+compared after `realpath`, so symlinks and `..` do not slip through, and a failed
+transfer deletes the partial file instead of leaving a convincing-looking one.
 
 ## Security model
 
@@ -280,7 +342,11 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 
 **What it does not protect against** (stated plainly)
 
-A program that already has your OS account privileges can call this project's
+- **Local policy can be bypassed**: `hosts.toml` and `scripts/` are writable by
+  the same user, so rules can be edited away or `lib.transport` called directly.
+  It prevents slips, not a security boundary (see 6.1).
+- **The audit log can be rewritten** by the same user: it is a record, not tamper protection.
+- A program that already has your OS account privileges can call this project's
 Python API and decrypt the vault. One line of
 `python -c "from lib import vault; vault.open_vault()"` is enough. That is an
 operating-system boundary; no local tool can cross it.
@@ -290,8 +356,8 @@ time — but then the agent can't run unattended.
 
 The real improvement is this: **for the AI to steal the password, it has to
 actively write code against internal APIs** rather than just read a file. Every
-successful decryption appends a `vault.open` audit record (caller pid, command
-line, working directory), so that path **cannot be blocked, but it does leave a
+successful decryption appends a `vault.open` audit record (pid, interpreter,
+working directory, first two argv tokens), so that path **cannot be blocked, but it does leave a
 trail** you can inspect afterwards.
 
 ## FAQ

@@ -36,6 +36,15 @@ def lock_file() -> Path:
     return data_dir() / ".lock"
 
 
+def bootstrap_lock_file() -> Path:
+    """运行环境自举专用的锁。
+
+    与 `.lock` 分开：首次启动要建 venv + 装依赖，可能占用几分钟，不能让期间
+    其它 agent 的读写操作陪着一起等（#10）。
+    """
+    return data_dir() / ".bootstrap"
+
+
 def no_window_marker() -> Path:
     """标记文件：这个环境里弹窗撑不住（命令一结束就被宿主回收）。
 
