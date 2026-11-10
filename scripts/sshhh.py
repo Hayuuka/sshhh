@@ -567,11 +567,49 @@ def cmd_test(argv: list[str]) -> int:
     return 0
 
 
+def _inside(path: Path, parent: Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def _guard_local_path(direction: str, path: str) -> str | None:
+    """文件通道的本地路径约束。返回拒绝原因，None 表示放行。
+
+    `put` 的本地源由调用方指定，`get` 的本地目标也是 —— 两边都不设防的话，
+    `get prod /etc/shadow ~/.sshhh/hosts.toml` 能把密码库/清单写坏（DoS），
+    `put prod ~/.sshhh/vault.enc /tmp/x` 能把整库密文送到远端（#32）。
+    realpath 归一之后再判断，防止用符号链接或 `..` 绕过去。
+    """
+    target = Path(os.path.realpath(os.path.expanduser(path)))
+    data_dir = Path(os.path.realpath(paths.data_dir()))
+    tmp_dir = Path(os.path.realpath(paths.data_dir() / "tmp"))
+
+    if direction == "get":
+        if _inside(target, tmp_dir):
+            return None
+        if _inside(target, data_dir):
+            return (f"下载目标不能落在 sshhh 数据目录内（{data_dir}）："
+                    "那里是密码库、主机清单和指纹库")
+        cwd = Path(os.path.realpath(os.getcwd()))
+        if _inside(target, cwd):
+            return None
+        return (f"下载目标必须在当前目录（{cwd}）或其子目录，"
+                f"或 {tmp_dir} 内；收到的是 {target}")
+
+    if _inside(target, data_dir):
+        return (f"上传源不能是 sshhh 数据目录里的文件（{data_dir}）："
+                "那里是密码库、主机清单和指纹库")
+    if not target.exists():
+        return f"上传源不存在：{target}"
+    if not target.is_file():
+        return f"上传源不是普通文件：{target}"
+    return None
+
+
 def _transfer(argv: list[str], direction: str) -> int:
     from lib import audit, protocol, store, vault
     from lib.transport import Client, TransportError
 
-    _, pos = _parse(argv, set())
+    opts, pos = _parse(argv, {"max-bytes", "timeout"})
     if len(pos) < 3:
         raise UsageError(f"用法：sshhh {direction} <主机> <本地> <远端>")
     name, a, b = pos[0], pos[1], pos[2]
@@ -599,17 +637,25 @@ def _transfer(argv: list[str], direction: str) -> int:
         _warn(f"[sshhh] 文件传输被策略拒绝：{reason}")
         return 1
 
+    reason = _guard_local_path(direction, local)
+    if reason:
+        audit.write("transfer.denied", host=name, user=host.user,
+                    command=summary, ok=False, error=reason)
+        _warn(f"[sshhh] 本地路径被拒绝：{reason}")
+        return 1
+
+    max_bytes = int(opts["max-bytes"]) if "max-bytes" in opts else None
+    timeout = float(opts["timeout"]) if "timeout" in opts else None
+
     client = Client(host, v.get(name), store.Settings())
     try:
         with client:
-            sftp = client._ssh.open_sftp()  # noqa: SLF001
-            try:
-                if direction == "put":
-                    sftp.put(local, remote)
-                else:
-                    sftp.get(remote, local)
-            finally:
-                sftp.close()
+            if direction == "put":
+                size = client.put_file(local, remote, max_bytes=max_bytes,
+                                       timeout=timeout)
+            else:
+                size = client.get_file(remote, local, max_bytes=max_bytes,
+                                       timeout=timeout)
     except TransportError as exc:
         audit.write(f"transfer.{direction}", host=name, user=host.user,
                     command=summary, ok=False, error=str(exc))
@@ -620,8 +666,9 @@ def _transfer(argv: list[str], direction: str) -> int:
                     command=summary, ok=False, error=str(exc))
         _warn(f"[sshhh] 文件传输失败：{exc}")
         return 4
-    audit.write(f"transfer.{direction}", host=name, user=host.user, command=summary)
-    _say(f"[ok] {direction} 完成：{a} -> {b}")
+    audit.write(f"transfer.{direction}", host=name, user=host.user,
+                command=f"{summary}（{size} 字节）")
+    _say(f"[ok] {direction} 完成：{a} -> {b}（{size} 字节）")
     return 0
 
 

@@ -282,6 +282,34 @@ def main() -> int:
     check("不再整文件 HostKeys.save 重写",
           "keys.save" not in inspect.getsource(transport_mod.Client))
 
+    print("\n== 文件通道的本地约束（#32）==")
+    from lib import store as store_mod  # noqa: E402
+
+    settings = store_mod.Settings()
+    size_label = f"{settings.transfer_max_bytes // (1024 * 1024)} MiB"
+    timeout_label = f"{int(settings.transfer_timeout)} 秒"
+    check(f"README 记载传输上限 {size_label}", size_label in readme, size_label)
+    check(f"README 记载传输超时 {timeout_label}", timeout_label in readme)
+    check("README 说明 get 不能写数据目录", "不允许写进" in readme)
+    check("README 说明 put 源不能来自数据目录", "不允许来自" in readme)
+    check("SKILL.md 说明 get 的落盘范围", "~/.sshhh/tmp/" in skill_md)
+    check("SKILL.md 给出 --max-bytes", "--max-bytes" in skill_md)
+    check("protocol.md 记录本地约束表", "文件通道的本地约束" in protocol_md)
+    check("protocol.md 说明半截文件会被删",
+          "半截文件" in protocol_md)
+
+    import inspect as _inspect
+
+    guard_src = _inspect.getsource(sshhh._guard_local_path)
+    check("路径判断用 realpath 归一",
+          "realpath" in _inspect.getsource(sshhh), "")
+    check("get/put 都过本地路径检查", "check_transfer" in _inspect.getsource(sshhh._transfer)
+          and "_guard_local_path" in _inspect.getsource(sshhh._transfer))
+    check("转移实现走 Client.put_file/get_file",
+          "put_file" in _inspect.getsource(sshhh._transfer)
+          and "get_file" in _inspect.getsource(sshhh._transfer))
+    check("上传源存在性在本地就查了", "exists()" in guard_src, guard_src[:120])
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

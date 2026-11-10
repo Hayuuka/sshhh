@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
@@ -404,11 +406,163 @@ print("OK" if transport.remember_host_keys([(sys.argv[2], key)]) else "FAIL")
           all(h in keys for h in hosts), str(list(keys)))
 
 
+class _FakeRemoteFile:
+    """最小可用的 SFTP 文件对象：够 transport 的分块读写用。"""
+
+    def __init__(self, buffer, writer=None):
+        self._buf = buffer
+        self._writer = writer
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size=-1):
+        return self._buf.read(size)
+
+    def write(self, data):
+        if self._writer is not None:
+            self._writer.append(data)
+        return len(data)
+
+    def close(self):
+        pass
+
+
+class _FakeSftp:
+    def __init__(self, data: bytes = b"", stat_size: int | None = None):
+        self.data = data
+        self.stat_size = len(data) if stat_size is None else stat_size
+        self.written: list[bytes] = []
+        self.removed: list[str] = []
+
+    def stat(self, remote):
+        import types
+
+        return types.SimpleNamespace(st_size=self.stat_size)
+
+    def open(self, path, mode):
+        if "r" in mode:
+            return _FakeRemoteFile(io.BytesIO(self.data))
+        return _FakeRemoteFile(io.BytesIO(), self.written)
+
+    def get_channel(self):
+        return None
+
+    def remove(self, remote):
+        self.removed.append(remote)
+
+    def close(self):
+        pass
+
+
+class _FakeSsh:
+    def __init__(self, sftp: _FakeSftp):
+        self._sftp = sftp
+
+    def open_sftp(self) -> _FakeSftp:
+        return self._sftp
+
+    def close(self):
+        pass
+
+
+def test_transfer_limits() -> None:
+    """put/get 两端都要有大小与超时上限，超限要报错而不是挂死。"""
+
+    from lib import transport
+    from lib.store import Host, Settings
+
+    def attach(client, sftp):
+        """换掉底层连接（Client 会缓存 SFTP 客户端，一起重置）。"""
+        client._ssh = _FakeSsh(sftp)  # noqa: SLF001
+        client._sftp = None  # noqa: SLF001
+
+    print("\n== #32 get 的大小上限 ==")
+    reset()
+    host = Host(name="box", host="127.0.0.1", user="root")
+    client = transport.Client(host, "pw", Settings(transfer_max_bytes=1024))
+    attach(client, _FakeSftp(b"x" * 4096))
+
+    target = _TMP / "big.bin"
+    err = None
+    try:
+        client.get_file("/remote/big.bin", str(target))
+    except transport.TransportError as exc:
+        err = str(exc)
+    check("超过上限直接拒绝", err is not None and "上限" in err, str(err))
+    check("提示怎么放宽", err is not None and "--max-bytes" in err, str(err))
+    check("没有留下半截文件", not target.exists(), str(target))
+
+    print("\n== #32 传输中途超限也不留半截文件 ==")
+    attach(client, _FakeSftp(b"y" * 4096, stat_size=10))  # stat 撒谎：实际更大
+    target2 = _TMP / "sneaky.bin"
+    err = None
+    try:
+        client.get_file("/remote/sneaky.bin", str(target2))
+    except transport.TransportError as exc:
+        err = str(exc)
+    check("边传边算大小，超了立刻中止",
+          err is not None and "上限" in err, str(err))
+    check("半截文件被删掉", not target2.exists(), str(target2))
+
+    print("\n== #32 get 正常路径 ==")
+    payload = b"hello world\n" * 10
+    attach(client, _FakeSftp(payload))
+    ok_target = _TMP / "ok.bin"
+    written = client.get_file("/remote/ok.bin", str(ok_target), max_bytes=0)
+    check("返回写入字节数", written == len(payload), str(written))
+    check("内容落盘", ok_target.read_bytes() == payload)
+
+    print("\n== #32 put 的大小上限 ==")
+    big = _TMP / "big-upload.bin"
+    big.write_bytes(b"z" * 4096)
+    attach(client, _FakeSftp())
+    err = None
+    try:
+        client.put_file(str(big), "/tmp/big-upload.bin")
+    except transport.TransportError as exc:
+        err = str(exc)
+    check("超过上限直接拒绝", err is not None and "上限" in err, str(err))
+
+    small = _TMP / "small.bin"
+    small.write_bytes(b"ping\n")
+    fake3 = _FakeSftp()
+    attach(client, fake3)
+    sent = client.put_file(str(small), "/tmp/small.txt")
+    check("正常上传返回字节数", sent == small.stat().st_size, str(sent))
+    check("内容真的发出去了", b"".join(fake3.written) == b"ping\n",
+          str(fake3.written))
+
+    print("\n== #32 超时与 sftp() 封装 ==")
+    err = None
+    try:
+        transport._check_deadline(time.monotonic() - 1, "下载", "/x")
+    except transport.TransportError as exc:
+        err = str(exc)
+    check("超时判定会抛 TransportError", err is not None and "超时" in err, str(err))
+
+    fake4 = _FakeSftp()
+    attach(client, fake4)
+    check("Client.sftp() 返回 SFTP 客户端", client.sftp() is fake4)
+    check("Client.sftp() 复用同一个连接", client.sftp() is fake4)
+
+    import inspect
+
+    src = inspect.getsource(__import__("sshhh")._transfer)
+    check("CLI 不再摸 client._ssh", "_ssh" not in src, src[:200])
+    check("CLI 走 Client.sftp/put_file/get_file",
+          "put_file" in src and "get_file" in src)
+
+
 def main() -> int:
     test_policy_bypass_cases()
     test_audit_does_not_leak_argv()
     test_setpass_keeps_fields()
     test_known_hosts()
+    test_transfer_limits()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

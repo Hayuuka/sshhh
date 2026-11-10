@@ -230,6 +230,7 @@ python scripts/sshhh.py config --here
 | `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
 | `~/.sshhh/console.log` | 配置窗口的诊断日志，只记流程和异常，不含任何输入 |
 | `~/.sshhh/venv/` | 独立运行时，约 35 MB，只建一次 |
+| `~/.sshhh/tmp/` | `get` 允许落盘的临时目录（数据目录内唯一的可写位置） |
 | `~/.sshhh/.lock` | 跨进程文件锁 |
 
 Windows 上是 `C:\Users\<你的用户名>\.sshhh\`。
@@ -292,6 +293,24 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
 python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
+
+`put` / `get` 除了远端策略，还有几道**本地**约束（防止一次传输把本地环境搞坏）：
+
+| 约束 | 说明 |
+|---|---|
+| `get` 的本地目标 | 必须在当前目录或其子目录，或 `~/.sshhh/tmp/`。**不允许写进 `~/.sshhh/`**，否则一次 `get` 就能覆盖 `hosts.toml`、`known_hosts`、`vault.enc` |
+| `put` 的本地源 | 不允许来自 `~/.sshhh/`，否则能把整库密文送到远端；源文件不存在直接报错 |
+| 单次大小 | 默认上限 64 MiB，超限报错并提示怎么放宽，**不会**悄悄截断 |
+| 单次时长 | 默认 300 秒，对端不发数据时按超时报错，不会挂到天荒地老 |
+
+两个上限都可用 `--max-bytes` / `--timeout` 单次放宽：
+
+```bash
+python scripts/sshhh.py get prod /var/log/app/big.log ./big.log --max-bytes 200000000
+```
+
+路径判断都在 `realpath` 归一之后做，符号链接和 `..` 绕不过去；传输被中止时会删掉
+本地的半截文件，避免「看起来传完了」的假象。
 
 ## 安全模型
 

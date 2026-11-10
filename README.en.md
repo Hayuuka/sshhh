@@ -291,6 +291,20 @@ cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
 python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
 
+`put` / `get` also enforce **local** path rules, so one transfer cannot wreck the
+local setup:
+
+| Rule | Detail |
+|---|---|
+| `get` target | Must be inside the current directory or `~/.sshhh/tmp/`. Writing into `~/.sshhh/` is refused — otherwise one `get` could overwrite `hosts.toml`, `known_hosts` or `vault.enc` |
+| `put` source | Must live outside `~/.sshhh/` (or the vault ciphertext could be shipped off-box) and must exist |
+| Size | 64 MiB per transfer by default; exceeding it is an error with the exact flag to raise it, never a silent truncation |
+| Duration | 300 s per transfer by default; a stalled peer errors out instead of hanging |
+
+Both limits can be raised per call with `--max-bytes` / `--timeout`. Paths are
+compared after `realpath`, so symlinks and `..` do not slip through, and a failed
+transfer deletes the partial file instead of leaving a convincing-looking one.
+
 ## Security model
 
 **What it protects against**

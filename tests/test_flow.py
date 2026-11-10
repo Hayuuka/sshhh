@@ -36,6 +36,10 @@ FAILED = 0
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-test-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+
+# 传输用的本地文件放在数据目录之外：数据目录里的路径现在会被拒绝（#32）
+_FILES = Path(tempfile.mkdtemp(prefix="sshhh-files-"))
+(_FILES / "a.txt").write_text("hello\n", encoding="utf-8")
 os.environ["SSHHH_MASTER"] = MASTER
 
 import sshhh as cli  # noqa: E402
@@ -179,28 +183,6 @@ class MockConsole:
         return [t for t, _ in self.calls]
 
 
-class FakeSftp:
-    def __init__(self):
-        self.calls: list[tuple[str, str, str]] = []
-
-    def put(self, local, remote):
-        self.calls.append(("put", local, remote))
-
-    def get(self, remote, local):
-        self.calls.append(("get", remote, local))
-
-    def close(self):
-        pass
-
-
-class FakeSsh:
-    def __init__(self, sftp: FakeSftp):
-        self._sftp = sftp
-
-    def open_sftp(self) -> FakeSftp:
-        return self._sftp
-
-
 class FakeClient:
     """替换 lib.transport.Client：只记录传输参数，不真连 SFTP。
 
@@ -211,7 +193,7 @@ class FakeClient:
     last: "FakeClient | None" = None
 
     def __init__(self, host=None, password=None, settings=None, redactor=None):
-        self.sftp = FakeSftp()
+        self.calls: list[tuple[str, str, str]] = []
         FakeClient.last = self
 
     def __enter__(self):
@@ -220,9 +202,13 @@ class FakeClient:
     def __exit__(self, *exc):
         return False
 
-    @property
-    def _ssh(self) -> FakeSsh:  # noqa: SLF001 —— 对齐真实 Client 的内部结构
-        return FakeSsh(self.sftp)
+    def put_file(self, local, remote, *, max_bytes=None, timeout=None) -> int:
+        self.calls.append(("put", local, remote))
+        return 0
+
+    def get_file(self, remote, local, *, max_bytes=None, timeout=None) -> int:
+        self.calls.append(("get", remote, local))
+        return 0
 
 
 def run_cli(args: list[str]) -> tuple[int, str, str]:
@@ -238,6 +224,7 @@ def run_cli(args: list[str]) -> tuple[int, str, str]:
 def reset_data():
     shutil.rmtree(_TMP, ignore_errors=True)
     _TMP.mkdir(parents=True, exist_ok=True)
+    (_TMP / "tmp").mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -494,12 +481,14 @@ def main() -> int:
         store.set_policy(HOST_NAME, ["^df -h$"], [])
         MockConsole().install()
 
-        code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow")])
+        code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow",
+                               str(_TMP / "tmp" / "shadow")])
         check("命令白名单主机的 get 默认被拒", code == 1, str(code))
         check("提示文件传输被策略拒绝", "策略拒绝" in err, err)
-        check("拒绝发生在建连之前", not (_TMP / "shadow").exists())
+        check("拒绝发生在建连之前", not (_TMP / "tmp" / "shadow").exists())
 
-        code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/etc/rc.local"])
+        code, _, err = run_cli(["put", HOST_NAME, str(_FILES / "a.txt"),
+                               "/etc/rc.local"])
         check("未放行的 put 同样被拒", code == 1, str(code))
 
         actions = [r.get("action") for r in audit.tail(30)]
@@ -511,24 +500,54 @@ def main() -> int:
         real_client = transport.Client
         transport.Client = FakeClient
         try:
-            code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "a.txt"), "/tmp/a.txt"])
+            src = str(_FILES / "a.txt")
+            code, _, err = run_cli(["put", HOST_NAME, src, "/tmp/a.txt"])
             check("allow_put 放行后执行", code == 0, err)
-            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            calls = FakeClient.last.calls if FakeClient.last else []
             check("put 方向与路径正确",
-                  calls == [("put", os.path.expanduser(str(_TMP / "a.txt")), "/tmp/a.txt")],
+                  calls == [("put", os.path.expanduser(src), "/tmp/a.txt")],
                   str(calls))
 
             remote_log = "/var/log/syslog"
-            local_log = os.path.expanduser(str(_TMP / "syslog"))
+            local_log = os.path.expanduser(str(_TMP / "tmp" / "syslog"))
             code, _, err = run_cli(["get", HOST_NAME, remote_log, local_log])
-            check("allow_get 放行后执行", code == 0, err)
-            calls = FakeClient.last.sftp.calls if FakeClient.last else []
+            check("allow_get 放行后执行（目标在数据目录 tmp/ 内）", code == 0, err)
+            calls = FakeClient.last.calls if FakeClient.last else []
             check("get 方向与路径正确",
                   calls == [("get", remote_log, local_log)],
                   str(calls))
 
-            code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow", str(_TMP / "shadow2")])
+            code, _, err = run_cli(["get", HOST_NAME, "/etc/shadow",
+                                   str(_TMP / "tmp" / "shadow2")])
             check("白名单外的路径仍被拒", code == 1, str(code))
+
+            print("\n== 文件通道的本地路径约束（#32）==")
+            hosts_before = paths.hosts_file().read_text(encoding="utf-8")
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_TMP / "hosts.toml")])
+            check("get 不能写进数据目录", code == 1, str(code))
+            check("提示指向数据目录", "数据目录" in err, err)
+            check("hosts.toml 没被动过",
+                  paths.hosts_file().read_text(encoding="utf-8") == hosts_before)
+
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_TMP / "vault.enc")])
+            check("get 不能覆盖密码库", code == 1, str(code))
+
+            code, _, err = run_cli(["put", HOST_NAME, str(_TMP / "vault.enc"),
+                                   "/tmp/vault.enc"])
+            check("put 不能把密码库送到远端", code == 1, str(code))
+            check("提示指向数据目录", "数据目录" in err, err)
+
+            code, _, err = run_cli(["get", HOST_NAME, remote_log,
+                                   str(_FILES / "outside.log")])
+            check("get 目标不在 cwd 也不在 tmp/ 时被拒", code == 1, str(code))
+            check("提示说明允许的范围", "当前目录" in err, err)
+
+            code, _, err = run_cli(["put", HOST_NAME, str(_FILES / "missing.txt"),
+                                   "/tmp/missing.txt"])
+            check("put 源文件不存在时报错而不是崩", code == 1, str(code))
+            check("提示源不存在", "不存在" in err, err)
         finally:
             transport.Client = real_client
 
@@ -747,6 +766,7 @@ def main() -> int:
         stop.set()
         time.sleep(0.2)
         shutil.rmtree(_TMP, ignore_errors=True)
+        shutil.rmtree(_FILES, ignore_errors=True)
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

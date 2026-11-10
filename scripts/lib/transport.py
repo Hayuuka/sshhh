@@ -175,6 +175,7 @@ class Client:
         self._password = password
         self.redactor = redactor or Redactor()
         self._ssh: paramiko.SSHClient | None = None
+        self._sftp: paramiko.SFTPClient | None = None
         self._tofu = _TOFU()
 
     def __enter__(self) -> "Client":
@@ -310,6 +311,12 @@ class Client:
         )
 
     def close(self) -> None:
+        if self._sftp is not None:
+            try:
+                self._sftp.close()
+            except Exception:
+                pass
+            self._sftp = None
         if self._ssh is not None:
             try:
                 self._ssh.close()
@@ -318,9 +325,143 @@ class Client:
             self._ssh = None
         self._password = None
 
+    # -- 文件通道 ------------------------------------------------------
+
+    def sftp(self) -> paramiko.SFTPClient:
+        """取（并缓存）SFTP 客户端。调用方不再直接摸 `_ssh`。"""
+        if self._ssh is None:
+            raise TransportError("尚未连接")
+        if self._sftp is None:
+            try:
+                self._sftp = self._ssh.open_sftp()
+            except Exception as exc:  # noqa: BLE001
+                raise TransportError(
+                    f"SSH 连接已建立，但打不开 SFTP 子系统："
+                    f"{self.redactor.clean(str(exc))}"
+                ) from None
+        return self._sftp
+
+    def get_file(self, remote: str, local: str, *,
+                 max_bytes: int | None = None,
+                 timeout: float | None = None) -> int:
+        """下载，返回写入的字节数。超过上限或超时抛 TransportError。"""
+        cap = self.settings.transfer_max_bytes if max_bytes is None else max_bytes
+        limit = (self.settings.transfer_timeout if timeout is None else timeout)
+        sftp = self.sftp()
+        try:
+            st = sftp.stat(remote)
+        except OSError as exc:
+            raise TransportError(f"读不到远端文件 {remote}：{exc}") from None
+        size = int(getattr(st, "st_size", 0) or 0)
+        if cap > 0 and size > cap:
+            raise TransportError(
+                f"远端文件 {remote} 有 {_human(size)}，超过单次传输上限 "
+                f"{_human(cap)}。确认要传请加 --max-bytes {max(0, size)}"
+            )
+
+        deadline = time.monotonic() + limit if limit > 0 else None
+        _arm_channel(sftp, limit)
+        total = 0
+        try:
+            with sftp.open(remote, "rb") as src, open(local, "wb") as dst:
+                while True:
+                    chunk = src.read(_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if cap > 0 and total > cap:
+                        raise TransportError(
+                            f"远端文件 {remote} 超过单次传输上限 {_human(cap)}"
+                            f"（已读 {_human(total)}），已中止。确认要传请加 "
+                            f"--max-bytes {total}"
+                        )
+                    dst.write(chunk)
+                    _check_deadline(deadline, "下载", remote)
+        except BaseException:
+            # 半截文件比没有更危险：读它的人会当真
+            try:
+                os.unlink(local)
+            except OSError:
+                pass
+            raise
+        return total
+
+    def put_file(self, local: str, remote: str, *,
+                 max_bytes: int | None = None,
+                 timeout: float | None = None) -> int:
+        """上传，返回发送的字节数。超过上限或超时抛 TransportError。"""
+        cap = self.settings.transfer_max_bytes if max_bytes is None else max_bytes
+        limit = (self.settings.transfer_timeout if timeout is None else timeout)
+        try:
+            size = os.path.getsize(local)
+        except OSError as exc:
+            raise TransportError(f"读不到本地文件 {local}：{exc}") from None
+        if cap > 0 and size > cap:
+            raise TransportError(
+                f"本地文件 {local} 有 {_human(size)}，超过单次传输上限 "
+                f"{_human(cap)}。确认要传请加 --max-bytes {max(0, size)}"
+            )
+
+        sftp = self.sftp()
+        deadline = time.monotonic() + limit if limit > 0 else None
+        _arm_channel(sftp, limit)
+        total = 0
+        try:
+            with open(local, "rb") as src, sftp.open(remote, "wb") as dst:
+                while True:
+                    chunk = src.read(_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if cap > 0 and total > cap:
+                        raise TransportError(
+                            f"本地文件 {local} 超过单次传输上限 {_human(cap)}，已中止"
+                        )
+                    dst.write(chunk)
+                    _check_deadline(deadline, "上传", remote)
+        except BaseException:
+            # 远端半截文件同样会被人当真，尽力删掉
+            try:
+                sftp.remove(remote)
+            except Exception:
+                pass
+            raise
+        return total
+
 
 def _drain(stream) -> str:
     return stream.read().decode("utf-8", "replace")
+
+
+# 文件通道的分块大小与上限说明，见 Settings.transfer_max_bytes
+_CHUNK = 32 * 1024
+
+
+def _human(size: int) -> str:
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 ** 3):.1f} GiB"
+    if size >= 1024 * 1024:
+        return f"{size / (1024 ** 2):.1f} MiB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KiB"
+    return f"{size} 字节"
+
+
+def _arm_channel(sftp: paramiko.SFTPClient, limit: float) -> None:
+    """把超时压到 SFTP 通道上，避免对端不发数据时无限挂住。"""
+    if limit <= 0:
+        return
+    try:
+        channel = sftp.get_channel()
+        if channel is not None:
+            channel.settimeout(limit)
+    except Exception:
+        pass
+
+
+def _check_deadline(deadline: float | None, what: str, target: str) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise TransportError(f"{what}超时：{target} 传输时间超过上限，已中止")
 
 
 def _shquote(s: str) -> str:

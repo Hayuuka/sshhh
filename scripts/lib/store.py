@@ -205,6 +205,10 @@ class Host:
 class Settings:
     connect_timeout: float = 15.0
     command_timeout: float = 300.0
+    # 单次 put / get 的字节上限与整体超时。默认 64 MiB / 300 秒：
+    # 够传配置、日志、发布包，又不至于一次 get 把磁盘填满或挂到天荒地老（#32）。
+    transfer_max_bytes: int = 64 * 1024 * 1024
+    transfer_timeout: float = 300.0
 
     @property
     def known_hosts(self) -> Path:
