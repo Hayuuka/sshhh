@@ -34,7 +34,7 @@ python scripts/sshhh.py run prod "df -h"
 
 | 命令 | 说明 |
 |------|------|
-| `run <主机> <命令>` | 执行远端命令，退出码透传 |
+| `run <主机> <命令>` | 执行远端命令，退出码透传；输出默认截到 50 KiB（`--max-bytes` / `--tail` 可调） |
 | `list` | 列出已配置的主机 |
 | `test <主机>` | 连通性测试 |
 | `put <主机> <本地> <远端>` | 上传文件 |
@@ -99,6 +99,27 @@ python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 
 **不要用 `--stdin <值>` 那种写法**（已删除，会直接报错）：值会进 argv、进程
 列表和审计日志。要传的内容里有密码，就走管道或 `--stdin-file`。
+
+### 输出长度（默认有上限，先看提示）
+
+`run` 回传的输出默认上限 **50 KiB**：超过时保留开头和结尾，中间替换成一行
+
+```
+[sshhh] 输出已截断（原始 N 字节，只保留开头约 … 与结尾约 … 字节）；需要完整内容请缩小命令范围，或用 --max-bytes / --tail 调整
+```
+
+看到这行说明**你拿到的不是全部输出**。正确反应是缩小范围再跑一次，
+而不是把这行当噪音忽略，也不要据此下「日志里只有这些」的结论：
+
+```bash
+python scripts/sshhh.py run prod --timeout 60 "tail -n 200 /var/log/app.log"  # 先取尾巴
+python scripts/sshhh.py run prod --tail 50 "journalctl -u nginx"              # 只回最后 50 行
+python scripts/sshhh.py run prod --max-bytes 500000 "grep -c ERROR big.log"   # 确实要全量
+```
+
+- `--tail N`：只回传最后 N 行（排障最常用）
+- `--max-bytes N`：改上限，`0` 表示不限制（慎用，几万行会灌满上下文）
+- 远端 stderr 同样受这个上限约束
 
 需要把 `--sudo` 这类字样**原样交给远端**时，用 `--` 分隔：
 

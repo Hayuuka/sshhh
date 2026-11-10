@@ -387,12 +387,58 @@ def _stdin_data(opts: dict) -> str | None:
     return None
 
 
+def _int_opt(opts: dict, flag: str, default: int,
+             allow_zero: bool) -> tuple[int, bool]:
+    """读一个整数选项，返回 (值, 是否出现过)。"""
+    if flag not in opts:
+        return default, False
+    raw = str(opts[flag])
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise UsageError(f"--{flag} 需要一个整数，收到 {raw!r}") from None
+    if value < 0 or (value == 0 and not allow_zero):
+        raise UsageError(
+            f"--{flag} 需要{'非负整数（0 = 不限制）' if allow_zero else '正整数'}，"
+            f"收到 {value}"
+        )
+    return value, True
+
+
+def _float_opt(opts: dict, flag: str) -> float | None:
+    if flag not in opts:
+        return None
+    raw = str(opts[flag])
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise UsageError(f"--{flag} 需要一个数字，收到 {raw!r}") from None
+    if value <= 0:
+        raise UsageError(f"--{flag} 需要正数，收到 {value}")
+    return value
+
+
+def _output_opts(opts: dict) -> tuple[int, int | None]:
+    """解析 `--max-bytes` / `--tail`。
+
+    默认 50 KiB 上限：够看一份日志尾巴、一份 `df -h`，又不至于把会话上下文
+    灌满。`--max-bytes 0` 表示不限制，`--tail N` 只回传最后 N 行。
+    """
+    from lib import output
+
+    max_bytes, _ = _int_opt(opts, "max-bytes", output.DEFAULT_MAX_BYTES,
+                            allow_zero=True)
+    tail_lines, present = _int_opt(opts, "tail", 0, allow_zero=False)
+    return max_bytes, (tail_lines if present else None)
+
+
 def cmd_run(argv: list[str]) -> int:
-    from lib import audit, protocol, store, vault
+    from lib import audit, output, protocol, store, vault
     from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
-    opts, pos = _parse(argv, {"timeout", "stdin", "stdin-file"})
+    opts, pos = _parse(argv, {"timeout", "stdin", "stdin-file",
+                              "max-bytes", "tail"})
     if not pos:
         raise UsageError('用法：sshhh run <主机> "<命令>"')
     name = pos[0]
@@ -460,8 +506,9 @@ def cmd_run(argv: list[str]) -> int:
         _warn(f"[sshhh] 命令被策略拒绝：{reason}")
         return 1
 
-    timeout = float(opts["timeout"]) if "timeout" in opts else None
+    timeout = _float_opt(opts, "timeout")
     stdin_data = _stdin_data(opts)
+    max_bytes, tail_lines = _output_opts(opts)
 
     client = Client(host, password, store.Settings(), redactor)
     try:
@@ -476,17 +523,25 @@ def cmd_run(argv: list[str]) -> int:
         _warn(f"[sshhh] {exc}")
         return protocol.EXIT_NETWORK
 
-    sys.stdout.write(result.stdout)
-    if result.stdout and not result.stdout.endswith("\n") and sys.stdout.isatty():
+    stdout_text, out_info = output.shape(
+        result.stdout, max_bytes=max_bytes, tail_lines=tail_lines)
+    stderr_text, err_info = output.shape(
+        result.stderr, max_bytes=max_bytes, tail_lines=tail_lines)
+
+    sys.stdout.write(stdout_text)
+    if stdout_text and not stdout_text.endswith("\n") and sys.stdout.isatty():
         sys.stdout.write("\n")
     sys.stdout.flush()
-    if result.stderr:
-        sys.stderr.write(result.stderr)
+    if stderr_text:
+        sys.stderr.write(stderr_text)
         sys.stderr.flush()
 
+    truncated = out_info["truncated"] or err_info["truncated"]
     audit.write("run", host=name, user=host.user, command=safe_cmd,
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
-                ok=result.exit_code == 0)
+                ok=result.exit_code == 0, truncated=truncated,
+                original_bytes=max(out_info["original_bytes"],
+                                   err_info["original_bytes"]))
     return result.exit_code
 
 
@@ -644,8 +699,9 @@ def _transfer(argv: list[str], direction: str) -> int:
         _warn(f"[sshhh] 本地路径被拒绝：{reason}")
         return 1
 
-    max_bytes = int(opts["max-bytes"]) if "max-bytes" in opts else None
-    timeout = float(opts["timeout"]) if "timeout" in opts else None
+    cap, has_cap = _int_opt(opts, "max-bytes", 0, allow_zero=True)
+    max_bytes = cap if has_cap else None
+    timeout = _float_opt(opts, "timeout")
 
     client = Client(host, v.get(name), store.Settings())
     try:

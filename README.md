@@ -152,19 +152,36 @@ deny_put  = ['^/etc/']
 远端命令如果把密码打出来了（比如误执行 `echo $PASS`、`cat` 了某个配置文件），
 转给 AI 之前会被替换成 `[REDACTED]`。
 
+### 7.1 输出有长度上限（默认 50 KiB）
+
+AI 的上下文很贵，也很容易被灌满：`cat` 一个大文件、`find /`、构建日志动辄几千行，
+真正有用的信息会被挤出去，还按 token 计费。所以 `run` 回传的输出默认截到
+**50 KiB**，保留头尾、中间换成一行提示：
+
+```
+[sshhh] 输出已截断（原始 1834221 字节，只保留开头约 30720 与结尾约 20480 字节）；
+需要完整内容请缩小命令范围，或用 --max-bytes / --tail 调整
+```
+
+- `--tail N` 只回传最后 N 行（排障最常用）
+- `--max-bytes N` 改上限，`0` = 不限制
+- 远端 stderr 同样受限制
+- 截断事件与原始大小会写进审计（`truncated` / `bytes` 字段），事后能看出
+  「这次其实有 1.8 MB，只是被截了」
+
 ### 8. 审计日志
 
 所有触达凭据或远端的动作都会记一条 JSONL。命令、路径写入前已脱敏，日志里不会有密码。
 
 | action | 记什么 |
 |---|---|
-| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时 |
-| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、结果 |
+| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时；被截断时带 `truncated` 与原始字节数 |
+| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、字节数、结果 |
 | `test` | 探测了哪台机器、结果如何 |
 | `setpass` | 哪台主机的密码被改动（不含密码本身） |
 | `unlock` | 解锁事件，含自动解锁失败的尝试 |
 | `migrate` | 凭据库迁移的来源与条数 |
-| `vault.open` | 每一次成功解密：调用方 pid、命令行、工作目录 |
+| `vault.open` | 每一次成功解密：调用方 pid、命令行前两个参数、工作目录 |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -288,6 +305,10 @@ sequenceDiagram
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
+
+# 输出长度：默认 50 KiB，超了保留头尾；--tail 只看尾巴，--max-bytes 0 不限制
+python scripts/sshhh.py run prod --tail 50 "journalctl -u nginx"
+python scripts/sshhh.py run prod --max-bytes 200000 "cat /var/log/app.log"
 
 # 给远端命令喂标准输入（内容不进 argv，也就不进进程列表和审计）
 cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"

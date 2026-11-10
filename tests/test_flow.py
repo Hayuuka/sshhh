@@ -303,6 +303,34 @@ def main() -> int:
         check("审计日志无密码", SSH_PASSWORD not in audit_text)
         check("审计有记录", '"action": "run"' in audit_text, audit_text[-200:])
 
+        print("\n== 输出长度控制 ==")
+        code, out, _ = run_cli(["run", HOST_NAME, "echo hello-world",
+                                "--max-bytes", "8"])
+        check("默认有上限，超了会截断", "[sshhh] 输出已截断" in out, out)
+        check("保留开头", "hell" in out, out)
+        check("保留结尾", "rld" in out, out)
+        check("提示里给出原始大小", "字节" in out, out)
+
+        recs = [r for r in audit.tail(10) if r.get("action") == "run"]
+        check("截断事件进审计", any(r.get("truncated") for r in recs), str(recs[-1]))
+        check("审计记下原始字节数",
+              any(isinstance(r.get("bytes"), int) and r["bytes"] > 0 for r in recs),
+              str(recs[-1]))
+
+        code, out, _ = run_cli(["run", HOST_NAME, "echo a; echo b; echo c",
+                                "--tail", "2"])
+        check("--tail 只回传最后 N 行", out.strip().endswith("b\nc"), out)
+        check("丢弃的部分有提示", "[sshhh] 只回传最后 2 行" in out, out)
+
+        code, out, _ = run_cli(["run", HOST_NAME, "echo untouched",
+                                "--max-bytes", "0"])
+        check("--max-bytes 0 = 不限制", "untouched" in out
+              and "[sshhh]" not in out, out)
+
+        code, _, err = run_cli(["run", HOST_NAME, "echo x", "--max-bytes", "abc"])
+        check("非法 --max-bytes 报参数错误", code == 2, str(code))
+        check("提示是用法问题", "--max-bytes" in err, err)
+
         print("\n== 回传文件字段白名单 ==")
         import console_setup
 

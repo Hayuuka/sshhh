@@ -24,7 +24,8 @@ def _cut(text: str, limit: int = MAX_COMMAND_CHARS) -> str:
 
 def write(action: str, *, host: str = "", user: str = "", command: str = "",
           exit_code: int | None = None, duration_ms: int | None = None,
-          ok: bool = True, error: str = "") -> None:
+          ok: bool = True, error: str = "",
+          truncated: bool = False, original_bytes: int | None = None) -> None:
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "epoch": int(time.time()),
@@ -41,6 +42,12 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
         record["ms"] = duration_ms
     if error:
         record["error"] = _cut(error, 200)
+    # 截断是「回给调用方的不是全部」这件事本身，必须留痕：
+    # 否则事后看日志会以为命令就产出了那么点内容（#24）
+    if truncated:
+        record["truncated"] = True
+    if original_bytes is not None:
+        record["bytes"] = original_bytes
 
     path = paths.audit_file()
     try:

@@ -310,6 +310,19 @@ def main() -> int:
           and "get_file" in _inspect.getsource(sshhh._transfer))
     check("上传源存在性在本地就查了", "exists()" in guard_src, guard_src[:120])
 
+    print("\n== 输出长度控制（#24）==")
+    from lib import output as output_mod  # noqa: E402
+
+    limit_label = f"{output_mod.DEFAULT_MAX_BYTES // 1024} KiB"
+    check(f"README 记载默认上限 {limit_label}", limit_label in readme, limit_label)
+    check("README 给出 --tail", "--tail" in readme)
+    check("README 说明截断进审计", "truncated" in readme)
+    check("SKILL.md 说明截断提示怎么读", "[sshhh] 输出已截断" in skill_md)
+    check("SKILL.md 给出 --tail 用法", "--tail" in skill_md)
+    check("protocol.md 有截断小节", "## 输出截断" in protocol_md)
+    check("protocol.md 说明 tail 优先于 max-bytes",
+          "优先于" in protocol_md and "--tail" in protocol_md)
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

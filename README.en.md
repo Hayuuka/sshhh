@@ -151,6 +151,23 @@ Rules:
 If a remote command prints the password — a stray `echo $PASS`, a `cat` of some
 config file — it is replaced with `[REDACTED]` before reaching the agent.
 
+### 7.1 Output is capped (50 KiB by default)
+
+Agent context is expensive and easy to drown: `cat` of a big file, `find /`, a
+build log — thousands of lines that push out what actually matters and get billed
+per token. So `run` returns at most **50 KiB**, keeping the head and the tail and
+replacing the middle with one line:
+
+```
+[sshhh] 输出已截断（原始 1834221 字节，只保留开头约 30720 与结尾约 20480 字节）；…
+```
+
+- `--tail N` returns just the last N lines (the usual debugging case)
+- `--max-bytes N` changes the cap, `0` means unlimited
+- remote stderr gets the same treatment
+- the truncation and the original size go into the audit log (`truncated` / `bytes`),
+  so later you can tell "that run produced 1.8 MB" from "we only returned this much"
+
 ### 8. Audit log
 
 Every action that touches credentials or a remote host appends a JSONL record.
@@ -159,8 +176,8 @@ a password.
 
 | action | Recorded |
 |---|---|
-| `run` / `run.denied` | command executed or refused, exit code, duration |
-| `transfer.put` / `transfer.get` / `transfer.denied` | direction, local and remote paths, result |
+| `run` / `run.denied` | command executed or refused, exit code, duration; `truncated` + original byte count when capped |
+| `transfer.put` / `transfer.get` / `transfer.denied` | direction, local and remote paths, byte count, result |
 | `test` | which machine was probed, and the result |
 | `setpass` | which host's password changed (never the password) |
 | `unlock` | unlock events, including failed automatic attempts |
