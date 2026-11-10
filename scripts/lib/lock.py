@@ -47,8 +47,29 @@ def data_lock(timeout: float = 30.0, poll: float = 0.1):
             _STATE.depth = depth
         return
 
+    with _file_lock(paths.lock_file(), timeout, poll):
+        _STATE.depth = 1
+        try:
+            yield
+        finally:
+            _STATE.depth = 0
+
+
+@contextlib.contextmanager
+def bootstrap_lock(timeout: float = 300.0, poll: float = 0.2):
+    """运行环境自举的独占锁（#10）。
+
+    两个 agent 同时首跑时，后到的那个必须等前一个把 venv 建完，而不是也进
+    `_create_venv`（那里开头会 rmtree，会把另一个正在 pip install 的目录删掉）。
+    故意与 data_lock 用不同的锁文件：装依赖要几分钟，不该堵塞读写操作。
+    """
     paths.ensure_data_dir()
-    lock_path = paths.lock_file()
+    with _file_lock(paths.bootstrap_lock_file(), timeout, poll):
+        yield
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path, timeout: float, poll: float):
     fh = open(lock_path, "a+b")
     deadline = time.monotonic() + timeout
     acquired = False
@@ -64,10 +85,8 @@ def data_lock(timeout: float = 30.0, poll: float = 0.1):
                         "另一个 sshhh 进程正在配置，请稍后重试"
                     ) from None
                 time.sleep(poll)
-        _STATE.depth = 1
         yield
     finally:
-        _STATE.depth = 0
         if acquired:
             try:
                 _release(fh)

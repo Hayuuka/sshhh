@@ -95,6 +95,13 @@ No guessing, no trial and error.
 First run creates an isolated venv at `~/.sshhh/venv` and installs dependencies
 there. Every later call reuses it. Your system Python stays untouched.
 
+**Several agents bootstrapping at once only build it once**: venv creation and
+`pip install` are serialized behind a dedicated bootstrap lock
+(`~/.sshhh/.bootstrap`); later processes wait, re-check, and reuse the result.
+Without it two processes would `rmtree` and `pip install` over each other and
+leave a venv that never works. Waiting past 300 s returns `NO_RUNTIME` with the
+reason instead of hanging.
+
 ### 6. Restrict what the agent can run — and which files it can touch
 
 Add rules per host. Command rules are regexes that must match the **entire**

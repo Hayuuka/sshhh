@@ -172,7 +172,7 @@ def main() -> int:
           f"{paths.MIN_SETUP_TIMEOUT}" in protocol_md
           and f"{paths.MAX_SETUP_TIMEOUT}" in protocol_md)
     check("并发锁 30 秒有说明", "30 秒" in protocol_md)
-    check("四个超时被明确区分", "四个超时不要混" in protocol_md)
+    check("各个超时被明确区分", "超时不要混" in protocol_md)
     check("SKILL.md 说明了窗口交接", "交接" in skill_md)
     check("交接时长与代码一致",
           f"{int(handoff_default)}" in protocol_md, str(handoff_default))
@@ -190,6 +190,13 @@ def main() -> int:
           "python 命令本身不存在" in skill_md)
     check("protocol.md 记录了 pip 超时数值",
           str(runtime.PIP_INSTALL_TIMEOUT) in protocol_md)
+    check("protocol.md 记录自举锁上限（#10）",
+          str(runtime.BOOTSTRAP_LOCK_TIMEOUT) in protocol_md,
+          str(runtime.BOOTSTRAP_LOCK_TIMEOUT))
+    check("protocol.md 说明自举锁独立于数据锁",
+          ".bootstrap" in protocol_md)
+    check("SKILL.md 覆盖「另一个进程正在准备环境」",
+          "正在首次准备运行环境" in skill_md)
     check("protocol.md 承认检测不到「完全没装 Python」",
           "机器完全没装 Python" in protocol_md)
     check("hint 文案是「升级」不是「首次安装」",
