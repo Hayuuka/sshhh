@@ -323,6 +323,20 @@ def main() -> int:
     check("protocol.md 说明 tail 优先于 max-bytes",
           "优先于" in protocol_md and "--tail" in protocol_md)
 
+    print("\n== 写入原子性与锁纪律（#9）==")
+    store_src = _inspect.getsource(store_mod)
+    for fn_name in ("upsert_host", "remove_host", "set_policy"):
+        fn_src = _inspect.getsource(getattr(store_mod, fn_name))
+        check(f"{fn_name} 自己加锁", "data_lock()" in fn_src, fn_name)
+        check(f"{fn_name} 走原子替换",
+              "_write_hosts" in fn_src or "atomic_write_text" in fn_src, fn_name)
+    check("不再直接 write_text 落盘", "path.write_text(" not in store_src)
+    check("protocol.md 说明锁下沉",
+          "下沉" in protocol_md and "原子替换" in protocol_md)
+    check("protocol.md 说明锁可重入", "可重入" in protocol_md)
+    mig_src = _inspect.getsource(sshhh.cmd_migrate)
+    check("migrate 全程持锁", "data_lock(" in mig_src, mig_src[:120])
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

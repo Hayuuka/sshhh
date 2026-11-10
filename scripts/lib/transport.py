@@ -116,7 +116,8 @@ def load_known_hosts(ssh: paramiko.SSHClient, path: Path) -> None:
     不会把凭据发给一台「校验不了」的机器。
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        from .fsutil import read_text as _read
+        text = _read(path)
     except (OSError, UnicodeDecodeError) as exc:
         raise TransportError(
             f"主机指纹库损坏，无法校验目标主机：{path}\n（{exc}）\n"
@@ -151,13 +152,13 @@ def remember_host_keys(entries: list[tuple[str, paramiko.PKey]],
     if not entries:
         return True
     target = Path(path) if path is not None else paths.known_hosts_file()
-    from .fsutil import atomic_write_text
+    from .fsutil import atomic_write_text, read_text
     from .lock import LockTimeout, data_lock
 
     try:
         with data_lock(timeout=15):
             try:
-                text = target.read_text(encoding="utf-8") if target.exists() else ""
+                text = read_text(target) if target.exists() else ""
             except OSError:
                 text = ""
             atomic_write_text(target, merge_known_hosts(text, list(entries)))

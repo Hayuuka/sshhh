@@ -927,40 +927,45 @@ def cmd_migrate(argv: list[str]) -> int:
         return 3
 
     paths.ensure_data_dir()
-    new_v = vault.Vault.create(paths.vault_file(), master)
-    for name in old_v.names():
-        value = old_v.get(name)
-        if value:
-            new_v.set(name, value)
-
     migrated: list[str] = []
-    if old_cfg.exists():
-        raw = tomllib.loads(old_cfg.read_text(encoding="utf-8"))
-        for name, item in (raw.get("hosts") or {}).items():
-            if not isinstance(item, dict) or not item.get("host"):
-                continue
-            host = store.Host(
-                name=name,
-                host=str(item["host"]),
-                user=str(item.get("user", "root")),
-                port=int(item.get("port", 22)),
-                description=str(item.get("description", "")),
-                sudo=bool(item.get("sudo", False)),
-                key_file=item.get("key_file") or None,
-            )
-            store.upsert_host(host)
-            pol = item.get("policy") or {}
-            allow = [str(x) for x in (pol.get("allow") or [])]
-            deny = [str(x) for x in (pol.get("deny") or [])]
-            allow_put = [str(x) for x in (pol.get("allow_put") or [])]
-            allow_get = [str(x) for x in (pol.get("allow_get") or [])]
-            deny_put = [str(x) for x in (pol.get("deny_put") or [])]
-            deny_get = [str(x) for x in (pol.get("deny_get") or [])]
-            if allow or deny or allow_put or allow_get or deny_put or deny_get:
-                store.set_policy(name, allow, deny, allow_put=allow_put,
-                                 allow_get=allow_get, deny_put=deny_put,
-                                 deny_get=deny_get)
-            migrated.append(name)
+    # 整个迁移（新密码库 + 主机 + 策略）放在一把锁里：中途被并发写打断会留下
+    # 一半迁移过去的状态，比什么都不做更难查（#9）。
+    from lib.lock import data_lock
+
+    with data_lock(timeout=60):
+        new_v = vault.Vault.create(paths.vault_file(), master)
+        for name in old_v.names():
+            value = old_v.get(name)
+            if value:
+                new_v.set(name, value)
+
+        if old_cfg.exists():
+            raw = tomllib.loads(old_cfg.read_text(encoding="utf-8"))
+            for name, item in (raw.get("hosts") or {}).items():
+                if not isinstance(item, dict) or not item.get("host"):
+                    continue
+                host = store.Host(
+                    name=name,
+                    host=str(item["host"]),
+                    user=str(item.get("user", "root")),
+                    port=int(item.get("port", 22)),
+                    description=str(item.get("description", "")),
+                    sudo=bool(item.get("sudo", False)),
+                    key_file=item.get("key_file") or None,
+                )
+                store.upsert_host(host)
+                pol = item.get("policy") or {}
+                allow = [str(x) for x in (pol.get("allow") or [])]
+                deny = [str(x) for x in (pol.get("deny") or [])]
+                allow_put = [str(x) for x in (pol.get("allow_put") or [])]
+                allow_get = [str(x) for x in (pol.get("allow_get") or [])]
+                deny_put = [str(x) for x in (pol.get("deny_put") or [])]
+                deny_get = [str(x) for x in (pol.get("deny_get") or [])]
+                if allow or deny or allow_put or allow_get or deny_put or deny_get:
+                    store.set_policy(name, allow, deny, allow_put=allow_put,
+                                     allow_get=allow_get, deny_put=deny_put,
+                                     deny_get=deny_get)
+                migrated.append(name)
 
     if vault.keyring_save(paths.vault_file(), master):
         _say("[ok] 主密码已存入系统凭据管理器")

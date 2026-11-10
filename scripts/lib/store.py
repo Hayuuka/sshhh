@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import paths
+from .fsutil import atomic_write_text, read_text
+from .lock import data_lock
 
 HEADER = """\
 # sshhh 主机清单 —— 由程序自动维护，也可以手写
@@ -220,7 +222,7 @@ def load() -> dict[str, Host]:
     if not path.exists():
         return {}
     try:
-        text = path.read_text(encoding="utf-8")
+        text = read_text(path)
     except OSError as exc:
         raise StoreError(f"hosts.toml 读取失败：{exc}") from None
     try:
@@ -284,55 +286,69 @@ def _section_index(text: str, name: str) -> tuple[int, int] | None:
 
 
 def upsert_host(host: Host) -> None:
-    """新增或更新一台主机（保留文件中的其它内容与注释）。"""
-    path = paths.hosts_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = _heal_legacy(path.read_text(encoding="utf-8")) if path.exists() else HEADER
+    """新增或更新一台主机（保留文件中的其它内容与注释）。
 
-    block = [f"[hosts.{_key(host.name)}]"]
-    if host.description:
-        block.append(f'description = "{_esc(host.description)}"')
-    block.append(f'host = "{_esc(host.host)}"')
-    block.append(f"port = {host.port}")
-    block.append(f'user = "{_esc(host.user)}"')
-    if host.sudo:
-        block.append("sudo = true")
-    if host.allow_shell:
-        block.append("allow_shell = true")
-    if host.key_file:
-        block.append(f'key_file = "{_esc(host.key_file)}"')
+    写入本身在 data_lock 内完成，调用方**不需要**自己加锁（#9）；落盘走
+    tmp + os.replace，否则并发读会拿到截断的 TOML，表现为「清单解析失败」。
+    """
+    with data_lock():
+        path = paths.hosts_file()
+        text = _heal_legacy(read_text(path)) if path.exists() else HEADER
 
-    span = _section_index(text, host.name)
-    if span is None:
-        text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
-    else:
-        start, end = span
-        lines = text.splitlines()
-        # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
-        section_end = start + 1
-        while section_end < end:
-            if _section_path(lines[section_end]) is not None:
-                break
-            section_end += 1
-        new_lines = lines[:start] + block + [""] + lines[section_end:]
-        text = "\n".join(new_lines).rstrip("\n") + "\n"
+        block = [f"[hosts.{_key(host.name)}]"]
+        if host.description:
+            block.append(f'description = "{_esc(host.description)}"')
+        block.append(f'host = "{_esc(host.host)}"')
+        block.append(f"port = {host.port}")
+        block.append(f'user = "{_esc(host.user)}"')
+        if host.sudo:
+            block.append("sudo = true")
+        if host.allow_shell:
+            block.append("allow_shell = true")
+        if host.key_file:
+            block.append(f'key_file = "{_esc(host.key_file)}"')
 
-    path.write_text(text, encoding="utf-8")
+        span = _section_index(text, host.name)
+        if span is None:
+            text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
+        else:
+            start, end = span
+            lines = text.splitlines()
+            # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
+            section_end = start + 1
+            while section_end < end:
+                if _section_path(lines[section_end]) is not None:
+                    break
+                section_end += 1
+            new_lines = lines[:start] + block + [""] + lines[section_end:]
+            text = "\n".join(new_lines).rstrip("\n") + "\n"
+
+        _write_hosts(text)
 
 
 def remove_host(name: str) -> bool:
-    path = paths.hosts_file()
-    if not path.exists():
-        return False
-    text = _heal_legacy(path.read_text(encoding="utf-8"))
-    span = _section_index(text, name)
-    if span is None:
-        return False
-    start, end = span
-    lines = text.splitlines()
-    del lines[start:end]
-    path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
-    return True
+    with data_lock():
+        path = paths.hosts_file()
+        if not path.exists():
+            return False
+        text = _heal_legacy(read_text(path))
+        span = _section_index(text, name)
+        if span is None:
+            return False
+        start, end = span
+        lines = text.splitlines()
+        del lines[start:end]
+        _write_hosts("\n".join(lines).rstrip("\n") + "\n")
+        return True
+
+
+def _write_hosts(text: str) -> None:
+    """清单落盘：原子替换 + 权限收紧。
+
+    内容里有主机名、用户名、策略，没有密码；但仍按 0600 写，省得别人顺手
+    读到「这台机器上有哪些生产环境」。
+    """
+    atomic_write_text(paths.hosts_file(), text, mode=0o600)
 
 
 def set_policy(name: str, allow: list[str], deny: list[str], *,
@@ -344,48 +360,47 @@ def set_policy(name: str, allow: list[str], deny: list[str], *,
 
     文件通道的四条规则是关键字参数，老调用方（只传 allow / deny）不受影响。
     """
-    path = paths.hosts_file()
-    if not path.exists():
-        raise StoreError(f"主机 {name} 不存在")
-    text = _heal_legacy(path.read_text(encoding="utf-8"))
-    lines = text.splitlines()
+    with data_lock():
+        path = paths.hosts_file()
+        if not path.exists():
+            raise StoreError(f"主机 {name} 不存在")
+        text = _heal_legacy(read_text(path))
+        lines = text.splitlines()
 
-    # 定位已有的 policy 段并删除
-    start = None
-    end = None
-    for idx, line in enumerate(lines):
-        path_ = _section_path(line)
-        if path_ is None:
-            continue
-        is_policy = (path_ == ["hosts", name, "policy"])
-        if is_policy and start is None:
-            start = idx
-        elif start is not None:
-            end = idx
-            break
-    if start is not None:
-        del lines[start:(end if end is not None else len(lines))]
-        text = "\n".join(lines).rstrip("\n") + "\n"
+        # 定位已有的 policy 段并删除
+        start = None
+        end = None
+        for idx, line in enumerate(lines):
+            path_ = _section_path(line)
+            if path_ is None:
+                continue
+            is_policy = (path_ == ["hosts", name, "policy"])
+            if is_policy and start is None:
+                start = idx
+            elif start is not None:
+                end = idx
+                break
+        if start is not None:
+            del lines[start:(end if end is not None else len(lines))]
+            text = "\n".join(lines).rstrip("\n") + "\n"
 
-    rules = [
-        ("allow", allow),
-        ("deny", deny),
-        ("allow_put", allow_put or []),
-        ("allow_get", allow_get or []),
-        ("deny_put", deny_put or []),
-        ("deny_get", deny_get or []),
-    ]
-    block = [f"[hosts.{_key(name)}.policy]"]
-    for key, values in rules:
-        if values:
-            block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
+        rules = [
+            ("allow", allow),
+            ("deny", deny),
+            ("allow_put", allow_put or []),
+            ("allow_get", allow_get or []),
+            ("deny_put", deny_put or []),
+            ("deny_get", deny_get or []),
+        ]
+        block = [f"[hosts.{_key(name)}.policy]"]
+        for key, values in rules:
+            if values:
+                block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
 
-    if len(block) > 1:
-        path.write_text(
-            text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n", encoding="utf-8"
-        )
-    else:
-        path.write_text(text, encoding="utf-8")
+        if len(block) > 1:
+            _write_hosts(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n")
+        else:
+            _write_hosts(text)
 
 
 def _q(value: str) -> str:

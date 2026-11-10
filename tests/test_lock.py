@@ -31,7 +31,8 @@ _TMP = Path(tempfile.mkdtemp(prefix="sshhh-lock-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
 os.environ["SSHHH_MASTER"] = MASTER
 
-from lib import paths, vault  # noqa: E402
+from lib import paths, store, vault  # noqa: E402
+from lib.lock import LockTimeout, data_lock  # noqa: E402
 
 PASSED = 0
 FAILED = 0
@@ -98,6 +99,36 @@ def run_worker(mode: str, name: str, hold: float, timeout: float = 30.0) -> dict
         return json.loads(line[-1])
     except json.JSONDecodeError:
         return {"ok": False, "error": f"输出异常: {proc.stdout[-200:]}"}
+
+
+STORE_WORKER = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from lib import store
+out = {"ok": True}
+try:
+    store.upsert_host(store.Host(name=sys.argv[2], host="10.0.0.1",
+                                 user="root", description="并发写入"))
+except Exception as exc:
+    out = {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
+print(json.dumps(out))
+"""
+
+READER = r"""
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from lib import store
+bad = []
+reads = 0
+end = time.monotonic() + float(sys.argv[2])
+while time.monotonic() < end:
+    try:
+        store.load()
+        reads += 1
+    except Exception as exc:
+        bad.append(type(exc).__name__ + ": " + str(exc))
+print(json.dumps({"bad": bad, "reads": reads}))
+"""
 
 
 def main() -> int:
@@ -178,6 +209,71 @@ def main() -> int:
     read_elapsed = time.monotonic() - t0
     holder3.wait(timeout=30)
     check("读操作无需等锁（<0.5s）", read_elapsed < 0.5, f"{read_elapsed:.2f}s")
+
+    print("\n== 并发读不会读到半截 TOML（#9）==")
+    reader = subprocess.Popen(
+        [sys.executable, "-c", READER, str(SCRIPTS), "2.5"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8",
+    )
+    writes = 0
+    while reader.poll() is None and writes < 400:
+        store.upsert_host(store.Host(name=f"churn{writes % 7}",
+                                     host=f"10.1.0.{writes % 250}",
+                                     user="root", description="x" * (writes % 200)))
+        writes += 1
+    out, err = reader.communicate(timeout=60)
+    try:
+        report = json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        report = {"bad": [err[-200:]], "reads": 0}
+    check("读方一次解析失败都没有",
+          not report["bad"], f"失败 {len(report['bad'])} 次：{report['bad'][:3]}")
+    check("读方确实在并发读", (report.get("reads") or 0) > 20, str(report))
+    check("写方也确实在写", writes > 20, str(writes))
+
+    print("\n== store 写函数自带锁，调用方不必记得加锁（#9）==")
+    names = [f"locked{i}" for i in range(6)]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", STORE_WORKER, str(SCRIPTS), n],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+        )
+        for n in names
+    ]
+    results = []
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        try:
+            results.append(json.loads(out.strip().splitlines()[-1]))
+        except Exception:
+            results.append({"ok": False, "error": err[-200:]})
+    check("六个进程不加外层锁也全部成功",
+          all(r.get("ok") for r in results),
+          str([r for r in results if not r.get("ok")]))
+    stored = store.load()
+    missing = [n for n in names if n not in stored]
+    check("没有丢更新", not missing, f"缺失 {missing}")
+    check("写入后清单仍合法", all(stored[n].user == "root" for n in names))
+
+    print("\n== 锁可重入：锁内调 store 不会自己等自己（#9）==")
+    t0 = time.monotonic()
+    try:
+        with data_lock(timeout=5):
+            store.upsert_host(store.Host(name="nested", host="10.2.2.2",
+                                         user="root"))
+            store.set_policy("nested", ["^ls$"], [])
+            nested = store.get("nested")
+        reentrant_error = None
+    except LockTimeout as exc:
+        reentrant_error = str(exc)
+        nested = None
+    elapsed = time.monotonic() - t0
+    check("嵌套调用不超时", reentrant_error is None, str(reentrant_error))
+    check("嵌套调用很快返回（<2s）", elapsed < 2.0, f"{elapsed:.2f}s")
+    check("嵌套调用结果正确",
+          nested is not None and nested.policy.allow == ["^ls$"], str(nested))
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

@@ -20,6 +20,10 @@ from pathlib import Path
 _REPLACE_RETRIES = 8
 _REPLACE_DELAY = 0.05
 
+# 读侧的重试（同上，Windows 共享冲突）
+_READ_RETRIES = 8
+_READ_DELAY = 0.03
+
 
 def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
     """原子地把 `text` 写到 `path`。
@@ -59,3 +63,28 @@ def _replace(tmp: Path, path: Path) -> None:
             if attempt == _REPLACE_RETRIES - 1:
                 raise
             time.sleep(_REPLACE_DELAY)
+
+
+def read_text(path: Path, *, encoding: str = "utf-8",
+              retries: int = _READ_RETRIES, delay: float = _READ_DELAY) -> str:
+    """读文本，遇到 Windows 上的瞬时共享冲突就重试几次。
+
+    原子替换（MoveFileEx）执行的那一瞬间，另一个进程 `open()` 同一路径可能
+    拿到 PermissionError：这是 Windows 的共享模式所致，不是文件真的坏了。
+    直接把这种错误抛给调用方，就会出现「并发时有概率报 hosts.toml 读取失败」，
+    和 #9 想消灭的现象没区别。
+    """
+    last: OSError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            return path.read_text(encoding=encoding)
+        except PermissionError as exc:      # 典型的共享冲突
+            last = exc
+            time.sleep(delay)
+        except OSError as exc:
+            last = exc
+            # 文件不存在之类的错误没有重试意义
+            if isinstance(exc, FileNotFoundError):
+                raise
+            time.sleep(delay)
+    raise last if last is not None else OSError(f"读取失败：{path}")
