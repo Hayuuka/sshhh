@@ -315,7 +315,7 @@ def main() -> int:
     check("转移实现走 Client.put_file/get_file",
           "put_file" in _inspect.getsource(sshhh._transfer)
           and "get_file" in _inspect.getsource(sshhh._transfer))
-    check("上传源存在性在本地就查了", "exists()" in guard_src, guard_src[:120])
+    check("上传源存在性在本地就查了", "os.path.exists" in guard_src, guard_src[:120])
 
     print("\n== 输出长度控制（#24）==")
     from lib import output as output_mod  # noqa: E402

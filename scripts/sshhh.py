@@ -622,8 +622,15 @@ def cmd_test(argv: list[str]) -> int:
     return 0
 
 
-def _inside(path: Path, parent: Path) -> bool:
-    return path == parent or parent in path.parents
+def _norm(path: str | Path) -> str:
+    """归一成本地可比较的绝对路径：展开 ~、解析符号链接、Windows 上统一大小写。"""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def _inside(child: str, parent: str) -> bool:
+    if child == parent:
+        return True
+    return child.startswith(parent.rstrip(os.sep) + os.sep)
 
 
 def _guard_local_path(direction: str, path: str) -> str | None:
@@ -632,11 +639,11 @@ def _guard_local_path(direction: str, path: str) -> str | None:
     `put` 的本地源由调用方指定，`get` 的本地目标也是 —— 两边都不设防的话，
     `get prod /etc/shadow ~/.sshhh/hosts.toml` 能把密码库/清单写坏（DoS），
     `put prod ~/.sshhh/vault.enc /tmp/x` 能把整库密文送到远端（#32）。
-    realpath 归一之后再判断，防止用符号链接或 `..` 绕过去。
+    realpath 归一之后再判断，防止用符号链接、`..` 或大小写变体绕过去。
     """
-    target = Path(os.path.realpath(os.path.expanduser(path)))
-    data_dir = Path(os.path.realpath(paths.data_dir()))
-    tmp_dir = Path(os.path.realpath(paths.data_dir() / "tmp"))
+    target = _norm(path)
+    data_dir = _norm(paths.data_dir())
+    tmp_dir = _norm(paths.data_dir() / "tmp")
 
     if direction == "get":
         if _inside(target, tmp_dir):
@@ -644,18 +651,21 @@ def _guard_local_path(direction: str, path: str) -> str | None:
         if _inside(target, data_dir):
             return (f"下载目标不能落在 sshhh 数据目录内（{data_dir}）："
                     "那里是密码库、主机清单和指纹库")
-        cwd = Path(os.path.realpath(os.getcwd()))
-        if _inside(target, cwd):
+        try:
+            cwd = _norm(os.getcwd())
+        except OSError:
+            cwd = ""
+        if cwd and _inside(target, cwd):
             return None
-        return (f"下载目标必须在当前目录（{cwd}）或其子目录，"
+        return (f"下载目标必须在当前目录（{cwd or '（未知）'}）或其子目录，"
                 f"或 {tmp_dir} 内；收到的是 {target}")
 
     if _inside(target, data_dir):
         return (f"上传源不能是 sshhh 数据目录里的文件（{data_dir}）："
                 "那里是密码库、主机清单和指纹库")
-    if not target.exists():
+    if not os.path.exists(target):
         return f"上传源不存在：{target}"
-    if not target.is_file():
+    if not os.path.isfile(target):
         return f"上传源不是普通文件：{target}"
     return None
 

@@ -70,7 +70,7 @@ def bootstrap_lock(timeout: float = 300.0, poll: float = 0.2):
 
 @contextlib.contextmanager
 def _file_lock(lock_path: Path, timeout: float, poll: float):
-    fh = open(lock_path, "a+b")
+    fh = _open_retry(lock_path, timeout, poll)
     deadline = time.monotonic() + timeout
     acquired = False
     try:
@@ -96,6 +96,24 @@ def _file_lock(lock_path: Path, timeout: float, poll: float):
             fh.close()
         except Exception:
             pass
+
+
+def _open_retry(lock_path: Path, timeout: float, poll: float):
+    """打开锁文件；Windows 上刚创建的文件偶尔会短暂占住，退避重试。
+
+    并发首跑时几个进程同时创建/打开 `.bootstrap`，实测偶发 PermissionError。
+    打不开锁文件导致整个 ensure() 崩掉，比晚 100 毫秒拿到锁糟糕得多。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return open(lock_path, "a+b")
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise LockTimeout(
+                    f"打不开锁文件（{lock_path}），可能有别的进程正占用，请稍后重试"
+                ) from None
+            time.sleep(poll)
 
 
 def _acquire(fh) -> None:
