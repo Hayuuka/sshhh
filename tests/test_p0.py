@@ -311,10 +311,104 @@ def test_setpass_keeps_fields() -> None:
     os.environ.pop("SSHHH_MASTER", None)
 
 
+def test_known_hosts() -> None:
+    """损坏的 known_hosts 被吞掉 → 空库 → 任何主机密钥都接受。"""
+
+    import subprocess
+
+    import paramiko
+
+    from lib import transport
+    from lib.store import Host, Settings
+
+    print("\n== #31 损坏的指纹库必须报错，不能静默当空库 ==")
+    reset()
+    known = paths.known_hosts_file()
+    known.write_text("这不是指纹库 随便写的内容\n", encoding="utf-8")
+    client = transport.Client(
+        Host(name="bad", host="127.0.0.1", user="root", port=1),
+        "pw", Settings(),
+    )
+    err: str | None = None
+    try:
+        client.connect()
+    except transport.TransportError as exc:
+        err = str(exc)
+    check("损坏的指纹库让连接中止", err is not None, str(err))
+    check("提示指纹库损坏", err is not None and "指纹库损坏" in err, str(err))
+    check("说明没有发出凭据",
+          err is not None and ("凭据" in err or "没有向该主机发送" in err), str(err))
+    check("报错发生在建连之前（不是网络错误）",
+          err is not None and "网络错误" not in err, str(err))
+
+    print("\n== #31 结构检查能认出截断的行 ==")
+    good_key = paramiko.RSAKey.generate(1024)
+    line = f"1.1.1.1 {good_key.get_name()} {good_key.get_base64()}"
+    check("完整行通过检查", transport.check_known_hosts_text(line + "\n") is None)
+    check("注释与空行通过", transport.check_known_hosts_text("# c\n\n" + line) is None)
+    truncated = transport.check_known_hosts_text(line[:40] + "\n")
+    check("截断行被识别", truncated is not None, str(truncated))
+    short = transport.check_known_hosts_text("1.1.1.1 ssh-rsa\n")
+    check("缺 base64 的行被识别", short is not None, str(short))
+
+    print("\n== #31 只替换该主机的条目，其它行原样保留 ==")
+    old_key = paramiko.RSAKey.generate(1024)
+    new_key = paramiko.RSAKey.generate(1024)
+    original = (
+        "# 手写注释\n"
+        f"1.1.1.1 {old_key.get_name()} {old_key.get_base64()}\n"
+        f"2.2.2.2 {good_key.get_name()} {good_key.get_base64()}\n"
+        "\n"
+        "# 尾巴\n"
+    )
+    merged = transport.merge_known_hosts(original, [("1.1.1.1", new_key)])
+    check("注释保留", "# 手写注释" in merged and "# 尾巴" in merged, merged)
+    check("其它主机保留", "2.2.2.2" in merged, merged)
+    check("旧指纹已替换", old_key.get_base64() not in merged, merged)
+    check("新指纹已写入", new_key.get_base64() in merged, merged)
+    check("同一主机只剩一行",
+          sum(1 for ln in merged.splitlines() if ln.startswith("1.1.1.1 ")) == 1,
+          merged)
+    check("合并结果结构合法", transport.check_known_hosts_text(merged) is None, merged)
+
+    print("\n== #31 并发写下不会写坏指纹库 ==")
+    known.unlink(missing_ok=True)
+    worker = r"""
+import sys, paramiko
+sys.path.insert(0, sys.argv[1])
+from lib import transport
+key = paramiko.RSAKey.generate(1024)
+print("OK" if transport.remember_host_keys([(sys.argv[2], key)]) else "FAIL")
+"""
+    hosts = [f"10.9.0.{i}" for i in range(6)]
+    procs = [
+        subprocess.Popen([sys.executable, "-c", worker, str(SCRIPTS), h],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8")
+        for h in hosts
+    ]
+    results = [p.communicate(timeout=120)[0].strip() for p in procs]
+    check("六个并发写入都成功", results == ["OK"] * len(hosts), str(results))
+
+    text = known.read_text(encoding="utf-8")
+    check("文件没被写坏（结构检查通过）",
+          transport.check_known_hosts_text(text) is None, text)
+    missing = [h for h in hosts if not any(
+        ln.startswith(h + " ") for ln in text.splitlines())]
+    check("六条指纹一条都没丢", not missing, f"缺失 {missing}\n{text}")
+
+    keys = paramiko.HostKeys()
+    keys.load(str(known))
+    check("paramiko 能完整载入", len(keys) == len(hosts), str(list(keys)))
+    check("载入后不再触发 missing_host_key",
+          all(h in keys for h in hosts), str(list(keys)))
+
+
 def main() -> int:
     test_policy_bypass_cases()
     test_audit_does_not_leak_argv()
     test_setpass_keeps_fields()
+    test_known_hosts()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

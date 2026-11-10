@@ -264,6 +264,24 @@ def main() -> int:
     check("文档里没有残留 SSHHH_CALLER",
           "SSHHH_CALLER" not in (skill_md + protocol_md + readme))
 
+    print("\n== TOFU 与指纹库（#31）==")
+    check("README 说明指纹库损坏不退化成『谁都信』",
+          "退化成「谁都信」" in readme, "")
+    check("SKILL.md 给出『主机指纹库损坏』的处置",
+          "主机指纹库损坏" in skill_md, "")
+    import inspect
+
+    from lib import transport as transport_mod  # noqa: E402
+
+    load_src = inspect.getsource(transport_mod.load_known_hosts)
+    check("加载失败路径会抛错而不是 pass",
+          "TransportError" in load_src and "except Exception:\n        pass" not in load_src)
+    check("指纹库写入走原子替换 + 锁",
+          "atomic_write_text" in inspect.getsource(transport_mod.remember_host_keys)
+          and "data_lock" in inspect.getsource(transport_mod.remember_host_keys))
+    check("不再整文件 HostKeys.save 重写",
+          "keys.save" not in inspect.getsource(transport_mod.Client))
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

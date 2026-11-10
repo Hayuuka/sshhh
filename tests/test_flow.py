@@ -382,6 +382,16 @@ def main() -> int:
         check("错误信息不含密码",
               "wrong-password-here" not in (out + err), err)
 
+        print("\n== 指纹库损坏时中止 ==")
+        paths.known_hosts_file().write_text("坏文件 随便写的内容\n", encoding="utf-8")
+        code, out, err = run_cli(["run", HOST_NAME, "echo hi"])
+        check("指纹库损坏 → 4（网络/校验类）",
+              code == protocol.EXIT_NETWORK, str(code))
+        check("提示指纹库损坏", "指纹库损坏" in err, err)
+        check("没有执行远端命令", "hi" not in out, out)
+        check("提示里有修复方向", "known_hosts" in err, err)
+        paths.known_hosts_file().unlink()
+
         print("\n== 命令策略 ==")
         reset_data()
         v = vault.Vault.create(paths.vault_file(), MASTER)

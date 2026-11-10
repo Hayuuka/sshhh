@@ -6,10 +6,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import socket
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import paramiko
 
@@ -36,6 +40,130 @@ class _TOFU(paramiko.MissingHostKeyPolicy):
 
     def missing_host_key(self, client, hostname, key):
         self.new_keys.append((hostname, key))
+
+
+# --------------------------------------------------------------------------
+# known_hosts（TOFU 指纹库）
+# --------------------------------------------------------------------------
+
+
+def _key_line(hostname: str, key: paramiko.PKey) -> str:
+    return f"{hostname} {key.get_name()} {key.get_base64()}"
+
+
+def merge_known_hosts(text: str, entries: list[tuple[str, paramiko.PKey]]) -> str:
+    """把新指纹并进 known_hosts 文本，只动这些主机自己的条目。
+
+    原先每次首连都用 `HostKeys.save()` 整文件重写：并发首连时后写的覆盖先写
+    的，写一半崩掉还能留下截断文件，而截断文件下次被 `except: pass` 吞掉后
+    「谁都被信任」（#31）。这里改成按主机名替换行，其它主机与注释原样保留。
+    """
+    by_host: dict[str, list[str]] = {}
+    for hostname, key in entries:
+        by_host.setdefault(hostname, []).append(_key_line(hostname, key))
+
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        fields = stripped.split()
+        if fields and fields[0] in by_host:
+            continue  # 这台主机的旧条目整体替换掉
+        kept.append(line)
+
+    while kept and not kept[-1].strip():
+        kept.pop()
+    for hostname, lines in by_host.items():
+        kept.extend(lines)
+    return "\n".join(kept) + "\n" if kept else ""
+
+
+def check_known_hosts_text(text: str) -> tuple[int, str] | None:
+    """返回第一条结构性损坏的行 (行号, 内容)，全部正常返回 None。
+
+    为什么要自己看：`paramiko.HostKeys.load()` 对解析不了的行**静默跳过**。
+    文件被写坏一半时它不报错，只是加载出一份更短的指纹库；极端情况下一行都
+    没加载成功，于是「严格校验」变成「任何主机密钥都接受」——这正是 #31 里
+    那条静默降级链的起点。这里只查结构（字段数、base64 是否可解），不判密钥
+    类型，避免把合法的冷门 key type 误判成损坏。
+    """
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        # 带标记的行（@cert-authority / @revoked）多一个字段在前
+        has_marker = fields[0].startswith("@")
+        need = 4 if has_marker else 3
+        if len(fields) < need:
+            return lineno, stripped
+        blob = fields[3] if has_marker else fields[2]
+        if len(blob) < 32:
+            return lineno, stripped
+        try:
+            base64.b64decode(blob, validate=True)
+        except (ValueError, binascii.Error):
+            return lineno, stripped
+    return None
+
+
+def load_known_hosts(ssh: paramiko.SSHClient, path: Path) -> None:
+    """把指纹库装进 client；文件损坏就抛错，绝不静默当作空库继续。
+
+    抛 TransportError → CLI 侧映射成 EXIT_NETWORK(4)，并且发生在认证之前，
+    不会把凭据发给一台「校验不了」的机器。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TransportError(
+            f"主机指纹库损坏，无法校验目标主机：{path}\n（{exc}）\n"
+            "连接已中止，没有向该主机发送任何凭据。请让用户确认如何处理该文件。"
+        ) from None
+
+    bad = check_known_hosts_text(text)
+    if bad is not None:
+        raise TransportError(
+            f"主机指纹库损坏，无法校验目标主机：{path}\n"
+            f"（第 {bad[0]} 行无法解析：{bad[1][:80]}）\n"
+            "连接已中止，没有向该主机发送任何凭据。请让用户确认这个文件为什么坏了："
+            "修好可保留原有指纹；确认要重来则删除它（之后首次连接会重新记录指纹）。"
+        )
+
+    try:
+        ssh.load_host_keys(str(path))
+    except Exception as exc:  # noqa: BLE001
+        raise TransportError(
+            f"主机指纹库载入失败：{path}\n（{exc}）\n"
+            "连接已中止，没有向该主机发送任何凭据。请让用户确认如何处理该文件。"
+        ) from None
+
+
+def remember_host_keys(entries: list[tuple[str, paramiko.PKey]],
+                       path: os.PathLike | str | None = None) -> bool:
+    """记下新主机指纹：加锁 + 原子替换，失败返回 False。
+
+    拿不到锁、写不进去都不能让本次执行失败（命令已经跑完了），但要让调用方
+    有机会提示用户：没记下来的指纹，下次连接会重新走 TOFU。
+    """
+    if not entries:
+        return True
+    target = Path(path) if path is not None else paths.known_hosts_file()
+    from .fsutil import atomic_write_text
+    from .lock import LockTimeout, data_lock
+
+    try:
+        with data_lock(timeout=15):
+            try:
+                text = target.read_text(encoding="utf-8") if target.exists() else ""
+            except OSError:
+                text = ""
+            atomic_write_text(target, merge_known_hosts(text, list(entries)))
+        return True
+    except (OSError, LockTimeout):
+        return False
 
 
 class Client:
@@ -66,10 +194,7 @@ class Client:
 
         known = s.known_hosts
         if known.exists():
-            try:
-                ssh.load_host_keys(str(known))
-            except Exception:
-                pass
+            load_known_hosts(ssh, known)
 
         kwargs: dict = {
             "hostname": h.host,
@@ -111,16 +236,17 @@ class Client:
     def _save_new_keys(self) -> None:
         if not self._tofu.new_keys:
             return
-        known = self.settings.known_hosts
-        try:
-            known.parent.mkdir(parents=True, exist_ok=True)
-            keys = paramiko.HostKeys()
-            if known.exists():
-                keys.load(str(known))
-            for hostname, key in self._tofu.new_keys:
-                keys.add(hostname, key.get_name(), key)
-            keys.save(str(known))
+        entries = list(self._tofu.new_keys)
+        if remember_host_keys(entries, self.settings.known_hosts):
             self._tofu.new_keys.clear()
+            return
+        # 记不下来不让本次执行失败（命令已经跑完、输出就在内存里），但要说出来：
+        # 这台主机的指纹没进库，下次连接会重新走 TOFU。
+        try:
+            sys.stderr.write(
+                f"[sshhh] 警告：没能记录主机指纹（{self.settings.known_hosts}），"
+                "下次连接将重新校验该主机指纹\n"
+            )
         except Exception:
             pass
 
