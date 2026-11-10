@@ -18,7 +18,7 @@
 - 让 AI 帮忙排查线上问题：看日志、查磁盘、看服务状态、重启服务
 - 公司安全要求「生产环境密码不能进入任何第三方 AI 服务」
 - 同时用好几个 AI 工具，不想为每个都配一遍密码
-- 想限制 AI 只能跑只读命令，禁止 `rm -rf`、`shutdown`
+- 想限制 AI 只能跑只读命令，禁止 `rm -rf`、`shutdown`（防手滑，不是安全边界，见 6.1）
 - 给 AI 临时开一次服务器权限，事后能查它到底跑了什么
 
 ## 为什么需要它
@@ -99,12 +99,12 @@ SSHHH_HINT: 请告诉用户在自己的终端里执行：python "..." config
 
 ### 6. 可以限制 AI 能跑什么命令、能碰哪些文件
 
-在主机配置里加规则（正则，命令匹配整条命令，文件规则匹配**远端路径**）：
+在主机配置里加规则（正则；命令规则要求**整条命令**匹配，文件规则匹配**远端路径**）：
 
 ```toml
 [hosts.prod.policy]
-allow     = ['^df -h$', '^systemctl status ', '^docker ps']
-deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status .*', '^docker ps$']
+deny      = ['^rm -rf.*', '^shutdown$', '^mkfs.*']
 allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
 allow_get = ['^/var/log/']
 deny_put  = ['^/etc/']
@@ -112,18 +112,40 @@ deny_put  = ['^/etc/']
 
 | 字段 | 管什么 | 匹配对象 |
 |---|---|---|
-| `allow` / `deny` | `run` 执行的命令 | 整条命令 |
-| `allow_put` / `deny_put` | `put` 上传 | 远端**目标**路径 |
-| `allow_get` / `deny_get` | `get` 下载 | 远端**源**路径 |
+| `allow` / `deny` | `run` 执行的命令 | 整条命令（`fullmatch`） |
+| `allow_put` / `deny_put` | `put` 上传 | 远端**目标**路径（前缀匹配） |
+| `allow_get` / `deny_get` | `get` 下载 | 远端**源**路径（前缀匹配） |
 
 规则：
 
+- 命令规则是 `fullmatch`，不是「字符串里出现过」。`allow = ['^df -h$']` 放行
+  `df -h`，放不过 `x; df -h`；写 `^rm -rf` 只能拦住**正好等于** `rm -rf` 的命令，
+  要拦那一族就写 `^rm -rf.*`。
+- **命令里含 shell 元字符（`;` `&` `|` `$` 反引号 `>` `<` 换行）默认拒绝**——
+  这类写法能把一条命令变成一串命令，让任何按整串写的规则失效。确实需要
+  （例如 `2>/dev/null`、`a && b`）就在主机段里加 `allow_shell = true`，
+  那时规则只对整条命令原样生效。
 - 白名单非空时，不匹配就拒绝；`deny` 优先于 `allow`。
 - **配了 `allow` 命令白名单的主机，文件通道默认关闭**，必须显式写
   `allow_put` / `allow_get` 才能传文件 —— 否则「只允许 `df -h`」的机器
   仍然能被 `get /etc/shadow` 掏空。
 - 只配 `deny` 的主机，文件通道照常可用，除非路径命中 `deny_put` / `deny_get`。
 - 被拒绝时不会连接主机，退出码为 1，并在审计日志里留一条 `*.denied` 记录。
+
+### 6.1 这套规则的定位：防手滑，非安全边界
+
+「能限制 agent 跑什么命令」这句话要说清楚，否则比没有更危险：
+
+- `hosts.toml` 和 `scripts/` 下的代码，对**同一个操作系统用户**的进程都是可写的。
+  agent 想绕开规则，改一行配置、或者直接 `import lib.transport` 都能绕。
+- 所以本地策略是**防手滑**：让「顺手 `rm -rf`」「顺手 `get /etc/shadow`」
+  这类误操作多一道摩擦、多一条审计记录，而不是一道拦得住有意者的墙。
+- 真正的强制只能在服务端做（受限 `authorized_keys` + 服务端包装脚本），
+  那才是 agent 无法绕过的边界。本项目当前默认档（基线模式）不含该能力，
+  文档里不承诺「限制住了 agent」。
+- 同理：审计日志同用户可改，是**留痕**不是防篡改。
+
+这一段的取舍写进了 [docs/DESIGN.md](docs/DESIGN.md)（第 1、3 节），改措辞请先改那里。
 
 ### 7. 输出自动脱敏
 
@@ -275,7 +297,10 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 
 **防不住什么**（如实说明）
 
-拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
+- **本地策略可以被绕过**：`hosts.toml` 与 `scripts/` 对同用户的进程可写，改掉规则
+  或直接调 `lib.transport` 都行。它是**防手滑，非安全边界**（见 6.1）。
+- **审计日志可以被改写**：同用户进程有写权限，留痕不等于防篡改。
+- 拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
 `python -c "from lib import vault; vault.open_vault()"` 一行就够。
 这是操作系统级别的边界，任何本地工具都绕不过去。
 
@@ -338,9 +363,11 @@ password = "@vault:shared"
 py -3.14 -m venv .venv
 .venv/Scripts/python.exe -m pip install paramiko cryptography keyring
 
-# 跑测试（93 项）
+# 跑测试
 .venv/Scripts/python.exe tests/test_flow.py   # 主流程与状态码
-.venv/Scripts/python.exe tests/test_lock.py   # 并发锁
+.venv/Scripts/python.exe tests/test_p0.py     # P0 真值修复（策略 / 审计 / 传输 / 输出）
+.venv/Scripts/python.exe tests/test_lock.py   # 并发锁与自举竞态
+.venv/Scripts/python.exe tests/test_store.py  # 主机清单读写
 py -3.14 tests/test_docs.py                   # 文档与代码一致性
 ```
 

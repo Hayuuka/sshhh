@@ -234,6 +234,23 @@ def main() -> int:
     check("SKILL.md 提醒 put/get 同样受策略约束",
           "allow_put" in skill_md and "allow_get" in skill_md)
 
+    print("\n== B 层定性：三份文档口径一致（#28）==")
+    # 定位错误比实现 bug 更重要：三份文档都必须承认本地策略不是安全边界，
+    # 否则 README 一句「能限制 agent 跑什么命令」就会变成安全承诺。
+    for label, text in (("README.md", readme), ("SKILL.md", skill_md),
+                        ("protocol.md", protocol_md)):
+        check(f"{label} 写明「防手滑，非安全边界」", "防手滑" in text, "")
+        check(f"{label} 承认本地策略可被绕过",
+              ("可写" in text) or ("可被绕过" in text) or ("绕不过" in text), "")
+    check("README 说明命令规则是 fullmatch", "fullmatch" in readme)
+    check("README 说明元字符默认拒绝",
+          "元字符" in readme and "默认拒绝" in readme)
+    check("README 记载 allow_shell 开关", "allow_shell" in readme)
+    check("protocol.md 记载 allow_shell 开关", "allow_shell" in protocol_md)
+    check("SKILL.md 记载元字符默认拒绝", "元字符" in skill_md)
+    check("README 旧示例已改成 fullmatch 写法",
+          "'^systemctl status '" not in readme, "仍是未锚定的旧示例")
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1

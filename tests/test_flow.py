@@ -287,8 +287,11 @@ def main() -> int:
         reset_data()
         v = vault.Vault.create(paths.vault_file(), MASTER)
         v.set(HOST_NAME, SSH_PASSWORD)
+        # allow_shell：下面的脱敏用例要把带 & < 的密码原样 echo 出去，
+        # #28 之后含元字符的命令默认被拒，这里显式放开（与脱敏逻辑无关）。
         store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1",
-                                     user=USER, port=port, description="测试"))
+                                     user=USER, port=port, description="测试",
+                                     allow_shell=True))
 
         mock = MockConsole().install()
         code, out, err = run_cli(["run", HOST_NAME, "echo hello-world"])
@@ -385,11 +388,22 @@ def main() -> int:
         v.set(HOST_NAME, SSH_PASSWORD)
         h = store.Host(name=HOST_NAME, host="127.0.0.1", user=USER, port=port)
         store.upsert_host(h)
-        store.set_policy(HOST_NAME, [], [r"^rm -rf"])
+        # fullmatch 语义：要拦一整族就得写 .*（旧写法 ^rm -rf 只拦正好那一条）
+        store.set_policy(HOST_NAME, [], [r"^rm -rf.*"])
         MockConsole().install()
         code, _, err = run_cli(["run", HOST_NAME, "rm -rf /tmp/x"])
         check("deny 规则生效", code == 1, str(code))
         check("拒绝提示", "策略拒绝" in err, err)
+
+        code, _, err = run_cli(["run", HOST_NAME, "df -h && rm -rf /tmp/x"])
+        check("含 shell 元字符默认拒绝", code == 1, str(code))
+        check("提示里点明元字符", "元字符" in err, err)
+
+        store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1", user=USER,
+                                     port=port, allow_shell=True))
+        code, _, err = run_cli(["run", HOST_NAME, "echo a && echo b"])
+        check("allow_shell 主机放行 &&", code == 0, err)
+        store.upsert_host(h)
 
         print("\n== 只读命令 ==")
         code, out, _ = run_cli(["list"])

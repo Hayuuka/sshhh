@@ -85,6 +85,28 @@ class StoreError(Exception):
     pass
 
 
+# 命令里出现这些字符就默认拒绝。它们让「一条命令」变成「一串命令」，
+# 任何按整条字符串写的 allow / deny 规则都会被绕开（#28）。
+_SHELL_META = frozenset(";&|$`\n\r<>")
+
+_META_LABEL = {
+    "\n": "\\n", "\r": "\\r",
+}
+
+
+def _matches(pattern: str, text: str) -> bool:
+    """整条字符串匹配一条规则。
+
+    用 fullmatch 而不是 search：`allow = ['df -h']` 在 search 下会放过
+    `x; rm -rf /; df -h`。规则写坏（非法正则）时退化成字面全串比较，
+    不让一条笔误把整台机器变成「不设防」或「完全不可用」。
+    """
+    try:
+        return re.fullmatch(pattern, text) is not None
+    except re.error:
+        return pattern == text
+
+
 @dataclass
 class Policy:
     """主机策略。
@@ -93,6 +115,11 @@ class Policy:
     通道，匹配的是**远端路径**（put 看目标、get 看源）。命令策略和文件策略
     分开配置，是因为它们拦的是完全不同的东西：一条白名单管不住
     `get /etc/shadow`。
+
+    定性（重要）：这是**防手滑，非安全边界**。hosts.toml 和本文件对同用户
+    的进程都可写，agent 想绕开随时能绕开（改文件、直接调 lib）。真正的强制
+    只能在服务端做。这里的价值是让「顺手犯的错」付出一点摩擦成本，并留下
+    拒绝记录，而不是拦住有意绕过的调用方。
     """
 
     allow: list[str] = field(default_factory=list)
@@ -102,13 +129,25 @@ class Policy:
     deny_put: list[str] = field(default_factory=list)
     deny_get: list[str] = field(default_factory=list)
 
-    def check(self, command: str) -> str | None:
+    def check(self, command: str, *, allow_shell: bool = False) -> str | None:
+        """校验一条 `run` 命令。返回 None 表示放行，否则返回拒绝原因。
+
+        `allow_shell=True` 的主机跳过元字符检查（例如需要 `2>/dev/null`
+        或 `a && b` 的场景），代价是 allow / deny 只对整条命令原样生效。
+        """
+        if not allow_shell:
+            meta = sorted({_META_LABEL.get(ch, ch) for ch in command
+                           if ch in _SHELL_META})
+            if meta:
+                return ("命令包含 shell 元字符（" + "、".join(meta)
+                        + "），默认拒绝；确需使用请在主机配置里加 "
+                          "allow_shell = true")
         for pat in self.deny:
-            if re.search(pat, command):
+            if _matches(pat, command):
                 return f"命中禁止规则 /{pat}/"
         if self.allow:
             for pat in self.allow:
-                if re.search(pat, command):
+                if _matches(pat, command):
                     return None
             return "未命中任何允许规则（该主机处于白名单模式）"
         return None
@@ -156,6 +195,9 @@ class Host:
     description: str = ""
     sudo: bool = False
     key_file: str | None = None
+    # 允许命令里出现 shell 元字符（`;` `&&` `|` 重定向等）。默认关闭，
+    # 见 Policy.check：#28 之后含元字符的命令默认拒绝。
+    allow_shell: bool = False
     policy: Policy = field(default_factory=Policy)
 
 
@@ -202,6 +244,7 @@ def load() -> dict[str, Host]:
             description=str(item.get("description", "")),
             sudo=bool(item.get("sudo", False)),
             key_file=item.get("key_file") or None,
+            allow_shell=bool(item.get("allow_shell", False)),
             policy=Policy(
                 allow=[str(x) for x in (pol.get("allow") or [])],
                 deny=[str(x) for x in (pol.get("deny") or [])],
@@ -250,6 +293,8 @@ def upsert_host(host: Host) -> None:
     block.append(f'user = "{_esc(host.user)}"')
     if host.sudo:
         block.append("sudo = true")
+    if host.allow_shell:
+        block.append("allow_shell = true")
     if host.key_file:
         block.append(f'key_file = "{_esc(host.key_file)}"')
 

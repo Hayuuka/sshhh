@@ -97,13 +97,13 @@ there. Every later call reuses it. Your system Python stays untouched.
 
 ### 6. Restrict what the agent can run — and which files it can touch
 
-Add rules per host. Command rules are regexes matched against the whole command;
-file rules are matched against the **remote path**:
+Add rules per host. Command rules are regexes that must match the **entire**
+command (`fullmatch`); file rules are matched against the **remote path**:
 
 ```toml
 [hosts.prod.policy]
-allow     = ['^df -h$', '^systemctl status ', '^docker ps']
-deny      = ['^rm -rf', 'shutdown', 'mkfs']
+allow     = ['^df -h$', '^systemctl status .*', '^docker ps$']
+deny      = ['^rm -rf.*', '^shutdown$', '^mkfs.*']
 allow_put = ['^/tmp/', '^/etc/nginx/conf\.d/']
 allow_get = ['^/var/log/']
 deny_put  = ['^/etc/']
@@ -111,12 +111,19 @@ deny_put  = ['^/etc/']
 
 | Field | Governs | Matched against |
 |---|---|---|
-| `allow` / `deny` | commands run via `run` | the whole command |
+| `allow` / `deny` | commands run via `run` | the whole command (`fullmatch`) |
 | `allow_put` / `deny_put` | uploads via `put` | the remote **destination** path |
 | `allow_get` / `deny_get` | downloads via `get` | the remote **source** path |
 
 Rules:
 
+- Command rules use `fullmatch`, not "contains". `allow = ['^df -h$']` permits
+  `df -h` but not `x; df -h`; `^rm -rf` only blocks a command that is exactly
+  `rm -rf` — write `^rm -rf.*` to block the family.
+- **Commands containing shell metacharacters (`;` `&` `|` `$` backtick `>` `<`
+  newline) are refused by default**, because they can turn one command into a
+  chain and defeat any whole-string rule. If you need them (e.g. `2>/dev/null`,
+  `a && b`), set `allow_shell = true` in that host's section.
 - When an allow-list is present, anything unmatched is refused; `deny` wins over `allow`.
 - **A host with an `allow` command list has its file channel closed by default.**
   You must add `allow_put` / `allow_get` explicitly — otherwise a box that only
@@ -125,6 +132,19 @@ Rules:
   matches `deny_put` / `deny_get`.
 - A refusal happens before connecting, returns exit code 1, and writes a `*.denied`
   audit record.
+
+### 6.1 What these rules are (and are not): prevents slips, not a security boundary
+
+- `hosts.toml` and the code under `scripts/` are writable by any process running
+  as the same OS user. An agent that wants to get around the rules can edit the
+  file or import `lib.transport` directly.
+- So the local policy **prevents slips, not a security boundary**: it adds friction
+  and an audit trail to accidents like a stray `rm -rf` or `get /etc/shadow`, and
+  it cannot stop a caller that deliberately bypasses it.
+- Real enforcement can only live on the server (restricted `authorized_keys` plus
+  a server-side wrapper). That is not part of the default baseline mode, and this
+  README does not claim the agent is "restricted".
+- Likewise the audit log is a record, not tamper protection: the same user can edit it.
 
 ### 7. Automatic output redaction
 
@@ -280,7 +300,11 @@ python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
 
 **What it does not protect against** (stated plainly)
 
-A program that already has your OS account privileges can call this project's
+- **Local policy can be bypassed**: `hosts.toml` and `scripts/` are writable by
+  the same user, so rules can be edited away or `lib.transport` called directly.
+  It prevents slips, not a security boundary (see 6.1).
+- **The audit log can be rewritten** by the same user: it is a record, not tamper protection.
+- A program that already has your OS account privileges can call this project's
 Python API and decrypt the vault. One line of
 `python -c "from lib import vault; vault.open_vault()"` is enough. That is an
 operating-system boundary; no local tool can cross it.

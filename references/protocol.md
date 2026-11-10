@@ -245,13 +245,22 @@ agent 调用时 ─────────────────┘
 
 | 字段 | 管什么 | 匹配对象 |
 |------|--------|----------|
-| `allow` / `deny` | `run` | 整条命令 |
-| `allow_put` / `deny_put` | `put` | 远端目标路径 |
-| `allow_get` / `deny_get` | `get` | 远端源路径 |
+| `allow` / `deny` | `run` | 整条命令（`fullmatch`） |
+| `allow_put` / `deny_put` | `put` | 远端目标路径（前缀匹配） |
+| `allow_get` / `deny_get` | `get` | 远端源路径（前缀匹配） |
 
+- 命令规则用 `fullmatch`：`^df -h$` 只放行 `df -h`，放过不 `x; df -h`。
+  要拦一族命令写 `^rm -rf.*`，只写 `^rm -rf` 只拦「正好等于」那一条。
+- 命令含 shell 元字符（`;` `&` `|` `$` 反引号 `>` `<` 换行）时**默认拒绝**，
+  除非该主机段里写了 `allow_shell = true`。
 - 白名单非空时不匹配即拒绝；`deny` 优先。
 - 配了 `allow` 命令白名单的主机，文件通道默认关闭（需显式 `allow_put` / `allow_get`）。
 - 拒绝发生在连接之前：不建连、退出码 1、写 `run.denied` / `transfer.denied`。
+
+**定性**：本地策略是**防手滑，非安全边界**。`hosts.toml` 与 `scripts/` 对同用户
+进程可写，绕过它不需要任何技巧（改文件或直接调 `lib.transport`）；它的价值是
+给误操作加摩擦、给拒绝留记录。唯一 agent 绕不过的强制在服务端（受限
+`authorized_keys` + 服务端包装），不在本档实现范围内。
 
 审计（`audit.log`）覆盖所有触达凭据或远端的动作，`action` 取值：
 

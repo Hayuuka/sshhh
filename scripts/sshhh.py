@@ -420,7 +420,7 @@ def cmd_run(argv: list[str]) -> int:
     redactor = Redactor([password] if password else [])
     safe_cmd = redactor.clean(command)
 
-    reason = host.policy.check(command)
+    reason = host.policy.check(command, allow_shell=host.allow_shell)
     if reason:
         audit.write("run.denied", host=name, user=host.user, command=safe_cmd,
                     ok=False, error=reason)
