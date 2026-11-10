@@ -446,6 +446,10 @@ def cmd_run(argv: list[str]) -> int:
     if not command:
         raise UsageError('缺少要执行的命令，例如：sshhh run prod "df -h"')
 
+    # 选项本身先校验一遍：参数写错就报 2，不要先去弹配置窗口
+    timeout = _float_opt(opts, "timeout")
+    max_bytes, tail_lines = _output_opts(opts)
+
     # --- 1. 没有密码库：先配置 -------------------------------------------
     if not paths.vault_file().exists():
         status, detail = _launch("setup", {})
@@ -506,9 +510,8 @@ def cmd_run(argv: list[str]) -> int:
         _warn(f"[sshhh] 命令被策略拒绝：{reason}")
         return 1
 
-    timeout = _float_opt(opts, "timeout")
+    # stdin 放到策略检查之后再读：被拒的命令不该先把调用方的管道吃掉
     stdin_data = _stdin_data(opts)
-    max_bytes, tail_lines = _output_opts(opts)
 
     client = Client(host, password, store.Settings(), redactor)
     try:
