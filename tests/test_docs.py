@@ -116,7 +116,7 @@ def main() -> int:
     unknown = mentioned - names - {
         "SSHHH_STATUS", "SSHHH_MESSAGE", "SSHHH_HINT",
         "SSHHH_SETUP_TIMEOUT", "SSHHH_SETUP_HANDOFF",
-        "SSHHH_DATA_DIR", "SSHHH_CALLER", "SSHHH_MASTER",
+        "SSHHH_DATA_DIR", "SSHHH_MASTER",
         "RESULT_KEYS", "CREATE_NEW_CONSOLE", "CREATE_BREAKAWAY_FROM_JOB",
         "PIP_INDEX_URL",
     }
@@ -250,6 +250,19 @@ def main() -> int:
     check("SKILL.md 记载元字符默认拒绝", "元字符" in skill_md)
     check("README 旧示例已改成 fullmatch 写法",
           "'^systemctl status '" not in readme, "仍是未锚定的旧示例")
+
+    print("\n== 审计字段口径（#29）==")
+    check("protocol.md 说明 vault.open 只留前两个 argv 参数",
+          "前两个" in protocol_md)
+    check("README 不再宣称 caller 字段", "caller pid" not in readme)
+    check("英文 README 不再宣称 caller 字段", "caller pid" not in readme_en)
+    for label, text in (("README.md", readme), ("SKILL.md", skill_md),
+                        ("protocol.md", protocol_md)):
+        check(f"{label} 不再把 --stdin <值> 当用法",
+              '--stdin "mysql' not in text and "--stdin 密" not in text, "")
+    check("SKILL.md 说明 --stdin 只接受 -", "--stdin -" in skill_md)
+    check("文档里没有残留 SSHHH_CALLER",
+          "SSHHH_CALLER" not in (skill_md + protocol_md + readme))
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

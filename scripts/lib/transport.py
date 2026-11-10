@@ -136,8 +136,9 @@ class Client:
 
         if use_sudo:
             command = f"sudo -S -p '' bash -lc {_shquote(command)}"
-            if stdin_data is None:
-                stdin_data = (self._password or "") + "\n"
+            # `sudo -S` 把 stdin 的第一行当密码。调用方自己喂的数据必须排在
+            # 后面，否则 sudo 会拿它当密码去认证，命令根本跑不起来。
+            stdin_data = (self._password or "") + "\n" + (stdin_data or "")
 
         try:
             stdin, stdout, stderr = self._ssh.exec_command(

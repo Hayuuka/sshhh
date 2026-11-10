@@ -1,14 +1,16 @@
 """审计日志：JSON Lines，记录谁连了哪台机器、跑了什么。
 
 **绝不记录**密码或命令输出。写入前命令已由调用方脱敏。
+
+「谁」也不从环境变量取：`SSHHH_CALLER` 是调用方自己填的，填什么就是什么，
+把它写成 caller 字段只是制造一种「有归属」的错觉（#29）。真正可核对的是
+pid / 可执行文件 / 工作目录 / 命令行前缀，见 vault._audit_open。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
-from pathlib import Path
 
 from . import paths
 
@@ -39,9 +41,6 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
         record["ms"] = duration_ms
     if error:
         record["error"] = _cut(error, 200)
-    caller = os.environ.get("SSHHH_CALLER")
-    if caller:
-        record["caller"] = caller[:80]
 
     path = paths.audit_file()
     try:

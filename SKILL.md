@@ -74,13 +74,23 @@ python scripts/sshhh.py run prod "df -h"
 
 ### 选项的位置
 
-`--sudo`、`--timeout`、`--stdin` 写在主机名之前或之后都等价：
+`--sudo`、`--timeout`、`--stdin`、`--stdin-file` 写在主机名之前或之后都等价：
 
 ```bash
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run --sudo prod "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 ```
+
+需要给远端命令喂标准输入时，用管道配 `--stdin -`，或直接读文件：
+
+```bash
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
+```
+
+**不要用 `--stdin <值>` 那种写法**（已删除，会直接报错）：值会进 argv、进程
+列表和审计日志。要传的内容里有密码，就走管道或 `--stdin-file`。
 
 需要把 `--sudo` 这类字样**原样交给远端**时，用 `--` 分隔：
 

@@ -165,7 +165,7 @@ a password.
 | `setpass` | which host's password changed (never the password) |
 | `unlock` | unlock events, including failed automatic attempts |
 | `migrate` | source directory and record counts |
-| `vault.open` | every successful decryption: caller pid, command line, working directory |
+| `vault.open` | every successful decryption: pid, interpreter, working directory, first two argv tokens |
 
 ```bash
 python scripts/sshhh.py audit -n 20
@@ -285,6 +285,10 @@ Common flags:
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
+
+# feed stdin to a remote command (never via argv, so never in ps or the audit log)
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
 
 ## Security model
@@ -314,8 +318,8 @@ time — but then the agent can't run unattended.
 
 The real improvement is this: **for the AI to steal the password, it has to
 actively write code against internal APIs** rather than just read a file. Every
-successful decryption appends a `vault.open` audit record (caller pid, command
-line, working directory), so that path **cannot be blocked, but it does leave a
+successful decryption appends a `vault.open` audit record (pid, interpreter,
+working directory, first two argv tokens), so that path **cannot be blocked, but it does leave a
 trail** you can inspect afterwards.
 
 ## FAQ

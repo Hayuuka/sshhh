@@ -282,6 +282,10 @@ sequenceDiagram
 python scripts/sshhh.py run prod --sudo "systemctl restart nginx"
 python scripts/sshhh.py run prod --timeout 600 "make build"
 python scripts/sshhh.py run prod -- tail -n 100 /var/log/nginx/error.log
+
+# 给远端命令喂标准输入（内容不进 argv，也就不进进程列表和审计）
+cat schema.sql | python scripts/sshhh.py run prod --stdin - "mysql -u app"
+python scripts/sshhh.py run prod --stdin-file ./schema.sql "mysql -u app"
 ```
 
 ## 安全模型

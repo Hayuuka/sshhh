@@ -76,7 +76,8 @@ _LONG_BOOL_FLAGS = frozenset({"sudo"})
 def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
     """解析参数。
 
-    长选项（`--timeout` / `--stdin` / `--sudo`）写在主机名之前或之后都等价：
+    长选项（`--timeout` / `--stdin-file` / `--sudo` / `--stdin`）写在主机名
+    之前或之后都等价：
 
         run --sudo hk "systemctl restart nginx"
         run hk --sudo "systemctl restart nginx"
@@ -354,12 +355,44 @@ def cmd_setup(argv: list[str]) -> int:
     return 0
 
 
+def _stdin_data(opts: dict) -> str | None:
+    """取要喂给远端命令的标准输入。
+
+    内容一律不经过 argv —— argv 会进进程列表，也会进审计（#29）：
+
+        cat schema.sql | sshhh run prod --stdin - "mysql -u app"
+        sshhh run prod --stdin-file ./schema.sql "mysql -u app"
+
+    `--stdin` 只接受 `-`（标准输入）。旧写法 `--stdin <值>` 直接报错而不是
+    默默忽略：那个值会变成命令的一部分，等于把秘密写进审计日志。
+    """
+    if "stdin" in opts:
+        value = str(opts["stdin"])
+        if value != "-":
+            raise UsageError(
+                "--stdin 只接受 -（表示从标准输入读取）。\n"
+                "旧的 --stdin <值> 写法已删除：值会进 argv、进程列表和审计日志。\n"
+                "请改用：cat 文件 | sshhh run <主机> --stdin - <命令>\n"
+                "        或：sshhh run <主机> --stdin-file <文件> <命令>"
+            )
+        return sys.stdin.read() or None
+    if "stdin-file" in opts:
+        source = str(opts["stdin-file"])
+        if source == "-":
+            return sys.stdin.read() or None
+        try:
+            return Path(source).expanduser().read_text(encoding="utf-8") or None
+        except OSError as exc:
+            raise UsageError(f"读不了 --stdin-file {source}：{exc}") from None
+    return None
+
+
 def cmd_run(argv: list[str]) -> int:
     from lib import audit, protocol, store, vault
     from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
-    opts, pos = _parse(argv, {"timeout", "stdin"})
+    opts, pos = _parse(argv, {"timeout", "stdin", "stdin-file"})
     if not pos:
         raise UsageError('用法：sshhh run <主机> "<命令>"')
     name = pos[0]
@@ -428,7 +461,7 @@ def cmd_run(argv: list[str]) -> int:
         return 1
 
     timeout = float(opts["timeout"]) if "timeout" in opts else None
-    stdin_data = str(opts["stdin"]) if "stdin" in opts else None
+    stdin_data = _stdin_data(opts)
 
     client = Client(host, password, store.Settings(), redactor)
     try:

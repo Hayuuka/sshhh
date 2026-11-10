@@ -267,5 +267,15 @@ agent 调用时 ─────────────────┘
 `run`、`run.denied`、`transfer.put`、`transfer.get`、`transfer.denied`、
 `test`、`setpass`、`unlock`、`migrate`、`vault.open`。
 
-`vault.open` 记录的是「谁解密了密码库」：pid、调用方命令行、工作目录。
-它拦不住同用户进程直接调用 `lib.vault`（操作系统级边界），但能让这条路留痕。
+`vault.open` 记录的是「谁解密了密码库」：pid、解释器、工作目录、命令行**前两个
+参数**。它拦不住同用户进程直接调用 `lib.vault`（操作系统级边界），但能让这条路
+留痕。
+
+只留前两个参数是刻意的：整串 `sys.argv` 会把调用方顺手写在命令里的秘密一起
+落盘（`run prod --stdin S3cret mysql -pS3cret` 就是原样两条），而 redactor 只认得
+主密码和库里已有的值。落盘前仍会再过一遍 redactor，作第二道保险。
+
+同理，标准输入的内容只能来自管道（`--stdin -`）或 `--stdin-file <文件>`，
+**不接受 `--stdin <值>`** —— 值会进 argv、进程列表和审计，所以这种写法现在
+直接报参数错误（退出码 2），而不是默默放行。审计记录里也不再有 `caller`
+字段：它取自定义方随便就能设置的环境变量，只是「有归属」的错觉。
