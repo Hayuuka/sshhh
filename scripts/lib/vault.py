@@ -313,6 +313,8 @@ class Vault:
         v._key = _derive(master, salt, _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
         v._data = {}
         v._flush()
+        from . import integrity
+        integrity.set_vault_key(v._key)
         return v
 
     @classmethod
@@ -363,6 +365,11 @@ class Vault:
                     continue
                 v._legacy_aad = True
             _audit_open(path, cand, v._data.values())
+            # 绑定 hosts.toml 完整性签名的 MAC 密钥（#18）：签名随密码库
+            # 解锁而生效，强制路径（run / test / put / get / harden）先解锁
+            # 后验签，锁定时只读视图仍可用
+            from . import integrity
+            integrity.set_vault_key(v._key)
             return v
 
         raise VaultError("主密码错误或钥匙串中没有可用的主密码")
@@ -441,6 +448,9 @@ class Vault:
             "p": _SCRYPT_P,
         }
         self._key = _derive(new_master, salt, _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+        # 换了主密码，签名密钥随之更换；旧签名会失效，需重新 reseal（#18）
+        from . import integrity
+        integrity.set_vault_key(self._key)
         self._flush()
 
 

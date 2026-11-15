@@ -44,4 +44,5 @@ jobs:
           python tests/test_store.py
           python tests/test_p0.py
           python tests/test_p1.py
+          python tests/test_p2.py
           python tests/test_docs.py

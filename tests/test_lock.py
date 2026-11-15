@@ -104,9 +104,12 @@ def run_worker(mode: str, name: str, hold: float, timeout: float = 30.0) -> dict
 STORE_WORKER = r"""
 import json, sys
 sys.path.insert(0, sys.argv[1])
-from lib import store
+from lib import store, vault
 out = {"ok": True}
 try:
+    # 写已签名的 hosts.toml 需要持钥（#18）：生产里所有写路径都先解锁
+    # 密码库，worker 对齐这个语义 —— 主密码从继承的 SSHHH_MASTER 取
+    vault.open_vault()
     store.upsert_host(store.Host(name=sys.argv[2], host="10.0.0.1",
                                  user="root", description="并发写入"))
 except Exception as exc:

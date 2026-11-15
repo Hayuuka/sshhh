@@ -21,7 +21,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover - 3.9/3.10 由运行时装 tomli（见 runtime.PACKAGES）
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
-from . import paths
+from . import integrity, paths
 from .fsutil import atomic_write_text, read_text
 from .lock import data_lock
 
@@ -31,6 +31,8 @@ HEADER = """\
 # 这里没有密码字段，密码在 vault.enc 里，用 sshhh setpass <名称> 录入。
 # 手动加主机后不必再做什么，第一次执行时会自动要求补充密码。
 # 注意：程序写入时会整份规范重排（不保留注释与排版），字段值始终保留。
+# 注意：清单带完整性签名（[sshhh_integrity] 段）—— 手编之后连接会被拒绝，
+# 这是预期行为：检查内容无误后执行 sshhh manage reseal 重新签名。
 
 """
 
@@ -96,6 +98,31 @@ def _heal_legacy(text: str) -> str:
 
 class StoreError(Exception):
     pass
+
+
+# 完整性签名失效时的指引（#18）。这段话写给最终用户：签名失效最常见的
+# 原因是本人手编了 hosts.toml（预期行为，reseal 一次即可）；但也可能是
+# 别的进程改了清单 —— 所以必须先检查内容，再重新签名。
+_RESEAL_HINT = (
+    "如果你刚手动编辑过 hosts.toml，这是预期行为：先检查文件内容是否符合"
+    "你的本意，然后在你的终端执行 sshhh manage reseal 重新签名。\n"
+    "如果你没有改过它，说明有别的程序动过这份清单——先弄清楚改了什么。"
+)
+
+
+def _verify_integrity(doc: dict) -> None:
+    """读路径的强制验签点。签名密钥未绑定（密码库没解锁）时跳过。
+
+    run / test / put / get / harden 全部先解锁密码库才走到这里，所以
+    强制路径必然验签；list / status / policy 在锁定状态下仍可用来
+    检查被改过的文件。
+    """
+    key = integrity.mac_key()
+    if key is None:
+        return
+    problem = integrity.verify_doc(doc, key)
+    if problem is not None:
+        raise StoreError(f"{problem}\n{_RESEAL_HINT}")
 
 
 # 命令里出现这些字符就默认拒绝。它们让「一条命令」变成「一串命令」，
@@ -229,6 +256,21 @@ class Settings:
 
 
 def load() -> dict[str, Host]:
+    """读主机清单。密码库已解锁时会先验完整性签名，失败抛 StoreError
+    （fail-closed，#18）：宁可拒绝服务，也不按一份被改过的清单放行命令。"""
+    path = paths.hosts_file()
+    if not path.exists():
+        return {}
+    _verify_integrity(_read_doc())
+    return load_unverified()
+
+
+def load_unverified() -> dict[str, Host]:
+    """不做完整性验签的读取，仅供 list / status / policy 这类只读展示。
+
+    这些视图的存在意义之一就是让用户在被改动的清单上「看看改了什么」，
+    所以不能被验签挡住。任何会触发连接或策略判定的路径禁止用本函数。
+    """
     path = paths.hosts_file()
     if not path.exists():
         return {}
@@ -297,13 +339,16 @@ def _read_doc() -> dict:
             raise StoreError(f"hosts.toml 解析失败：{exc}") from None
 
 
-def _write_doc(doc: dict) -> None:
-    """整份规范重排落盘：tomli-w 统一序列化 + 原子替换 + 权限收紧。
+def _write_doc(doc: dict, *, force_seal: bool = False) -> None:
+    """整份规范重排落盘：tomli-w 统一序列化 + 完整性签名 + 原子替换。
 
-    注释与排版不保留（方案 B 的代价）；文件头的使用说明保留，清单依旧可以
-    手编，程序下次写入时把手写内容重新规范排序（字段值始终保留）。
-    内容里有主机名、用户名、策略，没有密码；但仍按 0600 写，省得别人顺手
-    读到「这台机器上有哪些生产环境」。
+    签名续签规则（#18，防洗白）：
+    - 文件尚不存在 → 直接签名（首台主机的正常路径）
+    - 原有文件带**有效**签名 → 重签（向导加主机、迁移都会自动续签）
+    - 原有文件没有签名或签名已失效 → **不签名**照写：一次普通写入不能把
+      被篡改或遗留未签的清单洗成「已验证」状态；强制路径依旧 fail-closed，
+      直到用户检查内容后显式 reseal。
+    `force_seal` 仅供 manage reseal（用户本人检查过内容后的显式确认）。
     """
     try:
         import tomli_w
@@ -312,7 +357,49 @@ def _write_doc(doc: dict) -> None:
             "缺少 tomli-w（写 hosts.toml 需要）。请运行 sshhh manage setup "
             "重建运行环境，或 pip install tomli-w"
         ) from exc
-    atomic_write_text(paths.hosts_file(), HEADER + tomli_w.dumps(doc), mode=0o600)
+    path = paths.hosts_file()
+    key = integrity.mac_key()
+    if force_seal:
+        if key is None:
+            raise StoreError("密码库未解锁，无法生成 hosts.toml 的完整性签名")
+        doc = integrity.seal_doc(doc, key)
+    elif not path.exists():
+        # 全新清单：没有历史可洗白，直接进入签名状态
+        if key is not None:
+            doc = integrity.seal_doc(doc, key)
+    else:
+        old = _read_doc()
+        if integrity.SECTION in old:
+            # 已带签名段的文件：必须持钥重签。所有合法写路径（向导 / 迁移 /
+            # reseal）都先解锁了密码库；没持钥就写，唯一结局是把签名弄成
+            # 陈旧值让下一次连接 fail-closed —— 不如现在就拒绝，把话说清楚。
+            if key is None:
+                raise StoreError(
+                    "hosts.toml 带完整性签名，写入需要解锁密码库来重新签名；"
+                    "请使用 sshhh 的管理命令操作，而不是直接调内部写函数"
+                )
+            if integrity.verify_doc(old, key) is None:
+                doc = integrity.seal_doc(doc, key)
+            # 原有签名已失效 → 不签名照写：普通写入不能把被篡改或遗留
+            # 未签的清单洗成「已验证」状态，强制路径依旧 fail-closed，
+            # 直到用户检查内容后显式 reseal。
+        elif key is not None and not old.get("hosts"):
+            # 空清单的首次写入（升级前的遗留空文件）：没有可保护的内容，
+            # 直接进入签名状态
+            doc = integrity.seal_doc(doc, key)
+    atomic_write_text(path, HEADER + tomli_w.dumps(doc), mode=0o600)
+
+
+def reseal() -> None:
+    """给当前 hosts.toml 重新签名（manage reseal，用户本人执行）。
+
+    前提：密码库已解锁 —— 签名密钥从主密码派生。文件解析失败抛 StoreError，
+    绝不基于半份清单签名。签名覆盖当前文件的全部内容，所以必须在用户
+    检查过内容之后调用。
+    """
+    with data_lock():
+        doc = _read_doc()
+        _write_doc(doc, force_seal=True)
 
 
 def upsert_host(host: Host) -> None:

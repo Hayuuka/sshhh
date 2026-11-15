@@ -39,6 +39,7 @@ sshhh —— AI 可用的 SSH 通道，密码不进入 AI 上下文
   manage setpass <主机>    修改某台主机的密码
   manage unlock           重新输入主密码
   manage policy <主机>     查看该主机的生效策略
+  manage reseal            手编 hosts.toml 后重新签名
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
   manage harden <主机> --check 只读探测远端可加固性
   manage migrate <旧目录>  从旧版 sshx 项目迁移主机和密码
@@ -521,7 +522,12 @@ def cmd_run(argv: list[str]) -> int:
             return protocol.emit(protocol.EXIT_LOCKED, str(exc), nonce=nonce)
 
     # --- 3. 主机必须已配置 -----------------------------------------------
-    host = store.get(name)
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        # 清单解析失败或完整性签名失效（#18）：建连前中止，
+        # 绝不按一份被改过的清单放行命令
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc), nonce=nonce)
     if host is None:
         status, detail = _launch("add_host", {"host_name": name})
         if status != "ok":
@@ -601,7 +607,13 @@ def cmd_list(argv: list[str]) -> int:
     from lib import store, vault
 
     _parse(argv, set())
-    hosts = store.load()
+    # 只读展示用免验签读取（load_unverified）：清单签名失效时用户恰恰需要
+    # 用 list 看看里面有什么；验签由 run / test 等强制路径负责
+    try:
+        hosts = store.load_unverified()
+    except store.StoreError as exc:
+        _warn(f"[sshhh] {exc}")
+        return 3
     if not hosts:
         _say("还没有配置任何主机。")
         _say(f"对 AI 说「连一下 <名称>」即可触发配置，或手动执行：{_manual_cmd('config')}")
@@ -638,7 +650,10 @@ def cmd_test(argv: list[str]) -> int:
         raise UsageError("用法：sshhh test <主机>")
     name = pos[0]
 
-    host = store.get(name)
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
 
@@ -754,7 +769,10 @@ def _transfer(argv: list[str], direction: str) -> int:
         raise UsageError(f"用法：sshhh {direction} <主机> <本地> <远端>")
     name, a, b = pos[0], pos[1], pos[2]
 
-    host = store.get(name)
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
     try:
@@ -864,7 +882,10 @@ def cmd_setpass(argv: list[str]) -> int:
         raise UsageError("用法：sshhh setpass <主机>")
     name = pos[0]
 
-    host = store.get(name)
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
 
@@ -953,7 +974,11 @@ def cmd_status(argv: list[str]) -> int:
             _say(f"[!!] 密码库无法自动解锁：{exc}")
             _backend_guidance()
 
-    hosts = store.load()
+    try:
+        hosts = store.load_unverified()
+    except store.StoreError as exc:
+        _say(f"[!!] 主机清单读取失败：{exc}")
+        return 3
     _say(f"[--] 已配置 {len(hosts)} 台主机")
     for n, h in sorted(hosts.items()):
         _say(f"     {n}: {h.user}@{h.host}:{h.port} {h.description}")
@@ -1122,7 +1147,10 @@ def cmd_harden(argv: list[str]) -> int:
         return 2
     name = pos[0]
 
-    host = store.get(name)
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
     try:
@@ -1227,7 +1255,8 @@ def cmd_policy(argv: list[str]) -> int:
     """查看某台主机的生效策略（管理操作）。
 
     修改策略仍走 hosts.toml 手编（语法见 README 策略一节）；这里是只读视图，
-    免得用户为「看一眼」去解析整份清单。
+    免得用户为「看一眼」去解析整份清单。用免验签读取：签名失效时用户恰恰
+    需要先用它检查清单被改成了什么，再决定是否 reseal（#18）。
     """
     from lib import store
 
@@ -1235,7 +1264,11 @@ def cmd_policy(argv: list[str]) -> int:
     if not pos:
         raise UsageError("用法：sshhh manage policy <主机>")
     name = pos[0]
-    host = store.get(name)
+    try:
+        host = store.load_unverified().get(name)
+    except store.StoreError as exc:
+        _warn(f"[sshhh] {exc}")
+        return 3
     if host is None:
         return _unknown_host(name)
 
@@ -1256,6 +1289,44 @@ def cmd_policy(argv: list[str]) -> int:
     return 0
 
 
+def cmd_reseal(argv: list[str]) -> int:
+    """重新签名 hosts.toml（#18 完整性校验的合法化出口）。
+
+    hosts.toml 现在带 HMAC 签名：程序写入自动续签，手编之后签名失效，
+    所有连接在建连前被拒 —— 这是预期行为，不是故障。本命令在用户检查过
+    文件内容之后重新签名。签名密钥从主密码派生，密码库未解锁时先走解锁
+    流程；解锁经由窗口完成时，本进程会在拿到结果后自行再开一次密码库。
+    """
+    from lib import audit, protocol, store, vault
+
+    _parse(argv, set())
+    if not paths.hosts_file().exists():
+        _warn("[sshhh] 还没有 hosts.toml，没有可签名的内容")
+        return 3
+    try:
+        vault.open_vault()
+    except vault.VaultError:
+        status, detail = _launch("unlock", {})
+        if status != "ok":
+            audit.write("reseal", ok=False, error=f"密码库未解锁（{status}）")
+            return _setup_failed(status, detail, "unlock")
+        try:
+            vault.open_vault()
+        except vault.VaultError as exc:
+            audit.write("reseal", ok=False, error=str(exc))
+            return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
+    try:
+        store.reseal()
+    except store.StoreError as exc:
+        audit.write("reseal", ok=False, error=str(exc))
+        _warn(f"[sshhh] {exc}")
+        return 3
+    audit.write("reseal")
+    _say("[ok] hosts.toml 已重新签名，之后的连接会重新校验完整性")
+    return 0
+
+
 MANAGE_USAGE = """\
 sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
 
@@ -1264,6 +1335,7 @@ sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
   manage setpass <主机>     修改某台主机的密码
   manage unlock            重新输入主密码
   manage policy <主机>      查看该主机的生效策略
+  manage reseal            手编 hosts.toml 后重新签名（完整性校验，#18）
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
   manage harden <主机> --check 只读探测远端可加固性（不改动，见 #15）
   manage migrate <旧目录>   从旧版 sshx 项目迁移
@@ -1312,6 +1384,7 @@ MANAGE_COMMANDS = {
     "setpass": cmd_setpass,
     "unlock": cmd_unlock,
     "policy": cmd_policy,
+    "reseal": cmd_reseal,
     "audit": cmd_audit,
     "migrate": cmd_migrate,
     "harden": cmd_harden,

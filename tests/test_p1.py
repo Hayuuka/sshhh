@@ -1012,6 +1012,12 @@ def test_store_canonical_rewrite() -> None:
         'host = "5.6.7.8"\n',
         encoding="utf-8",
     )
+    # 此前测试创建过密码库，签名密钥仍绑定在本进程（#18）：手写的清单
+    # 先补签（等价 manage reseal 的升级路径），否则验签 fail-closed
+    from lib import integrity
+
+    if integrity.mac_key() is not None:
+        store.reseal()
     store.upsert_host(store.Host(name="prod", host="9.9.9.9", user="root",
                                  description="更新"))
     raw = paths.hosts_file().read_text(encoding="utf-8")
