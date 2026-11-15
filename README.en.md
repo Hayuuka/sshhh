@@ -259,8 +259,11 @@ On Windows that is `C:\Users\<you>\.sshhh\`. The master password itself is kept
 in the OS credential store — Windows Credential Locker, macOS Keychain, or
 Secret Service on Linux.
 
-To move to another machine, copy the whole `~/.sshhh/` directory; the master
-password stays the same.
+To move to another machine, copy `~/.sshhh/` **excluding `venv/`** (the runtime
+rebuilds itself on first use). The master password stays the same and
+`vault.enc` works as-is; the entry in the OS credential store, however, is
+indexed by a path hash, so the new machine won't find it — you'll be asked to
+unlock once (`sshhh unlock`) on first use. No host re-configuration needed.
 
 ## How it works
 
