@@ -22,8 +22,12 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tomllib
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # 3.9/3.10 用 pip 的 tomli（与 lib.store 一致）
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 import paramiko
 
