@@ -177,6 +177,13 @@ def main() -> int:
     check("交接时长与代码一致",
           f"{int(handoff_default)}" in protocol_md, str(handoff_default))
     check("SKILL.md 建议首次调用 300 秒", "300 秒" in skill_md)
+    # 算式陈述曾经写反（pip 150s < 交接 120s 不成立，#13）；锁定正确形态
+    chain = "pip 安装 150s + 窗口交接 120s ≈ 270s"
+    check("超时链算式两处一致且已修正（#13）",
+          chain in skill_md and chain in protocol_md,
+          f"skill={chain in skill_md}, protocol={chain in protocol_md}")
+    check("旧的反向不等式不再出现",
+          "150s  <  窗口交接 120s" not in skill_md + protocol_md)
 
     print("\n== 运行时降级说明 ==")
     from lib import runtime  # noqa: E402
