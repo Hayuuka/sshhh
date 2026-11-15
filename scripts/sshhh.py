@@ -1393,6 +1393,12 @@ MANAGE_COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     _setup_io()
+    # SSHHH_DATA_DIR 是路径类保护的根：只在显式测试模式下生效（#18）。
+    # 拒绝发生在一切数据访问之前。
+    refusal = paths.override_without_test_mode()
+    if refusal:
+        _warn(f"[sshhh] {refusal}")
+        return 3
     args = list(sys.argv[1:] if argv is None else argv)
 
     if not args or args[0] in ("-h", "--help", "help"):

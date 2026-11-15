@@ -501,6 +501,15 @@ def _write_result(path: Path, data: dict) -> None:
 
 
 def main() -> int:
+    # 与 sshhh.main 同一道门（#18）：SSHHH_DATA_DIR 只在测试模式下生效。
+    # 父进程经 argv[5] 传入的目录是内部可信通道，在门禁之后显式应用。
+    from lib import paths
+
+    refusal = paths.override_without_test_mode()
+    if refusal:
+        print(f"[sshhh] {refusal}", file=sys.stderr)
+        return 3
+
     if len(sys.argv) < 5:
         print("参数错误", file=sys.stderr)
         return 2
@@ -512,8 +521,10 @@ def main() -> int:
 
     # 数据目录由父进程显式传入：窗口是 explorer 拉起的，
     # 环境变量不一定还是调用方那一份，必须钉死，否则会读写到另一份密码库。
+    # 该通道等同测试模式的受信设置（#18 门禁之后仍需生效）
     if len(sys.argv) >= 6:
         os.environ["SSHHH_DATA_DIR"] = sys.argv[5]
+        os.environ["SSHHH_TEST_MODE"] = "1"
 
     # 一次只允许一个向导实例。窗口被重复拉起时（explorer 转发、
     # 命令行被解析两次等），后到的这个立刻退出，不跟用户抢同一个控制台。

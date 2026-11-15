@@ -4,7 +4,9 @@
 路径写死在用户主目录下，与 skill 的安装位置无关，因此升级 / 重装 skill
 不会覆盖配置。
 
-环境变量 SSHHH_DATA_DIR 仅用于测试隔离，正常使用不要设置。
+环境变量 SSHHH_DATA_DIR 仅在显式测试模式（SSHHH_TEST_MODE=1）下生效（#18）：
+它指到别处就能绕过基于路径的本地保护（put/get 的数据目录约束、指纹库与
+签名文件的落点等）。正常使用不要设置。
 """
 
 from __future__ import annotations
@@ -14,10 +16,37 @@ from pathlib import Path
 
 _DEFAULT_DATA_DIR = Path.home() / ".sshhh"
 
+DATA_DIR_ENV = "SSHHH_DATA_DIR"
+TEST_MODE_ENV = "SSHHH_TEST_MODE"
+
 
 def data_dir() -> Path:
-    override = os.environ.get("SSHHH_DATA_DIR")
-    return Path(override) if override else _DEFAULT_DATA_DIR
+    """数据目录。
+
+    `SSHHH_DATA_DIR` 只在 `SSHHH_TEST_MODE=1` 同时存在时生效；否则忽略该
+    变量并回落默认目录。入口（sshhh.main / console_setup.main）会用
+    `override_without_test_mode()` 检测这种组合并明确拒绝 —— 这里无声
+    回落是为了让深层调用不至于拿到一个谁都没料到的目录。
+    """
+    override = os.environ.get(DATA_DIR_ENV)
+    if override and os.environ.get(TEST_MODE_ENV) == "1":
+        return Path(override)
+    return _DEFAULT_DATA_DIR
+
+
+def override_without_test_mode() -> str | None:
+    """SSHHH_DATA_DIR 被设置但不在测试模式 → 返回拒绝理由；否则 None。
+
+    拒绝而不是无声忽略（#18）：无声忽略会让「以为换了目录」的调用方把
+    数据写到默认目录里，制造两份半重叠的配置，比明确报错难查得多。
+    """
+    if os.environ.get(DATA_DIR_ENV) and os.environ.get(TEST_MODE_ENV) != "1":
+        return (
+            f"{DATA_DIR_ENV} 只在测试模式（{TEST_MODE_ENV}=1）下生效："
+            "它能改变凭据与保护机制的落点，正常使用不应设置。\n"
+            "如果这确实是测试环境，请同时设置 SSHHH_TEST_MODE=1 后重试。"
+        )
+    return None
 
 
 def vault_file() -> Path:

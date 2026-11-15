@@ -37,6 +37,7 @@ FAILED = 0
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-test-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+os.environ["SSHHH_TEST_MODE"] = "1"  # SSHHH_DATA_DIR 仅测试模式生效（#18）
 
 # 传输用的本地文件放在数据目录之外：数据目录里的路径现在会被拒绝（#32）
 _FILES = Path(tempfile.mkdtemp(prefix="sshhh-files-"))

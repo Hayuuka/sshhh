@@ -25,6 +25,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-store-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+os.environ["SSHHH_TEST_MODE"] = "1"  # SSHHH_DATA_DIR 仅测试模式生效（#18）
 
 from lib import paths, store  # noqa: E402
 

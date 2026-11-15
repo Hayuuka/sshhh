@@ -31,6 +31,7 @@ else:  # 3.9/3.10 用 pip 的 tomli（与 lib.store 一致）
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-p1-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+os.environ["SSHHH_TEST_MODE"] = "1"  # SSHHH_DATA_DIR 仅测试模式生效（#18）
 os.environ.pop("SSHHH_MASTER", None)
 
 PASSED = 0

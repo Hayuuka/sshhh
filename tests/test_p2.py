@@ -30,8 +30,8 @@ MASTER = "p2-master-passphrase-11a4"
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-p2-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+os.environ["SSHHH_TEST_MODE"] = "1"  # SSHHH_DATA_DIR 仅测试模式生效（#18）
 os.environ["SSHHH_MASTER"] = MASTER
-os.environ.pop("SSHHH_TEST_MODE", None)
 
 import sshhh as cli  # noqa: E402
 from lib import audit, integrity, paths, store, vault  # noqa: E402
@@ -331,17 +331,70 @@ def test_enforcement_and_views() -> None:
     env["SSHHH_TEST_MODE"] = "1"  # commit #18c 起必须随 SSHHH_DATA_DIR 一起给
     proc = subprocess.run(
         [sys.executable, "-I", "-c", worker, str(SCRIPTS)],
-        capture_output=True, text=True, encoding="utf-8", timeout=120, env=env,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, env=env,
     )
     check("子进程 reseal 退出码 0", proc.returncode == 0,
           f"{proc.stdout[-300:]}{proc.stderr[-300:]}")
     check("子进程 reseal 落盘生效", store.get("prod") is not None)
 
 
+# --------------------------------------------------------------------------
+# #18 SSHHH_DATA_DIR 仅测试模式生效
+# --------------------------------------------------------------------------
+
+
+def test_data_dir_gating() -> None:
+    print("\n== #18 SSHHH_DATA_DIR 无测试模式时拒绝 ==")
+    saved_dir = os.environ.get("SSHHH_DATA_DIR")
+    saved_mode = os.environ.get("SSHHH_TEST_MODE")
+    try:
+        os.environ["SSHHH_DATA_DIR"] = str(_TMP / "elsewhere")
+        os.environ.pop("SSHHH_TEST_MODE", None)
+        code, out, err = run_cli(["status"])
+        check("CLI 明确拒绝（退出码 3）", code == 3, f"{code} {out}{err}")
+        check("报错说明测试模式", "SSHHH_TEST_MODE" in err, err)
+        check("拒绝发生在任何数据访问之前", "数据目录" not in out, out)
+
+        print("\n== #18 测试模式下覆盖生效 ==")
+        os.environ["SSHHH_TEST_MODE"] = "1"
+        code, out, err = run_cli(["status"])
+        check("status 正常运行", code == 0, f"{out}{err}")
+        check("数据目录就是覆盖值", str(_TMP) in out, out)
+    finally:
+        if saved_dir is not None:
+            os.environ["SSHHH_DATA_DIR"] = saved_dir
+        else:
+            os.environ.pop("SSHHH_DATA_DIR", None)
+        if saved_mode is not None:
+            os.environ["SSHHH_TEST_MODE"] = saved_mode
+        else:
+            os.environ.pop("SSHHH_TEST_MODE", None)
+
+    print("\n== #18 console_setup 入口同样拒绝 ==")
+    worker = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "import console_setup; sys.exit(console_setup.main())"
+    )
+    env = dict(os.environ)
+    env["SSHHH_DATA_DIR"] = str(_TMP / "elsewhere")
+    env.pop("SSHHH_TEST_MODE", None)
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", worker, str(SCRIPTS)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=60, env=env,
+    )
+    check("向导入口退出码 3", proc.returncode == 3,
+          f"{proc.stdout[-200:]}{proc.stderr[-200:]}")
+    check("拒绝理由进 stderr", "SSHHH_TEST_MODE" in proc.stderr,
+          proc.stderr[-300:])
+
+
 def main() -> int:
     test_seal_roundtrip_and_tamper()
     test_unsealed_failclosed_and_reseal()
     test_enforcement_and_views()
+    test_data_dir_gating()
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

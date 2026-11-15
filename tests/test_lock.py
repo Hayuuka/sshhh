@@ -29,6 +29,7 @@ MASTER = "lock-test-master-4b2e"
 
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-lock-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
+os.environ["SSHHH_TEST_MODE"] = "1"  # SSHHH_DATA_DIR 仅测试模式生效（#18）
 os.environ["SSHHH_MASTER"] = MASTER
 
 from lib import paths, store, vault  # noqa: E402
