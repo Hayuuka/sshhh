@@ -8,7 +8,9 @@ from urllib.parse import quote
 PLACEHOLDER = "[REDACTED]"
 
 _GENERIC = [
-    re.compile(r"(?i)((?:password|passwd|pwd)\s*[=:]\s*)(\S+)"),
+    # `pwd` 不进来：它是「打印工作目录」的极常见写法（Makefile、CI 输出、
+    # shell 提示符），误伤会把排障要看的路径抹掉（#11）。
+    re.compile(r"(?i)((?:password|passwd)\s*[=:]\s*)(\S+)"),
     re.compile(r"(?i)(--password[= ])(\S+)"),
 ]
 
