@@ -230,7 +230,12 @@ def _launch(task: str, payload: dict) -> tuple[str, dict]:
     from lib import console
 
     if not console.available():
-        return console.TIMEOUT, {}
+        # 弹窗不可用有多种原因，文案必须对症（#33）：非 Windows 的 agent shell
+        # 没有 tty，根本没有窗口可等；.no-window 标记说明这个环境弹窗撑不住。
+        # 退出码一律 12（TIMEOUT）不变契约，但 hint 不再提「窗口可能还开着」。
+        if paths.no_window_marker().exists():
+            return "gone", {}  # 弹窗链路已知撑不住，复用同款指引
+        return "unavailable", {}
     return console.launch(task, payload, _setup_timeout(), _handoff_seconds())
 
 
@@ -242,6 +247,20 @@ def _setup_failed(status: str, detail: dict, manual_sub: str,
     """
     from lib import protocol
 
+    if status == "unavailable":
+        return protocol.emit(
+            protocol.EXIT_TIMEOUT,
+            "这里没有可用的交互窗口环境，配置没有完成",
+            hint=(
+                "这台机器（或当前调用环境）无法弹出配置窗口（非图形环境，"
+                "或 agent 的非交互终端）。\n"
+                "不要提「窗口」——这里根本没有窗口。请告诉用户在自己的终端里"
+                "执行下面的命令，跟着提示设置主密码和服务器信息：\n"
+                f"{_manual_cmd('config --here')}\n"
+                "配置完成后重试原命令即可。"
+            ),
+            nonce=nonce,
+        )
     if status == "cancel":
         return protocol.emit(
             protocol.EXIT_CANCELLED, "用户取消了配置，未做任何修改", nonce=nonce

@@ -612,6 +612,59 @@ def test_audit_streaming() -> None:
     check("-n 非数字报参数错误（2）", code == 2, f"{code} {err}")
 
 
+# --------------------------------------------------------------------------
+# #33 非 Windows 首跑：没有窗口可等时，文案不再提「窗口」
+# --------------------------------------------------------------------------
+
+
+def test_non_windows_first_run_guidance() -> None:
+    import json as jsonlib
+
+    from lib import console, paths, protocol, vault
+
+    real_launch, real_available = console.launch, console.available
+    try:
+        print("\n== #33 无弹窗环境（非 nt / 非 tty）：hint 指向 config --here，不提窗口 ==")
+        reset()
+        # 模拟 console.available() 在非 Windows 非 tty 下的返回：False。
+        # （不 patch os.name —— pathlib 在 Windows 上切到 PosixPath 会直接炸）
+        console.available = lambda: False
+        code, _, err = run_cli(["run", "box", "echo hi"])
+        check("返回 12（契约不变）", code == protocol.EXIT_TIMEOUT, str(code))
+        check("提示 config --here", "config --here" in err, err)
+        check("文案不提「窗口可能还开着」", "窗口可能还开着" not in err, err)
+        check("文案说明这里没有窗口", "没有可用的交互窗口" in err, err)
+        check("状态行带 run 的 nonce",
+              "SSHHH_STATUS[" in err and "SSHHH_INVOCATION" in err, err[:200])
+
+        print("\n== #33 .no-window 标记：复用 gone 同款指引 ==")
+        reset()
+        paths.ensure_data_dir()
+        paths.no_window_marker().write_text("测试标记", encoding="utf-8")
+        code, _, err = run_cli(["config"])
+        check("返回 12", code == protocol.EXIT_TIMEOUT, str(code))
+        check("指向自己终端里的 --here", "--here" in err, err)
+        check("不再出现误导文案", "窗口可能还开着" not in err, err)
+        paths.no_window_marker().unlink()
+
+        print("\n== #33 config --here 在无 tty 环境依旧拒绝并解释 ==")
+        reset()
+        # 与 test_flow 同款：伪造非 tty 的 stdin，否则真终端里会进交互向导
+        import io as _io
+        import sys as _sys
+
+        real_stdin = _sys.stdin
+        _sys.stdin = _io.StringIO()
+        try:
+            code, _, err = run_cli(["config", "--here"])
+        finally:
+            _sys.stdin = real_stdin
+        check("返回 3（配置错误）", code == protocol.EXIT_CONFIG, str(code))
+        check("提示到真实终端执行", "真实" in err or "终端" in err, err)
+    finally:
+        console.launch, console.available = real_launch, real_available
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -620,6 +673,7 @@ def main() -> int:
     test_tofu_hostkey_line()
     test_nonce_anti_forgery()
     test_audit_streaming()
+    test_non_windows_first_run_guidance()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)
