@@ -16,8 +16,12 @@ from pathlib import Path
 
 from . import paths
 
-REQUIRED_MODULES = ("paramiko", "cryptography", "keyring")
-PACKAGES = ("paramiko", "cryptography", "keyring")
+REQUIRED_MODULES = ("paramiko", "cryptography", "keyring", "tomli_w")
+PACKAGES = (
+    "paramiko", "cryptography", "keyring", "tomli-w",
+    # 3.9/3.10 没有标准库 tomllib，读 hosts.toml 需要 tomli（#22）
+    'tomli; python_version < "3.11"',
+)
 
 _BOOT_FLAG = "SSHHH_BOOTSTRAPPED"
 _ENTRY = Path(__file__).resolve().parent.parent / "sshhh.py"
@@ -56,9 +60,10 @@ class PythonTooOldError(RuntimeError_):
 
 def deps_ok(executable: str | Path) -> bool:
     try:
-        code = (
-            "import " + ",".join(REQUIRED_MODULES)
-        )
+        modules = list(REQUIRED_MODULES)
+        if sys.version_info < (3, 11):
+            modules.append("tomli")
+        code = "import " + ",".join(modules)
         proc = subprocess.run(
             [str(executable), "-c", code],
             capture_output=True,

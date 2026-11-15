@@ -985,6 +985,58 @@ def test_auth_field_and_key_namespace() -> None:
     check("说明 names() 过滤", "过滤" in proto and "key:" in proto)
 
 
+# --------------------------------------------------------------------------
+# #22 store.py 方案 B：写路径规范重排
+# --------------------------------------------------------------------------
+
+
+def test_store_canonical_rewrite() -> None:
+    import tomllib
+
+    from lib import paths, store
+
+    print("\n== #22 写路径整份规范重排，未知内容不丢 ==")
+    reset()
+    paths.hosts_file().write_text(
+        "# 我的手写注释\n"
+        "[hosts.prod]\n"
+        'host = "1.2.3.4"\n'
+        'user = "root"\n'
+        "port = 22\n"
+        'custom_field = "keep-me"\n'
+        "\n"
+        "[hosts.half]\n"  # 缺 user 的半成品条目
+        'host = "5.6.7.8"\n',
+        encoding="utf-8",
+    )
+    store.upsert_host(store.Host(name="prod", host="9.9.9.9", user="root",
+                                 description="更新"))
+    raw = paths.hosts_file().read_text(encoding="utf-8")
+    check("写入后仍是合法 TOML", bool(tomllib.loads(raw)))
+    check("未知字段保留", "custom_field" in raw, raw)
+    check("半成品条目没被写丢", "half" in raw, raw)
+    check("注释不再保留（方案 B 的代价）", "我的手写注释" not in raw)
+    check("文件头使用说明保留", "# sshhh 主机清单" in raw)
+    check("规范重排走 tomli-w", 'host = "9.9.9.9"' in raw, raw)
+    h = store.get("prod")
+    check("更新生效", h is not None and h.host == "9.9.9.9"
+          and h.description == "更新", str(h))
+    check("半成品条目对 load 不可见（缺 user）", store.get("half") is None)
+    store.upsert_host(store.Host(name="half", host="5.6.7.8", user="root"))
+    check("补全后恢复可见", store.get("half") is not None)
+
+    print("\n== #22 解析失败的文件 fail-closed，绝不写入 ==")
+    paths.hosts_file().write_text("[hosts.bad\nhost = ", encoding="utf-8")
+    err = None
+    try:
+        store.upsert_host(store.Host(name="x", host="1.1.1.1", user="r"))
+    except store.StoreError as exc:
+        err = exc
+    check("写路径抛 StoreError", err is not None, str(err))
+    check("坏文件保持原样", "host = " in
+          paths.hosts_file().read_text(encoding="utf-8"))
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -1000,6 +1052,7 @@ def main() -> int:
     test_manage_dispatch()
     test_harden_check()
     test_auth_field_and_key_namespace()
+    test_store_canonical_rewrite()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

@@ -464,11 +464,12 @@ vault.enc 里。注意「多 agent 共用配置」不需要这个：所有 agent
 ```bash
 # 安装依赖
 py -3.14 -m venv .venv
-.venv/Scripts/python.exe -m pip install paramiko cryptography keyring
+.venv/Scripts/python.exe -m pip install paramiko cryptography keyring tomli-w
 
 # 跑测试
 .venv/Scripts/python.exe tests/test_flow.py   # 主流程与状态码
 .venv/Scripts/python.exe tests/test_p0.py     # P0 真值修复（策略 / 审计 / 传输 / 输出）
+.venv/Scripts/python.exe tests/test_p1.py     # P1 修复回归（nonce / 审计 / 加固等）
 .venv/Scripts/python.exe tests/test_lock.py   # 并发锁与自举竞态
 .venv/Scripts/python.exe tests/test_store.py  # 主机清单读写
 py -3.14 tests/test_docs.py                   # 文档与代码一致性

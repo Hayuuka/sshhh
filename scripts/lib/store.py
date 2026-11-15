@@ -1,15 +1,25 @@
 """主机清单（hosts.toml）。
 
 只存连接信息，**永不存密码** —— 密码一律在 vault.enc 里按主机名索引。
+
+写路径（#22 方案 B，2026-11-15 作者拍板）：不再做「保留注释与排版」的
+文本手术 —— 读进 dict、改、用 tomli-w 整份规范重排。代价是程序写入后
+不保留手写注释；换来的是「手动编辑格式稍有出入就写坏清单」这一类问题
+（#2）从根上消失，加字段也不用再动手术代码。
 """
 
 from __future__ import annotations
 
 import json
 import re
-import tomllib
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - 3.9/3.10 由运行时装 tomli（见 runtime.PACKAGES）
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 from . import paths
 from .fsutil import atomic_write_text, read_text
@@ -20,6 +30,7 @@ HEADER = """\
 #
 # 这里没有密码字段，密码在 vault.enc 里，用 sshhh setpass <名称> 录入。
 # 手动加主机后不必再做什么，第一次执行时会自动要求补充密码。
+# 注意：程序写入时会整份规范重排（不保留注释与排版），字段值始终保留。
 
 """
 
@@ -267,88 +278,86 @@ def get(name: str) -> Host | None:
     return load().get(name)
 
 
-def _section_index(text: str, name: str) -> tuple[int, int] | None:
-    """返回 [hosts.<name>] 段的 (起始行, 结束行)。"""
-    lines = text.splitlines()
-    start = None
-    for idx, line in enumerate(lines):
-        path = _section_path(line)
-        if path is None:
-            continue
-        if len(path) >= 2 and path[0] == "hosts" and path[1] == name:
-            if start is None:
-                start = idx
-        elif start is not None:
-            return start, idx
-    if start is None:
-        return None
-    return start, len(lines)
+def _read_doc() -> dict:
+    """读整份原始 TOML 文档（不清洗、保留未知字段），供写路径使用。
+
+    解析不了先按旧格式修一遍（#2 的遗留文件），仍然失败就抛 StoreError
+    （fail-closed）：绝不基于半份清单写入，那比不写更糟。
+    """
+    path = paths.hosts_file()
+    if not path.exists():
+        return {}
+    text = read_text(path)
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        try:
+            return tomllib.loads(_heal_legacy(text))
+        except tomllib.TOMLDecodeError as exc:
+            raise StoreError(f"hosts.toml 解析失败：{exc}") from None
+
+
+def _write_doc(doc: dict) -> None:
+    """整份规范重排落盘：tomli-w 统一序列化 + 原子替换 + 权限收紧。
+
+    注释与排版不保留（方案 B 的代价）；文件头的使用说明保留，清单依旧可以
+    手编，程序下次写入时把手写内容重新规范排序（字段值始终保留）。
+    内容里有主机名、用户名、策略，没有密码；但仍按 0600 写，省得别人顺手
+    读到「这台机器上有哪些生产环境」。
+    """
+    try:
+        import tomli_w
+    except ImportError as exc:  # pragma: no cover - 运行时会装好依赖
+        raise StoreError(
+            "缺少 tomli-w（写 hosts.toml 需要）。请运行 sshhh manage setup "
+            "重建运行环境，或 pip install tomli-w"
+        ) from exc
+    atomic_write_text(paths.hosts_file(), HEADER + tomli_w.dumps(doc), mode=0o600)
 
 
 def upsert_host(host: Host) -> None:
-    """新增或更新一台主机（保留文件中的其它内容与注释）。
+    """新增或更新一台主机（保留该主机的 policy 子段与清单里的其它内容）。
 
-    写入本身在 data_lock 内完成，调用方**不需要**自己加锁（#9）；落盘走
-    tmp + os.replace，否则并发读会拿到截断的 TOML，表现为「清单解析失败」。
+    写入本身在 data_lock 内完成，调用方**不需要**自己加锁（#9）。
     """
     with data_lock():
-        path = paths.hosts_file()
-        text = _heal_legacy(read_text(path)) if path.exists() else HEADER
-
-        block = [f"[hosts.{_key(host.name)}]"]
+        doc = _read_doc()
+        hosts = doc.setdefault("hosts", {})
+        item = hosts.setdefault(host.name, {})
+        item["host"] = host.host
+        item["user"] = host.user
+        item["port"] = host.port
         if host.description:
-            block.append(f'description = "{_esc(host.description)}"')
-        block.append(f'host = "{_esc(host.host)}"')
-        block.append(f"port = {host.port}")
-        block.append(f'user = "{_esc(host.user)}"')
-        if host.sudo:
-            block.append("sudo = true")
-        if host.allow_shell:
-            block.append("allow_shell = true")
-        if host.key_file:
-            block.append(f'key_file = "{_esc(host.key_file)}"')
-
-        span = _section_index(text, host.name)
-        if span is None:
-            text = text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n"
+            item["description"] = host.description
         else:
-            start, end = span
-            lines = text.splitlines()
-            # 只替换主段，保留后面的 [hosts.xxx.policy] 子段
-            section_end = start + 1
-            while section_end < end:
-                if _section_path(lines[section_end]) is not None:
-                    break
-                section_end += 1
-            new_lines = lines[:start] + block + [""] + lines[section_end:]
-            text = "\n".join(new_lines).rstrip("\n") + "\n"
-
-        _write_hosts(text)
+            item.pop("description", None)
+        if host.sudo:
+            item["sudo"] = True
+        else:
+            item.pop("sudo", None)
+        if host.allow_shell:
+            item["allow_shell"] = True
+        else:
+            item.pop("allow_shell", None)
+        if host.key_file:
+            item["key_file"] = host.key_file
+        else:
+            item.pop("key_file", None)
+        # policy 子段原样保留（set_policy 专门负责它）
+        _write_doc(doc)
 
 
 def remove_host(name: str) -> bool:
     with data_lock():
-        path = paths.hosts_file()
-        if not path.exists():
+        if not paths.hosts_file().exists():
             return False
-        text = _heal_legacy(read_text(path))
-        span = _section_index(text, name)
-        if span is None:
+        doc = _read_doc()
+        hosts = doc.get("hosts") or {}
+        if name not in hosts:
             return False
-        start, end = span
-        lines = text.splitlines()
-        del lines[start:end]
-        _write_hosts("\n".join(lines).rstrip("\n") + "\n")
+        del hosts[name]
+        _write_doc(doc)
         return True
-
-
-def _write_hosts(text: str) -> None:
-    """清单落盘：原子替换 + 权限收紧。
-
-    内容里有主机名、用户名、策略，没有密码；但仍按 0600 写，省得别人顺手
-    读到「这台机器上有哪些生产环境」。
-    """
-    atomic_write_text(paths.hosts_file(), text, mode=0o600)
 
 
 def set_policy(name: str, allow: list[str], deny: list[str], *,
@@ -361,58 +370,20 @@ def set_policy(name: str, allow: list[str], deny: list[str], *,
     文件通道的四条规则是关键字参数，老调用方（只传 allow / deny）不受影响。
     """
     with data_lock():
-        path = paths.hosts_file()
-        if not path.exists():
+        if not paths.hosts_file().exists():
             raise StoreError(f"主机 {name} 不存在")
-        text = _heal_legacy(read_text(path))
-        lines = text.splitlines()
-
-        # 定位已有的 policy 段并删除
-        start = None
-        end = None
-        for idx, line in enumerate(lines):
-            path_ = _section_path(line)
-            if path_ is None:
-                continue
-            is_policy = (path_ == ["hosts", name, "policy"])
-            if is_policy and start is None:
-                start = idx
-            elif start is not None:
-                end = idx
-                break
-        if start is not None:
-            del lines[start:(end if end is not None else len(lines))]
-            text = "\n".join(lines).rstrip("\n") + "\n"
-
-        rules = [
-            ("allow", allow),
-            ("deny", deny),
-            ("allow_put", allow_put or []),
-            ("allow_get", allow_get or []),
-            ("deny_put", deny_put or []),
-            ("deny_get", deny_get or []),
-        ]
-        block = [f"[hosts.{_key(name)}.policy]"]
-        for key, values in rules:
-            if values:
-                block.append(f"{key} = [" + ", ".join(_q(v) for v in values) + "]")
-
-        if len(block) > 1:
-            _write_hosts(text.rstrip("\n") + "\n\n" + "\n".join(block) + "\n")
+        doc = _read_doc()
+        hosts = doc.get("hosts") or {}
+        if name not in hosts:
+            raise StoreError(f"主机 {name} 不存在")
+        rules = {
+            "allow": allow, "deny": deny,
+            "allow_put": allow_put or [], "allow_get": allow_get or [],
+            "deny_put": deny_put or [], "deny_get": deny_get or [],
+        }
+        pol = {k: v for k, v in rules.items() if v}
+        if pol:
+            hosts[name]["policy"] = pol
         else:
-            _write_hosts(text)
-
-
-def _q(value: str) -> str:
-    """TOML 单引号字面量，正则里的反斜杠无需转义。
-
-    字面量字符串里没有任何办法表示单引号（写两个是无效语法，会让整份清单解析失败），
-    这种情况退回双引号基本字符串。
-    """
-    if "'" in value:
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    return "'" + value + "'"
-
-
-def _esc(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+            hosts[name].pop("policy", None)
+        _write_doc(doc)
