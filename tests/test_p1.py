@@ -541,6 +541,77 @@ def _nonce_checks(console, audit, paths, protocol, store, vault) -> None:
     check("protocol.md 说明老 agent 的退化行为", "退化为按" in proto)
 
 
+# --------------------------------------------------------------------------
+# #26 审计分流：展示层默认滤 vault.open；tail 倒读；轮转
+# --------------------------------------------------------------------------
+
+
+def test_audit_streaming() -> None:
+    from lib import audit, paths
+
+    print("\n== #26 展示层默认过滤 vault.open ==")
+    reset()
+    for i in range(5):
+        audit.write("run", host="h", command=f"cmd-{i}")
+    for i in range(3):
+        audit.write("vault.open", command=f"pid={i} exe=python cwd=/x")
+    audit.write("test", host="h2")
+
+    biz = audit.tail(50)
+    check("默认视图不含 vault.open",
+          all(r.get("action") != "vault.open" for r in biz), str(biz))
+    check("业务记录一条不少", len(biz) == 6, str(len(biz)))
+    check("顺序保持（时间正序）",
+          [r.get("command") for r in biz] == [f"cmd-{i}" for i in range(5)] + [None],
+          str([r.get("command") for r in biz]))
+    everything = audit.tail(50, include_internal=True)
+    check("--all 看全量（含 3 条 vault.open）",
+          sum(1 for r in everything if r.get("action") == "vault.open") == 3,
+          str(len(everything)))
+
+    print("\n== #26 tail 倒读跨块正确 ==")
+    reset()
+    for i in range(2000):  # 约 180 KiB，跨 3 个 64 KiB 块
+        audit.write("run", host="h", command=f"bulk-{i}")
+    recs = audit.tail(5)
+    check("跨块不丢行、只取 5 条", len(recs) == 5, str(len(recs)))
+    check("正是最后 5 条",
+          [r.get("command") for r in recs] == [f"bulk-{1995 + i}" for i in range(5)],
+          str([r.get("command") for r in recs]))
+    recs = audit.tail(2500, include_internal=True)
+    check("大日志全量仍可读", len(recs) == 2000, str(len(recs)))
+
+    print("\n== #26 轮转 ==")
+    reset()
+    orig = audit.ROTATE_BYTES
+    audit.ROTATE_BYTES = 1024
+    try:
+        for i in range(60):
+            audit.write("run", host="h", command=f"rotate-{i}-" + "x" * 40)
+    finally:
+        audit.ROTATE_BYTES = orig
+    rotated = Path(str(paths.audit_file()) + ".1")
+    check("轮转出 audit.log.1", rotated.exists(), str(rotated))
+    check("当前文件回到上限以内", paths.audit_file().stat().st_size < 1024 * 2)
+    recs = audit.tail(200)
+    check("轮转后 tail 只读当前代且不崩",
+          bool(recs) and all(str(r.get("command", "")).startswith("rotate-")
+                             for r in recs), str(len(recs)))
+
+    print("\n== #26 audit 命令的 --all 与 -n 校验 ==")
+    reset()
+    audit.write("run", host="h", command="visible-cmd")
+    audit.write("vault.open", command="pid=1 exe=x cwd=/y")
+    code, out, err = run_cli(["audit", "-n", "20"])
+    check("默认视图不显示 vault.open 记录", "pid=1 exe=x" not in out, out)
+    check("提示默认隐藏与 --all", "--all" in out, out)
+    check("业务记录可见", "visible-cmd" in out, out)
+    code, out, err = run_cli(["audit", "-n", "20", "--all"])
+    check("--all 显示 vault.open", "pid=1 exe=x" in out, out)
+    code, out, err = run_cli(["audit", "-n", "abc"])
+    check("-n 非数字报参数错误（2）", code == 2, f"{code} {err}")
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -548,6 +619,7 @@ def main() -> int:
     test_vault_aad_and_tmp()
     test_tofu_hostkey_line()
     test_nonce_anti_forgery()
+    test_audit_streaming()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

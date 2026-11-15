@@ -70,7 +70,7 @@ class UsageError(Exception):
 
 # 可以写在位置参数之后的长选项（布尔型）。
 # 短选项不在此列：远端命令里的 `-n` / `-f` 很常见，不能吞。
-_LONG_BOOL_FLAGS = frozenset({"sudo"})
+_LONG_BOOL_FLAGS = frozenset({"sudo", "all"})
 
 
 def _parse(argv: list[str], value_flags: set[str]) -> tuple[dict, list[str]]:
@@ -918,14 +918,22 @@ def cmd_status(argv: list[str]) -> int:
 
 
 def cmd_audit(argv: list[str]) -> int:
+    """查看审计记录（管理操作，本质是用户审查 agent 的行为）。
+
+    展示层分流（#26）：默认隐藏 vault.open 解密留痕，正常使用只见业务动作；
+    `--all` 看全量（文件本身全保真，一条不漏）。
+    """
     from lib import audit
 
     opts, _ = _parse(argv, {"n"})
-    limit = int(opts.get("n", 20))
-    records = audit.tail(limit)
+    limit, _ = _int_opt(opts, "n", 20, allow_zero=False)
+    show_all = bool(opts.get("all"))
+    records = audit.tail(limit, include_internal=show_all)
     if not records:
         _say("暂无审计记录")
         return 0
+    if not show_all:
+        _say("（vault.open 解密留痕默认隐藏；--all 查看全部）")
     for rec in records:
         flag = "ok " if rec.get("ok") else "ERR"
         ts = str(rec.get("ts", ""))[5:19].replace("T", " ")
