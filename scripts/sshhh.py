@@ -540,15 +540,27 @@ def cmd_run(argv: list[str]) -> int:
             nonce=nonce,
         )
 
-    # --- 4. 拿密码 -------------------------------------------------------
+    # --- 4. 取凭据：vault 密钥优先，密码兜底（#3 基线） -------------------
     # vault_obj 到这里必然非 None：第 2 步失败早已走 unlock 路径并 return
     password = vault_obj.get(name)
-    if not password and not host.key_file:
+    key_pem = vault_obj.get(f"key:{name}")
+    if not password and not key_pem:
+        if host.key_file:
+            # key_file 托管旁路已封（#18）：磁盘路径上的私钥不再参与认证
+            return protocol.emit(
+                protocol.EXIT_CONFIG,
+                f"主机 {name} 只配置了已废弃的 key_file 字段，需要把私钥"
+                "导入密码库后才能连接",
+                hint=("请告诉用户在自己的终端里执行：\n"
+                      f"{_manual_cmd(f'manage keyimport {name}')}\n"
+                      "（会自动使用主机里遗留的 key_file 路径）"),
+                nonce=nonce,
+            )
         status, detail = _launch("add_host", {"host_name": name})
         if status != "ok":
             return _setup_failed(status, detail, "config", nonce=nonce)
         return protocol.emit(
-            protocol.EXIT_CONFIGURED, f"已补充 {name} 的密码，请重试这条命令",
+            protocol.EXIT_CONFIGURED, f"已补充 {name} 的凭据，请重试这条命令",
             nonce=nonce,
         )
 
@@ -558,8 +570,9 @@ def cmd_run(argv: list[str]) -> int:
     redactor = Redactor(vault_obj.values())
     safe_cmd = redactor.clean(command)
 
-    # 认证方式进审计（#37）：将来受限密钥就位后，回落到密码必须看得见
-    auth = "key-file" if host.key_file else "password"
+    # 认证方式进审计：拒绝类记录写「预期的主认证方式」；真实连接的记录
+    # 在连接后按实际使用的认证写（#3：key / password，回落加 fallback）
+    auth = "key" if key_pem else "password"
 
     reason = host.policy.check(command, allow_shell=host.allow_shell)
     if reason:
@@ -571,7 +584,7 @@ def cmd_run(argv: list[str]) -> int:
     # stdin 放到策略检查之后再读：被拒的命令不该先把调用方的管道吃掉
     stdin_data = _stdin_data(opts)
 
-    client = Client(host, password, store.Settings(), redactor)
+    client = Client(host, password, store.Settings(), redactor, key_pem=key_pem)
     try:
         with client:
             result = client.run(
@@ -583,6 +596,10 @@ def cmd_run(argv: list[str]) -> int:
                     ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] {exc}")
         return protocol.EXIT_NETWORK
+
+    if client.auth_fallback:
+        _warn("[sshhh] 注意：密钥认证被服务器拒绝，本次连接回落到了密码"
+              "（已写入审计）。若这不是预期，请检查服务器上的公钥是否还在")
 
     stdout_text, out_info = output.shape(
         result.stdout, max_bytes=max_bytes, tail_lines=tail_lines)
@@ -602,7 +619,9 @@ def cmd_run(argv: list[str]) -> int:
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
                 ok=result.exit_code == 0, truncated=truncated,
                 original_bytes=max(out_info["original_bytes"],
-                                   err_info["original_bytes"]), auth=auth)
+                                   err_info["original_bytes"]),
+                auth=client.auth_used or auth,
+                fallback="key" if client.auth_fallback else "")
     return result.exit_code
 
 
@@ -625,21 +644,34 @@ def cmd_list(argv: list[str]) -> int:
     try:
         v = vault.open_vault()
         have_pw = set(v.names())
+        # key_names() 带 key: 前缀，按裸主机名比对需要剥掉
+        have_keys = {n.removeprefix("key:") for n in v.key_names()}
     except vault.VaultError:
         have_pw = set()
+        have_keys = set()
 
     width = max(len("名称"), *(len(n) for n in hosts))
     _say(f"{'名称'.ljust(width)}  地址                        认证    备注")
     _say("-" * (width + 42))
+    legacy = False
     for n, h in sorted(hosts.items()):
-        if h.key_file:
+        if n in have_keys and n in have_pw:
+            auth = "密钥+密码"
+        elif n in have_keys:
             auth = "密钥"
         elif n in have_pw:
             auth = "密码"
+        elif h.key_file:
+            auth = "key_file*"  # 遗留字段已不参与认证（#18），提示迁移
+            legacy = True
         else:
-            auth = "缺密码"
+            auth = "缺凭据"
         addr = f"{h.user}@{h.host}:{h.port}"
-        _say(f"{n.ljust(width)}  {addr.ljust(26)}  {auth.ljust(6)}  {h.description}")
+        _say(f"{n.ljust(width)}  {addr.ljust(26)}  {auth.ljust(10)}  {h.description}")
+    if legacy:
+        _say("")
+        _say("* key_file 字段已不再参与认证（#18）："
+             "请执行 manage keyimport <主机> 把私钥导入密码库")
     return 0
 
 
@@ -684,8 +716,9 @@ def cmd_test(argv: list[str]) -> int:
     target = f"{host.user}@{host.host}:{host.port}"
     _say(f"连接 {name} ({target}) ...")
     redactor = Redactor(v.values())
-    auth = "key-file" if host.key_file else "password"
-    client = Client(host, password, store.Settings(), redactor)
+    key_pem = v.get(f"key:{name}")
+    auth = "key" if key_pem else "password"
+    client = Client(host, password, store.Settings(), redactor, key_pem=key_pem)
     try:
         with client:
             r = client.run(probes[0], timeout=20)
@@ -693,7 +726,8 @@ def cmd_test(argv: list[str]) -> int:
                 error = "连接建立但测试命令未返回预期输出"
                 audit.write("test", host=name, user=host.user, command=target,
                             ok=False, error=error, duration_ms=r.duration_ms,
-                            auth=auth)
+                            auth=client.auth_used or auth,
+                            fallback="key" if client.auth_fallback else "")
                 _warn(f"[sshhh] {error}")
                 return 4
             info = ""
@@ -706,8 +740,12 @@ def cmd_test(argv: list[str]) -> int:
         _warn(f"[sshhh] 连接失败：{exc}")
         return 4
 
+    if client.auth_fallback:
+        _warn("[sshhh] 注意：密钥认证被服务器拒绝，本次连接回落到了密码"
+              "（已写入审计）")
     audit.write("test", host=name, user=host.user, command=target,
-                duration_ms=r.duration_ms, auth=auth)
+                duration_ms=r.duration_ms, auth=client.auth_used or auth,
+                fallback="key" if client.auth_fallback else "")
     _say(f"[ok] 连接成功（{r.duration_ms} ms）")
     for line in info.splitlines():
         if line:
@@ -809,8 +847,9 @@ def _transfer(argv: list[str], direction: str) -> int:
     max_bytes = cap if has_cap else None
     timeout = _float_opt(opts, "timeout")
 
-    auth = "key-file" if host.key_file else "password"
-    client = Client(host, v.get(name), store.Settings())
+    key_pem = v.get(f"key:{name}")
+    auth = "key" if key_pem else "password"
+    client = Client(host, v.get(name), store.Settings(), key_pem=key_pem)
     try:
         with client:
             if direction == "put":
@@ -829,8 +868,13 @@ def _transfer(argv: list[str], direction: str) -> int:
                     command=summary, ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] 文件传输失败：{exc}")
         return 4
+    if client.auth_fallback:
+        _warn("[sshhh] 注意：密钥认证被服务器拒绝，本次连接回落到了密码"
+              "（已写入审计）")
     audit.write(f"transfer.{direction}", host=name, user=host.user,
-                command=f"{summary}（{size} 字节）", auth=auth)
+                command=f"{summary}（{size} 字节）",
+                auth=client.auth_used or auth,
+                fallback="key" if client.auth_fallback else "")
     _say(f"[ok] {direction} 完成：{a} -> {b}（{size} 字节）")
     return 0
 
@@ -1160,7 +1204,8 @@ def cmd_harden(argv: list[str]) -> int:
         v = vault.open_vault()
     except vault.VaultError as exc:
         return protocol.emit(protocol.EXIT_LOCKED, str(exc))
-    auth = "key-file" if host.key_file else "password"
+    key_pem = v.get(f"key:{name}")
+    auth = "key" if key_pem else "password"
     password = v.get(name)
 
     # 探测命令与 test 同一纪律：过策略。脚本经 stdin 喂给 `bash -s`，
@@ -1188,7 +1233,8 @@ def cmd_harden(argv: list[str]) -> int:
 
     target = f"{host.user}@{host.host}:{host.port}"
     _say(f"[sshhh] 加固探测（只读）：{name} ({target})")
-    client = Client(host, password, store.Settings(), Redactor(v.values()))
+    client = Client(host, password, store.Settings(), Redactor(v.values()),
+                    key_pem=key_pem)
     try:
         with client:
             banner = client.banner()
@@ -1198,6 +1244,9 @@ def cmd_harden(argv: list[str]) -> int:
                     ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] 探测失败：{exc}")
         return 4
+    if client.auth_fallback:
+        _warn("[sshhh] 注意：密钥认证被服务器拒绝，本次连接回落到了密码"
+              "（已写入审计）")
 
     checks: list[tuple[str, bool, str]] = []
 
@@ -1242,7 +1291,8 @@ def cmd_harden(argv: list[str]) -> int:
         ok_all = ok_all and good
         _say(f"  {'[ok]' if good else '[!!]'} {label}：{detail}")
     audit.write("harden.check", host=name, user=host.user, command=probe_cmd,
-                ok=ok_all, auth=auth)
+                ok=ok_all, auth=client.auth_used or auth,
+                fallback="key" if client.auth_fallback else "")
     _say("")
     if ok_all:
         _say("结论：具备可加固条件。")

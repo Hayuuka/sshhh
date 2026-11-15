@@ -17,11 +17,15 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
+
+import paramiko
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -569,12 +573,198 @@ def test_key_management() -> None:
     check("未知主机退出码 3", code == 3, f"{out}{err}")
 
 
+# --------------------------------------------------------------------------
+# #3 密钥优先登录与回落留痕（本地 SSH 服务端）
+# --------------------------------------------------------------------------
+
+_USER = "tester"
+_SSH_PASSWORD = "Sup3r-Secret-Pw!<&>"
+
+
+class _AuthServer(paramiko.ServerInterface):
+    """公钥 + 密码双认证的迷你服务端：check_auth_publickey 比对授权公钥，
+    相当于完成了一次真实的签名验证。"""
+
+    def __init__(self, authorized_pub_b64: str) -> None:
+        self.authorized = authorized_pub_b64
+        self.event = threading.Event()
+        self.command = b""
+
+    def get_allowed_auths(self, username):
+        return "publickey,password"
+
+    def check_auth_publickey(self, username, key):
+        if username == _USER and key.get_base64() == self.authorized:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def check_auth_password(self, username, password):
+        if username == _USER and password == _SSH_PASSWORD:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def check_channel_request(self, kind, chanid):
+        return (paramiko.OPEN_SUCCEEDED if kind == "session"
+                else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED)
+
+    def check_channel_exec_request(self, channel, command):
+        self.command = command
+        self.event.set()
+        return True
+
+
+def _handle_auth(transport, server) -> None:
+    try:
+        while True:
+            chan = transport.accept(20)
+            if chan is None:
+                return
+            if not server.event.wait(20):
+                chan.close()
+                return
+            server.event.clear()
+            chan.sendall(("(ran) "
+                          + server.command.decode("utf-8", "replace") + "\n").encode())
+            chan.send_exit_status(0)
+            chan.close()
+    except Exception:
+        pass
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+def _start_auth_server(authorized_pub_b64: str) -> tuple[int, threading.Event]:
+    host_key = paramiko.RSAKey.generate(2048)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(20)
+    port = sock.getsockname()[1]
+    stop = threading.Event()
+
+    def loop() -> None:
+        sock.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            t = paramiko.Transport(conn)
+            t.add_server_key(host_key)
+            srv = _AuthServer(authorized_pub_b64)
+            try:
+                t.start_server(server=srv)
+            except Exception:
+                t.close()
+                continue
+            threading.Thread(target=_handle_auth, args=(t, srv),
+                             daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return port, stop
+
+
+def _last_run_record() -> dict | None:
+    for rec in reversed(audit.tail(10, include_internal=True)):
+        if rec.get("action") == "run":
+            return rec
+    return None
+
+
+def test_key_first_auth() -> None:
+    from lib import sshkeys
+
+    print("\n== #3 密钥优先：合法密钥直接通过 ==")
+    reset()
+    pem_auth = sshkeys.generate_ed25519_pem(comment="sshhh-test")
+    authorized = sshkeys.load_pkey(pem_auth).get_base64()
+    pem_bad = sshkeys.generate_ed25519_pem(comment="not-installed")
+    port, stop = _start_auth_server(authorized)
+    try:
+        v = vault.Vault.create(paths.vault_file(), MASTER)
+        store.upsert_host(store.Host(name="local", host="127.0.0.1",
+                                     user=_USER, port=port))
+        v.set("local", _SSH_PASSWORD)
+        v.set("key:local", pem_auth)
+
+        code, out, err = run_cli(["run", "local", "echo hi"])
+        check("密钥认证 run 成功", code == 0, f"{out}{err}")
+        rec = _last_run_record()
+        check("审计 auth=key", rec is not None and rec.get("auth") == "key",
+              str(rec))
+        check("无回落标记", rec is not None and "fallback" not in rec, str(rec))
+        check("没有回落提示", "回落" not in err, err)
+
+        print("\n== #3 密钥被拒 → 回落密码，审计与 stderr 双留痕 ==")
+        v.set("key:local", pem_bad)
+        code, out, err = run_cli(["run", "local", "echo hi"])
+        check("回落后 run 成功", code == 0, f"{out}{err}")
+        rec = _last_run_record()
+        check("审计 auth=password", rec is not None
+              and rec.get("auth") == "password", str(rec))
+        check("审计 fallback=key", rec is not None
+              and rec.get("fallback") == "key", str(rec))
+        check("stderr 有回落提示", "回落" in err, err)
+
+        print("\n== #3 只有被拒密钥、没有密码 → 明确失败 ==")
+        v.delete("local")
+        code, out, err = run_cli(["run", "local", "echo hi"])
+        check("退出码 4（网络/认证失败）", code == 4, f"{out}{err}")
+        check("报错说明密钥被拒", "密钥认证被服务器拒绝" in err, err)
+        rec = _last_run_record()
+        check("失败记录 auth=key", rec is not None and rec.get("auth") == "key",
+              str(rec))
+
+        print("\n== #3 仅密码主机行为不变 ==")
+        v.set("local", _SSH_PASSWORD)
+        v.delete("key:local")
+        code, out, err = run_cli(["run", "local", "echo hi"])
+        check("密码认证 run 成功", code == 0, f"{out}{err}")
+        rec = _last_run_record()
+        check("审计 auth=password 且无 fallback",
+              rec is not None and rec.get("auth") == "password"
+              and "fallback" not in rec, str(rec))
+
+        print("\n== #3 key_file 旁路封堵（#18）==")
+        store.upsert_host(store.Host(name="legacy", host="127.0.0.1",
+                                     user=_USER, port=port,
+                                     key_file="~/.ssh/id_should_not_be_read"))
+        code, out, err = run_cli(["run", "legacy", "echo hi"])
+        check("仅 key_file 的主机退出码 3", code == 3, f"{out}{err}")
+        check("报错指向 manage keyimport", "keyimport" in err, err)
+
+        # key_file + 密码并存：密码照常可用（key_file 被忽略，不再从盘上读私钥）
+        v.set("legacy", _SSH_PASSWORD)
+        code, out, err = run_cli(["run", "legacy", "echo hi"])
+        check("补了密码后 legacy 主机可用", code == 0, f"{out}{err}")
+        rec = _last_run_record()
+        check("legacy 用密码认证", rec is not None
+              and rec.get("auth") == "password", str(rec))
+
+        print("\n== #3 list 认证列反映 vault 状态 ==")
+        v.set("key:local", pem_auth)
+        # 有密码的 legacy 主机：key_file 惰性，正常显示密码
+        store.upsert_host(store.Host(name="legacy2", host="127.0.0.1",
+                                     user=_USER, port=port,
+                                     key_file="~/.ssh/another"))
+        code, out, err = run_cli(["list"])
+        check("list 显示密钥（local 密钥+密码）", "密钥+密码" in out, out)
+        check("list 标记无凭据的 legacy2", "key_file*" in out, out)
+        check("list 提示迁移", "keyimport" in out, out)
+    finally:
+        stop.set()
+
+
 def main() -> int:
     test_seal_roundtrip_and_tamper()
     test_unsealed_failclosed_and_reseal()
     test_enforcement_and_views()
     test_data_dir_gating()
     test_key_management()
+    test_key_first_auth()
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")

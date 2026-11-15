@@ -46,7 +46,7 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
           exit_code: int | None = None, duration_ms: int | None = None,
           ok: bool = True, error: str = "",
           truncated: bool = False, original_bytes: int | None = None,
-          auth: str = "") -> None:
+          auth: str = "", fallback: str = "") -> None:
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "epoch": int(time.time()),
@@ -56,9 +56,14 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
         "ok": ok,
     }
     if auth:
-        # 本次认证方式：password / key-file（#37）。为「加固回落检测」铺路：
-        # 将来受限密钥就位后，本应走密钥的连接回落到密码必须在审计里看得见。
+        # 本次认证方式：key / password（#3 基线；key-file 为 #18 之前的
+        # 历史值，不再产生）。为「加固回落检测」铺路：本应走密钥的连接
+        # 回落到密码必须在审计里看得见。
         record["auth"] = auth
+    if fallback:
+        # 密钥认证被拒后回落到密码（#3）。设计要求这个回落可见：加固被
+        # 静默移除（服务器上的公钥被人拿掉）时，这里是唯一的信号。
+        record["fallback"] = fallback
     if command:
         record["command"] = _cut(command)
     if exit_code is not None:

@@ -40,6 +40,11 @@ class _TOFU(paramiko.MissingHostKeyPolicy):
         self.new_keys: list[tuple[str, paramiko.PKey]] = []
 
     def missing_host_key(self, client, hostname, key):
+        # 密钥优先登录会先试一次密钥再回落密码（#3）：两次握手都会走到这里，
+        # 同一台主机的指纹只记一次，避免 known_hosts 里写重行
+        for h, k in self.new_keys:
+            if h == hostname and k.get_base64() == key.get_base64():
+                return
         self.new_keys.append((hostname, key))
 
 
@@ -177,11 +182,19 @@ def remember_host_keys(entries: list[tuple[str, paramiko.PKey]],
 class Client:
     def __init__(self, host: Host, password: str | None,
                  settings: Settings | None = None,
-                 redactor: Redactor | None = None):
+                 redactor: Redactor | None = None,
+                 key_pem: str | None = None):
         self.host = host
         self.settings = settings or Settings()
         self._password = password
+        self._key_pem = key_pem
         self.redactor = redactor or Redactor()
+        # 实际使用的认证方式与回落标记（#3）：连接成功后由 CLI 层写进审计。
+        # auth_used 取值 "key" / "password"；auth_fallback 表示密钥认证
+        # 被拒后回落到了密码 —— 设计要求这个回落必须可见（防加固被静默
+        # 移除后无人察觉）。
+        self.auth_used: str = ""
+        self.auth_fallback: bool = False
         self._ssh: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
         self._tofu = _TOFU()
@@ -196,51 +209,79 @@ class Client:
     # -- 连接 ----------------------------------------------------------
 
     def connect(self) -> None:
+        """连接主机。认证编排（#3 基线）：vault 密钥优先，密码兜底。
+
+        key_file 字段不再参与认证（#18）：hosts.toml 对 agent 可写，磁盘
+        路径上的私钥等于一个不经密码库的托管旁路 —— agent 可以用它连上
+        任何自己的服务器，审计里只留一条正常记录。认证材料只来自 vault
+        （key:<host> 与密码条目），两者都没有时给出迁移指引而不是静默失败。
+        """
         h = self.host
         s = self.settings
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(self._tofu)
 
-        known = s.known_hosts
-        if known.exists():
-            load_known_hosts(ssh, known)
-
-        kwargs: dict = {
-            "hostname": h.host,
-            "port": h.port,
-            "username": h.user,
-            "timeout": s.connect_timeout,
-            "banner_timeout": s.connect_timeout,
-            "auth_timeout": s.connect_timeout,
-            "allow_agent": False,
-            "look_for_keys": False,
-        }
-
-        if h.key_file:
-            kwargs["pkey"] = _load_key(os.path.expanduser(h.key_file))
-        elif self._password:
-            kwargs["password"] = self._password
-        else:
+        attempts: list[tuple[str, dict]] = []
+        if self._key_pem:
+            attempts.append(("key", {"pkey": _pkey_from_pem(self._key_pem)}))
+        if self._password:
+            attempts.append(("password", {"password": self._password}))
+        if not attempts:
+            if h.key_file:
+                raise TransportError(
+                    f"主机 {h.name} 只配置了已废弃的 key_file 字段"
+                    "（#18 之后不再从磁盘路径认证）。"
+                    "请在你的终端执行：sshhh manage keyimport "
+                    f"{h.name}（会自动使用该字段记录的路径）"
+                )
             raise TransportError(f"主机 {h.name} 没有可用凭据")
 
-        try:
-            ssh.connect(**kwargs)
-        except paramiko.AuthenticationException:
-            raise TransportError(
-                f"认证失败：{h.user}@{h.host}:{h.port}，请检查用户名或密码"
-            ) from None
-        except paramiko.SSHException as exc:
-            msg = self.redactor.clean(str(exc))
-            if "not found in known_hosts" in msg or "Host key" in msg:
-                raise TransportError(f"主机密钥校验失败：{msg}") from None
-            raise TransportError(f"SSH 错误：{msg}") from None
-        except (socket.timeout, TimeoutError):
-            raise TransportError(f"连接超时：{h.host}:{h.port}") from None
-        except OSError as exc:
-            raise TransportError(f"网络错误：{exc}") from None
+        saw_key_attempt = bool(self._key_pem)
+        last_auth_error: TransportError | None = None
+        for method, creds in attempts:
+            # 每次尝试用全新 client：认证失败后重连要重走完整的握手与
+            # 指纹校验，不能复用已经出过 AuthenticationException 的传输层
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(self._tofu)
+            known = s.known_hosts
+            if known.exists():
+                load_known_hosts(ssh, known)
 
-        self._ssh = ssh
-        self._save_new_keys()
+            kwargs: dict = {
+                "hostname": h.host,
+                "port": h.port,
+                "username": h.user,
+                "timeout": s.connect_timeout,
+                "banner_timeout": s.connect_timeout,
+                "auth_timeout": s.connect_timeout,
+                "allow_agent": False,
+                "look_for_keys": False,
+                **creds,
+            }
+            try:
+                ssh.connect(**kwargs)
+            except paramiko.AuthenticationException as exc:
+                last_auth_error = TransportError(
+                    f"认证失败：{h.user}@{h.host}:{h.port}"
+                    + ("，密钥认证被服务器拒绝" if method == "key"
+                       else "，请检查用户名或密码"))
+                if method == "key" and self._password:
+                    continue  # 密钥被拒 → 回落到密码（auth_fallback 留痕）
+                raise last_auth_error from None
+            except paramiko.SSHException as exc:
+                msg = self.redactor.clean(str(exc))
+                if "not found in known_hosts" in msg or "Host key" in msg:
+                    raise TransportError(f"主机密钥校验失败：{msg}") from None
+                raise TransportError(f"SSH 错误：{msg}") from None
+            except (socket.timeout, TimeoutError):
+                raise TransportError(f"连接超时：{h.host}:{h.port}") from None
+            except OSError as exc:
+                raise TransportError(f"网络错误：{exc}") from None
+
+            self._ssh = ssh
+            self.auth_used = method
+            self.auth_fallback = (method == "password" and saw_key_attempt)
+            self._save_new_keys()
+            return
+        raise last_auth_error or TransportError("认证失败：无可用的认证方式")
 
     def _save_new_keys(self) -> None:
         if not self._tofu.new_keys:
@@ -361,6 +402,8 @@ class Client:
                 pass
             self._ssh = None
         self._password = None
+        # 私钥 PEM 同样随连接结束消失（宪法：密钥材料内存即焚）
+        self._key_pem = None
 
     # -- 文件通道 ------------------------------------------------------
 
@@ -505,11 +548,18 @@ def _shquote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-def _load_key(path: str):
-    errors = []
-    for cls in (paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.RSAKey):
-        try:
-            return cls.from_private_key_file(path)
-        except Exception as exc:
-            errors.append(f"{cls.__name__}: {exc}")
-    raise TransportError(f"无法加载私钥 {path}")
+def _pkey_from_pem(pem: str) -> paramiko.PKey:
+    """把 vault 里的私钥 PEM 加载成内存中的 PKey。
+
+    私钥材料只在内存里流转（设计宪法）：不读文件、不落盘。归一化在导入时
+    已做过（lib.sshkeys.normalize_pem），这里只负责加载；加载失败多半是
+    vault 里的条目被改坏，报错要让用户看得出该重新导入。
+    """
+    from .sshkeys import SSHKeyError, load_pkey
+
+    try:
+        return load_pkey(pem)
+    except SSHKeyError as exc:
+        raise TransportError(
+            f"加载密钥失败（可用 manage keyimport 重新导入）：{exc}"
+        ) from None

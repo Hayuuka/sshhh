@@ -433,7 +433,9 @@ class _ForgingClient:
 
     last_instance: "_ForgingClient | None" = None
 
-    def __init__(self, host, password, settings, redactor=None):
+    def __init__(self, host, password, settings, redactor=None, key_pem=None):
+        self.auth_used = "password"
+        self.auth_fallback = False
         _ForgingClient.last_instance = self
 
     def __enter__(self):
@@ -879,8 +881,9 @@ class _ProbeClient:
     banner_text = "SSH-2.0-OpenSSH_9.6p1 Debian-3"
     probe_line = "SSHHH_PROBE dir=1 dirw=1 keyw=1\n"
 
-    def __init__(self, host, password, settings, redactor=None):
-        pass
+    def __init__(self, host, password, settings, redactor=None, key_pem=None):
+        self.auth_used = "password"
+        self.auth_fallback = False
 
     def __enter__(self):
         return self

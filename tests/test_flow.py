@@ -199,8 +199,11 @@ class FakeClient:
 
     last: "FakeClient | None" = None
 
-    def __init__(self, host=None, password=None, settings=None, redactor=None):
+    def __init__(self, host=None, password=None, settings=None, redactor=None,
+                 key_pem=None):
         self.calls: list[tuple[str, str, str]] = []
+        self.auth_used = "password"
+        self.auth_fallback = False
         FakeClient.last = self
 
     def __enter__(self):
