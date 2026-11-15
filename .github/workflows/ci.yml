@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 是主战场（launcher / console 链路只在 Windows 有意义），
+        # Ubuntu 验证跨平台路径与 POSIX 锁。Python 取最老支持版本 + 一个新 LTS。
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.9', '3.12']
+    runs-on: ${{ matrix.os }}
+    env:
+      # Windows runner 的管道默认是 cp1252，中文输出会直接炸
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: pip install paramiko cryptography keyring tomli-w "tomli; python_version < '3.11'"
+      # 全部脚本自带 PASSED/FAILED 计数并 sys.exit(1) 于失败，CI 直接标红
+      - name: 跑测试
+        shell: bash
+        run: |
+          python tests/test_flow.py
+          python tests/test_lock.py
+          python tests/test_reexec.py
+          python tests/test_store.py
+          python tests/test_p0.py
+          python tests/test_p1.py
+          python tests/test_docs.py
