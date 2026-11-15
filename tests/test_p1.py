@@ -48,8 +48,96 @@ def reset() -> None:
 
 
 # --------------------------------------------------------------------------
-# #11 redact 通用规则误伤
+# #7 --sudo 与 --stdin 同用时，sudo 密码必须排在用户数据之前
 # --------------------------------------------------------------------------
+
+
+class _FakeStdin:
+    """记录 exec 通道 stdin 上写进来的内容。
+
+    paramiko 的 ChannelFile 上 `.channel` 是属性不是方法，
+    `stdin.channel.shutdown_write()` 走的是属性访问。
+    """
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+        self.shutdown = False
+        outer = self
+
+        class _Chan:
+            @staticmethod
+            def shutdown_write() -> None:
+                outer.shutdown = True
+
+        self.channel = _Chan()
+
+    def write(self, data: str) -> int:
+        self.written.append(data)
+        return len(data)
+
+
+class _FakeStream:
+    def __init__(self, data: bytes = b"") -> None:
+        self._data = data
+        self.channel = _FakeChannel()
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _FakeChannel:
+    def recv_exit_status(self) -> int:
+        return 0
+
+    def settimeout(self, t) -> None:
+        pass
+
+
+class _FakeExecSsh:
+    """最小 SSHClient：exec_command 记录命令与喂给 stdin 的数据。"""
+
+    last: "_FakeExecSsh | None" = None
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.stdin = _FakeStdin()
+        _FakeExecSsh.last = self
+
+    def exec_command(self, command, timeout=None, get_pty=False):
+        self.commands.append(command)
+        self.stdin.written.clear()
+        return (self.stdin, _FakeStream(b"out\n"), _FakeStream(b""))
+
+
+def test_sudo_with_stdin() -> None:
+    """`run --sudo --stdin` 曾把用户数据当 sudo 密码认证，命令必挂。"""
+    from lib.redact import Redactor
+    from lib.store import Host, Settings
+    from lib.transport import Client
+
+    print("\n== #7 sudo 密码先于 --stdin 数据 ==")
+    client = Client(Host(name="box", host="127.0.0.1", user="root"),
+                    "sudo-password-1", Settings(), Redactor())
+    client._ssh = _FakeExecSsh()  # noqa: SLF001 - 直接注入，不真连
+
+    client.run("cat > /tmp/x", stdin_data="user-data-line\n",
+               timeout=10, use_sudo=True)
+
+    ssh = _FakeExecSsh.last
+    check("命令被包成 sudo -S", ssh.commands[0].startswith("sudo -S"),
+          ssh.commands[0])
+    written = "".join(ssh.stdin.written)
+    lines = written.split("\n")
+    check("第一行是 sudo 密码", lines[0] == "sudo-password-1", repr(lines[0]))
+    check("用户数据在密码之后", "user-data-line" in written
+          and written.index("sudo-password-1") < written.index("user-data-line"),
+          repr(written))
+    check("写完关写端（远端才能读到 EOF）", ssh.stdin.shutdown is True)
+
+    print("\n== #7 无 --stdin 时只有密码一行 ==")
+    client.run("systemctl restart nginx", timeout=10, use_sudo=True)
+    written = "".join(_FakeExecSsh.last.stdin.written)
+    check("只喂密码", written == "sudo-password-1\n", repr(written))
 
 
 def test_redact_pwd() -> None:
@@ -80,6 +168,7 @@ def test_redact_pwd() -> None:
 
 def main() -> int:
     test_redact_pwd()
+    test_sudo_with_stdin()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)
