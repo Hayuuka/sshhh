@@ -485,7 +485,8 @@ def main() -> int:
         code, _, err = run_cli(["setpass", HOST_NAME])
         check("setpass 走配置窗口并成功", code == 0, err)
 
-        actions = [r.get("action") for r in audit.tail(50)]
+        # vault.open 的留痕要验「文件里有没有」，用全保真视图（#26 分流后默认视图滤它）
+        actions = [r.get("action") for r in audit.tail(50, include_internal=True)]
         for action in ("vault.open", "test", "unlock", "setpass"):
             check(f"审计记录了 {action}", action in actions, str(actions))
         check("审计仍不含密码",
@@ -499,7 +500,8 @@ def main() -> int:
             vault.open_vault()
         finally:
             sys.argv = saved_argv
-        opens = [r for r in audit.tail(5) if r.get("action") == "vault.open"]
+        opens = [r for r in audit.tail(5, include_internal=True)
+                 if r.get("action") == "vault.open"]
         check("直接调用 vault 也写 vault.open", bool(opens), str(audit.tail(5)))
         last_open = opens[-1] if opens else {}
         check("记录里有调用方 pid",
