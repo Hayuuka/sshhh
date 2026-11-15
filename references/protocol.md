@@ -339,8 +339,8 @@ headless 环境没有 Secret Service：主密码改用本机 gpg 私钥加密保
 
 | 文件 | 内容 |
 |------|------|
-| `vault.enc` | AES-GCM 加密的密码库 |
-| `hosts.toml` | 主机清单，**无密码字段** |
+| `vault.enc` | AES-GCM 加密的密码库（含 `key:<host>` 私钥条目，同为密文） |
+| `hosts.toml` | 主机清单，**无密码字段**，带完整性签名（#18） |
 | `audit.log` | JSONL 审计日志，命令写入前已脱敏 |
 | `known_hosts` | TOFU 记录的主机指纹 |
 | `console.log` | 配置窗口的诊断日志（流程与异常，不含任何用户输入） |
@@ -401,7 +401,8 @@ headless 环境没有 Secret Service：主密码改用本机 gpg 私钥加密保
 审计（`audit.log`）覆盖所有触达凭据或远端的动作，`action` 取值：
 
 `run`、`run.denied`、`transfer.put`、`transfer.get`、`transfer.denied`、
-`test`、`test.denied`、`setpass`、`unlock`、`migrate`、`vault.open`。
+`test`、`test.denied`、`setpass`、`unlock`、`migrate`、`vault.open`、
+`reseal`、`key.gen`、`key.import`。
 
 `vault.open` 记录的是「谁解密了密码库」：pid、解释器、工作目录、命令行**前两个
 参数**。它拦不住同用户进程直接调用 `lib.vault`（操作系统级边界），但能让这条路
@@ -412,20 +413,63 @@ headless 环境没有 Secret Service：主密码改用本机 gpg 私钥加密保
 尾部倒读，不因日志增长而变慢。
 
 触达远端的业务记录（`run` / `transfer.*` / `test` / `harden.check`）带
-`auth` 字段标记本次认证方式：`password` 或 `key-file`（#37）。为加固回落
-检测铺路 —— 将来受限密钥就位后，「本应走密钥的连接回落到密码」必须在
-审计里看得见。
+`auth` 字段标记本次认证方式：`key`（vault 密钥）或 `password`（#3 基线；
+`key-file` 是 #18 之前的历史值，不再产生）。连接类记录另有
+`fallback: "key"`（#3）：**密钥认证被服务器拒绝、本次连接回落到了密码**
+—— 这是「服务器上的公钥被人拿掉 / 加固被静默移除」的唯一信号，stderr
+同时有一行人读提示。被策略拒绝的记录（发生在连接之前）写的是「预期的主
+认证方式」，没有 fallback 字段。
 
-## vault 的 key:<host> 命名空间（#37）
+## hosts.toml 的完整性签名（#18）
 
-私钥条目预留在独立命名空间：`key:<主机名>`。与密码条目隔离是为了
+hosts.toml 对 agent 可写，「删掉 `[hosts.x.policy]` 段就永久豁免策略」是
+TM-B3 的攻击路径。清单因此带 HMAC-SHA256 签名（`[sshhh_integrity]` 段），
+密钥从主密码派生 —— 修改清单从「编辑一个文本文件」升级为「解开密码库 +
+import 内部模块」，落在 README 已声明的残余风险线上（同 UID 进程仍拦不住，
+定性依旧是防手滑）。
+
+- 签名对象是「去掉该段后、用 tomli-w 重新序列化」的规范形式：
+  **注释与排版不参与签名**（手编注释不破坏签名），任何字段值改动都会失配
+- run / test / put / get / harden 全部先验签，失败在建连前拒绝
+  （退出码 3）并报错说明 —— 报错文案写明：手编后这是预期行为，先检查
+  内容再 `sshhh manage reseal`；没改过则说明有别的程序动了清单
+- `list` / `status` / `manage policy` 用免验签读取：用户恰恰需要它们
+  在被改动的清单上「看看改了什么」
+- 写路径续签规则：有效签名自动续签（向导 / 迁移）；失效或缺失签名的
+  文件写完仍不签名（防一次普通写入洗白篡改）；对已签名文件的写入
+  必须持钥，无钥写入直接拒绝
+- `manage reseal`：手编后的合法化出口，签名密钥随密码库解锁；升级前
+  遗留的无签名清单会在第一次强制命令处得到明确报错，reseal 一次即可
+
+## vault 的 key:<host> 命名空间（#37 / #3 基线）
+
+私钥条目放在独立命名空间：`key:<主机名>`。与密码条目隔离是为了
 「按主机名查密码」的调用方（`vault.get(name)` / `names()`）不会误把私钥
 材料当密码取走：
 
 - `Vault.names()` 只返回密码条目（过滤 `key:` 前缀）
 - `Vault.key_names()` 只返回私钥条目
-- 条目本身照常 get / set / delete；使用侧随 P2 密钥认证启用（#3 基线部分），
-  届时私钥**只以密文存在于 vault**（设计宪法：明文私钥落盘 = 禁止）
+- 条目本身照常 get / set / delete；使用侧已随 P2 密钥认证启用：
+  私钥**只以密文存在于 vault**，运行时从内存加载
+  （paramiko `from_private_key(StringIO(pem))`），进程退出即消失。
+  明文私钥落盘 = 禁止（设计宪法），lib.sshkeys 的任何函数都不写密钥文件
+- 管理命令：`manage keygen <主机> [--force]`（生成 / 轮换 Ed25519）、
+  `manage keyimport <主机> [文件]`（导入并归一化）、
+  `manage keyshow <主机>`（只显示公钥行与指纹）
+- 连接编排：**密钥优先，密码兜底**。密钥被服务器拒绝时回落到密码，
+  审计写 `auth: password` + `fallback: key`，stderr 有人读提示
+- 主机配置的 `key_file` 字段**已不参与认证**（#18）：hosts.toml 对 agent
+  可写，磁盘路径上的私钥是不经密码库的托管旁路。字段保留作迁移线索：
+  `manage keyimport <主机>` 省略文件路径时自动使用它
+
+## SSHHH_DATA_DIR 仅测试模式生效（#18）
+
+`SSHHH_DATA_DIR` 指到别处就能绕过基于路径的本地保护（put / get 的数据
+目录约束、指纹库与签名文件的落点）。因此它**只在 `SSHHH_TEST_MODE=1`
+同时存在时生效**；只设 `SSHHH_DATA_DIR` 的组合由入口（sshhh.py 与
+console_setup.py）在任何数据访问之前明确拒绝（退出码 3），不是无声忽略。
+向导进程经父进程 argv 接收的数据目录是内部可信通道，不受此门禁影响。
+正常使用两个变量都不应设置。
 
 ## harden --check（只读探测，#37）
 

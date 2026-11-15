@@ -247,8 +247,8 @@ upgrading or reinstalling the skill never touches your configuration.
 
 | Path | Contents |
 |---|---|
-| `~/.sshhh/vault.enc` | Encrypted passwords (AES-GCM + scrypt). Useless without the master password, and **the header does not list entry names** |
-| `~/.sshhh/hosts.toml` | Host list, port, user, policy rules. **No password field** |
+| `~/.sshhh/vault.enc` | Encrypted passwords and private-key entries (AES-GCM + scrypt). Useless without the master password, and **the header does not list entry names** |
+| `~/.sshhh/hosts.toml` | Host list, port, user, policy rules, with an HMAC integrity seal. **No password field** |
 | `~/.sshhh/known_hosts` | Host key fingerprints (TOFU) |
 | `~/.sshhh/audit.log` | JSONL audit trail, redacted |
 | `~/.sshhh/console.log` | Diagnostics for the config window — flow and exceptions only, never your input |
@@ -289,6 +289,29 @@ sequenceDiagram
     S->>S: redact
     S-->>A: stdout + remote exit code
 ```
+
+## SSH keys (optional, key-first)
+
+Besides passwords, sshhh supports SSH key authentication. Private keys live
+**only inside the encrypted vault** (`key:<host>` entries) and are loaded into
+memory at connect time — a plaintext key never touches the disk.
+
+```bash
+python scripts/sshhh.py manage keygen prod      # generate Ed25519, prints the public key line
+python scripts/sshhh.py manage keyimport prod ~/.ssh/id_ed25519  # import an existing key
+python scripts/sshhh.py manage keyshow prod     # show public key line + SHA256 fingerprint
+```
+
+- Deploying the public key is manual for now: append the printed line to the
+  server's `~/.ssh/authorized_keys` (on Windows admins:
+  `administrators_authorized_keys`, mind the ACL). One-click restricted-key
+  deployment belongs to the hardening tier (#15, on the watchlist).
+- Connections try the key first and fall back to the password. A fallback is
+  visible: `fallback: key` in the audit log plus a stderr notice — so a
+  silently removed server-side public key shows up in your audit trail.
+- The legacy `key_file` field in `hosts.toml` no longer authenticates (it
+  would be a vault-bypassing backdoor for an AI that can edit the file);
+  `manage keyimport` accepts it as the migration path.
 
 ## Commands
 
@@ -346,8 +369,10 @@ transfer deletes the partial file instead of leaving a convincing-looking one.
 **What it does not protect against** (stated plainly)
 
 - **Local policy can be bypassed**: `hosts.toml` and `scripts/` are writable by
-  the same user, so rules can be edited away or `lib.transport` called directly.
-  It prevents slips, not a security boundary (see 6.1).
+  the same user, so `lib.transport` can be called directly, or the vault can be
+  unlocked and the host list re-sealed via internal modules. The integrity seal
+  on `hosts.toml` raises the cost of editing policy away and makes it fail
+  closed, but it prevents slips, not a security boundary (see 6.1).
 - **The audit log can be rewritten** by the same user: it is a record, not tamper protection.
 - A program that already has your OS account privileges can call this project's
 Python API and decrypt the vault. One line of

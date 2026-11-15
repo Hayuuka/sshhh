@@ -210,6 +210,45 @@ AI 会把指纹念给你 —— 花几秒和 `ssh-keygen -lf`（或服务器控�
 写入是加锁 + 原子替换，多个 agent 同时首连不会互相写坏；每次只替换该主机
 自己的条目，手写注释和其它主机原样保留。
 
+### 10. 密钥认证（可选，密钥优先）
+
+密码之外支持 SSH 密钥：私钥**只以密文存在密码库**（`key:<host>` 条目），
+运行时从内存加载，进程退出即消失 —— 明文私钥不落盘（这是硬约束）。
+
+```bash
+# 生成（打印公钥行与指纹；私钥直接进密码库，不落任何明文文件）
+python scripts/sshhh.py manage keygen prod
+# 或导入已有私钥（PKCS8 / SEC1 / PKCS1 / OpenSSH 格式都可以，带口令的先
+# 用 `ssh-keygen -p -f 私钥` 移除口令再导入）
+python scripts/sshhh.py manage keyimport prod ~/.ssh/id_ed25519
+# 重新查看公钥
+python scripts/sshhh.py manage keyshow prod
+```
+
+- 公钥部署目前是**手动**的：把输出的公钥行追加到服务器的
+  `~/.ssh/authorized_keys`（Windows 管理员组用户是
+  `administrators_authorized_keys`，注意 ACL 只留 Administrators/SYSTEM）。
+  一键部署受限公钥属加固档（#15，观察名单）；`manage harden <主机> --check`
+  可以先探测服务器端条件
+- 连接时**密钥优先、密码兜底**：密钥被服务器拒绝会自动回落到密码，
+  并在审计日志写 `fallback: key`、在 stderr 提示 —— 服务器上的公钥
+  被人拿掉时你能在审计里看到
+- 密钥即使被偷，也只够登录这一台服务器，不像密码丢了要全网改
+
+### 11. 主机清单的完整性签名
+
+`hosts.toml` 对 AI 可写，「删掉策略段就永久豁免限制」是真实的攻击路径。
+清单因此带 HMAC 签名（密钥从主密码派生）：
+
+- 任何字段值被改动，签名就失配：所有连接类命令在建连前拒绝（退出码 3）
+  并明确报错；**注释与排版不参与签名**，手编注释不会弄坏它
+- 你本人手编 hosts.toml 后，检查内容无误，执行一次
+  `python scripts/sshhh.py manage reseal` 即可恢复
+- 程序写入（向导加主机、迁移）会自动续签；签名失效的清单普通写入
+  **不会**把它洗成「已验证」状态
+- `list` / `status` / `manage policy` 不验签 —— 你需要它们在被改动的
+  清单上先看看改了什么
+
 ## 快速开始
 
 ### 1. 安装
@@ -254,8 +293,8 @@ python scripts/sshhh.py config --here
 
 | 路径 | 内容 |
 |---|---|
-| `~/.sshhh/vault.enc` | 加密后的密码（AES-GCM + scrypt）。没有主密码打不开，**头部也不含条目名** |
-| `~/.sshhh/hosts.toml` | 主机、端口、用户名、命令策略。**没有 password 字段** |
+| `~/.sshhh/vault.enc` | 加密后的密码与私钥条目（AES-GCM + scrypt）。没有主密码打不开，**头部也不含条目名** |
+| `~/.sshhh/hosts.toml` | 主机、端口、用户名、命令策略，带完整性签名。**没有 password 字段** |
 | `~/.sshhh/known_hosts` | 主机指纹（TOFU） |
 | `~/.sshhh/audit.log` | JSONL 审计记录，写入前已脱敏 |
 | `~/.sshhh/console.log` | 配置窗口的诊断日志，只记流程和异常，不含任何输入 |
@@ -332,6 +371,10 @@ status，见 SKILL.md）；**管理层**给用户本人执行：
 | `manage hosts` | 列出主机清单（同 `list`） |
 | `manage setpass <主机>` | 修改某台主机的密码 |
 | `manage unlock` | 重新输入主密码 |
+| `manage keygen <主机> [--force]` | 生成 Ed25519 密钥对（私钥加密入密码库，打印公钥行与指纹） |
+| `manage keyimport <主机> [私钥文件]` | 导入已有私钥到密码库（省略路径时自动使用该主机遗留的 key_file） |
+| `manage keyshow <主机>` | 显示该主机的公钥行与 SHA256 指纹 |
+| `manage reseal` | 手编 hosts.toml 后重新签名（见「主机清单的完整性签名」） |
 | `manage policy <主机>` | 查看该主机的生效策略 |
 | `manage audit [-n N] [--all]` | 查看审计记录（`--all` 含 `vault.open` 解密留痕） |
 | `manage harden <主机> --check` | **只读探测**远端可加固性（sshd 是否 OpenSSH、shell、authorized_keys 可写性），不做任何改动 |
@@ -393,8 +436,9 @@ python scripts/sshhh.py get prod /var/log/app/big.log ./big.log --max-bytes 2000
 
 **防不住什么**（如实说明）
 
-- **本地策略可以被绕过**：`hosts.toml` 与 `scripts/` 对同用户的进程可写，改掉规则
-  或直接调 `lib.transport` 都行。它是**防手滑，非安全边界**（见 6.1）。
+- **本地策略可以被绕过**：`hosts.toml` 与 `scripts/` 对同用户的进程可写，
+  有意者可以直接调 `lib.transport`，或解开密码库后重新签名清单（import
+  内部模块级别）。完整性签名（第 11 节）抬的是这条路的成本与留痕，不是边界。
 - **审计日志可以被改写**：同用户进程有写权限，留痕不等于防篡改。
 - 拿到你操作系统账户权限的程序，可以直接调用本项目的 Python 接口解密，
 `python -c "from lib import vault; vault.open_vault()"` 一行就够。
@@ -444,9 +488,22 @@ vault.enc 里。注意「多 agent 共用配置」不需要这个：所有 agent
 
 **Q：改密码会不会把主机配置弄丢？**
 
-不会。`setpass <主机>` 只问新密码，地址、端口、用户名、`sudo`、`key_file`、
+不会。`setpass <主机>` 只问新密码，地址、端口、用户名、`sudo`、
 命令策略、`allow_shell` 全部原样保留。走 `config` 重填同一台主机时，中括号里
 是现值，直接回车就是保持不变。
+
+**Q：手动编辑了 hosts.toml，之后所有连接都被拒？**
+
+这是完整性签名在工作（见第 11 节），不是故障。检查文件内容符合你的本意，
+然后执行 `python scripts/sshhh.py manage reseal`。如果你没有改过它，
+说明有别的程序动了清单 —— 先弄清楚改了什么再签名。
+
+**Q：以前用 key_file 字段配的密钥还能用吗？**
+
+不能直接用了。hosts.toml 对 AI 可写，指向磁盘路径的私钥等于一个绕过
+密码库的后门（AI 可以用它连上任何自己的服务器），所以 key_file 不再参与
+认证。把私钥导入密码库即可：`python scripts/sshhh.py manage keyimport <主机>`
+（会自动使用该字段记录的路径）；导入后字段可以删掉。
 
 **Q：sudo 怎么处理？**
 
@@ -470,6 +527,7 @@ py -3.14 -m venv .venv
 .venv/Scripts/python.exe tests/test_flow.py   # 主流程与状态码
 .venv/Scripts/python.exe tests/test_p0.py     # P0 真值修复（策略 / 审计 / 传输 / 输出）
 .venv/Scripts/python.exe tests/test_p1.py     # P1 修复回归（nonce / 审计 / 加固等）
+.venv/Scripts/python.exe tests/test_p2.py     # P2（完整性签名 / 密钥认证）
 .venv/Scripts/python.exe tests/test_lock.py   # 并发锁与自举竞态
 .venv/Scripts/python.exe tests/test_store.py  # 主机清单读写
 py -3.14 tests/test_docs.py                   # 文档与代码一致性
