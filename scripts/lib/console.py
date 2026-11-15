@@ -8,6 +8,12 @@
   * 窗口进程消失且没有结果 → 取消（用户点了 X）
   * 等满交接时间还没结果 → 返回 pending，把窗口留给用户，自己正常退出
   * 等满硬超时 → taskkill 窗口，返回 timeout
+
+#23 评估结论（2026-11-15）：真实使用中弹窗 2 次、全部成功（console.log），
+链路保留。Windows 专属分支（_launch_inline 之外的全部 nt 路径、
+_pid_alive 的 kernel32 调用、taskkill）是测试盲区：自动化测试覆盖的是
+MockConsole 的编排语义与结果文件白名单，真实窗口行为需人工验证。
+非 Windows 的退化路径在 _launch_inline（当前终端里直接跑向导）。
 """
 
 from __future__ import annotations

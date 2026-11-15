@@ -16,6 +16,12 @@
 
 编码注意：.cmd 必须用系统 ANSI（mbcs）写，不能用 UTF-8 —— cmd.exe 按当前
 代码页逐行解析批处理，UTF-8 的中文路径会被解析坏。
+
+本模块是 Windows 专属（#23）：只在 os.name == "nt" 的路径被调用。
+测试盲区：真实 explorer 拉起、真实 cmd 窗口的键盘输入与回收行为
+无法在自动化测试里覆盖（test_flow 只能用 MockConsole 与 pid 语义替身），
+需要真实 Windows 桌面会话人工验证。链路保留/移除的评估数据见
+references/protocol.md「Windows 弹窗链路」一节。
 """
 
 from __future__ import annotations

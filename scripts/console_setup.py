@@ -4,6 +4,11 @@
 密码全程只存在于本进程内存，不经过命令行参数，也不会被父进程读到。
 
 退出时把结果写进一个临时 JSON 文件，父进程读它判断成功 / 取消 / 出错。
+
+Windows 专属部分（#23 标注）：CONIN$/CONOUT$ 绑定（_bind_console）、
+msvcrt 键盘读取（_read_line / _kbhit / _getch）、SetConsoleTitleW。
+这些在自动化测试里只有「msvcrt 打桩」级别的覆盖（test_flow 的读行测试），
+真实窗口的键盘焦点、回收时机是测试盲区，需人工验证。
 """
 
 from __future__ import annotations

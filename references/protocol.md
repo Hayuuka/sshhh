@@ -171,6 +171,22 @@ Windows 上 `CREATE_BREAKAWAY_FROM_JOB` 在多数作业对象里不起作用。�
 让 agent 的命令一直挂着没有意义。交接后 agent 可以告诉用户「去窗口里填」，
 用户在窗口里操作，完成后再重试。
 
+### Windows 弹窗链路：保留决策与测试盲区（#23）
+
+数据评估（2026-11-15，console.log）：真实使用中弹窗 2 次（首跑 `setup`、
+`add_host`），**全部成功**，没有一次落到 `config --here` 降级。按 #23 的
+决策规则（依据数据），链路**保留**。
+
+代价与盲区（如实标注）：
+
+- 约 700 行 Windows 专属编排（launcher / console 的 nt 分支 / console_setup
+  的 CONIN$、msvcrt 键盘读取、`.claimed` 独占、交接回收启发式）
+- 自动化测试覆盖的是编排语义（MockConsole 的状态流转、结果文件白名单、
+  pid 存活判定）；**真实 explorer 拉起、真实 cmd 窗口的键盘输入、taskkill
+  回收、交接后 15 秒启发式**只能人工验证
+- 上述模块的 docstring 已标注盲区；非 Windows 退化为 `_launch_inline`
+  （当前终端跑向导），有 #33 的针对性文案兜底
+
 ### 宿主回收窗口的识别与降级
 
 交接出去的下一次调用会检查：那个窗口还在吗？配置完成了吗？
