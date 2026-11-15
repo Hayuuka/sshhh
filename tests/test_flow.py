@@ -711,23 +711,27 @@ def main() -> int:
         shutil.rmtree(fake, ignore_errors=True)
 
         print("\n== 窗口启动脚本 ==")
-        from lib import launcher as launcher_mod
+        if os.name == "nt":
+            from lib import launcher as launcher_mod
 
-        work = _TMP / ".setup-testcmd"
-        cmd_file = launcher_mod.write_cmd(
-            work, r"C:\Python\python.exe", Path(r"D:\s\console_setup.py"), "setup",
-            work / "payload.json", work / "result.json", work / "pid.json",
-            work / "stderr.log", _TMP,
-        )
-        raw = cmd_file.read_bytes()
-        text = raw.decode("mbcs", "replace")
-        check("生成 run.cmd", cmd_file.exists())
-        check("stderr 走独立文件（避免和窗口日志抢句柄）",
-              "stderr.log" in text, text)
-        check("数据目录作为参数传入", str(_TMP) in text, text)
-        check("不含 UTF-8 BOM（cmd 解析不了）",
-              not raw.startswith(b"\xef\xbb\xbf"))
-        shutil.rmtree(work, ignore_errors=True)
+            work = _TMP / ".setup-testcmd"
+            cmd_file = launcher_mod.write_cmd(
+                work, r"C:\Python\python.exe", Path(r"D:\s\console_setup.py"), "setup",
+                work / "payload.json", work / "result.json", work / "pid.json",
+                work / "stderr.log", _TMP,
+            )
+            raw = cmd_file.read_bytes()
+            text = raw.decode("mbcs", "replace")
+            check("生成 run.cmd", cmd_file.exists())
+            check("stderr 走独立文件（避免和窗口日志抢句柄）",
+                  "stderr.log" in text, text)
+            check("数据目录作为参数传入", str(_TMP) in text, text)
+            check("不含 UTF-8 BOM（cmd 解析不了）",
+                  not raw.startswith(b"\xef\xbb\xbf"))
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            # run.cmd 的 mbcs 编码是 Windows 专属（#20 首跑在 ubuntu 上发现）
+            check("非 Windows 跳过启动脚本测试", True)
 
         print("\n== 控制台读行（不依赖 stdin）==")
         if os.name == "nt":

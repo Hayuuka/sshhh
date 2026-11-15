@@ -998,7 +998,8 @@ def cmd_audit(argv: list[str]) -> int:
 
 def cmd_migrate(argv: list[str]) -> int:
     """从旧版 sshx 项目（agentssh）迁移主机与密码。"""
-    import tomllib
+    # 3.9/3.10 没有标准库 tomllib；lib.store 顶部做过兼容 shim，复用它
+    from lib.store import tomllib
 
     from lib import audit, store, vault
 

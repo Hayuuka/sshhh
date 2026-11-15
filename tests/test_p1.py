@@ -24,6 +24,11 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # 3.9/3.10 用 pip 的 tomli（与 lib.store 一致）
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
 _TMP = Path(tempfile.mkdtemp(prefix="sshhh-p1-"))
 os.environ["SSHHH_DATA_DIR"] = str(_TMP)
 os.environ.pop("SSHHH_MASTER", None)
@@ -991,8 +996,6 @@ def test_auth_field_and_key_namespace() -> None:
 
 
 def test_store_canonical_rewrite() -> None:
-    import tomllib
-
     from lib import paths, store
 
     print("\n== #22 写路径整份规范重排，未知内容不丢 ==")
