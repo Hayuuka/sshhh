@@ -332,7 +332,7 @@ agent 调用时 ─────────────────┘
 审计（`audit.log`）覆盖所有触达凭据或远端的动作，`action` 取值：
 
 `run`、`run.denied`、`transfer.put`、`transfer.get`、`transfer.denied`、
-`test`、`setpass`、`unlock`、`migrate`、`vault.open`。
+`test`、`test.denied`、`setpass`、`unlock`、`migrate`、`vault.open`。
 
 `vault.open` 记录的是「谁解密了密码库」：pid、解释器、工作目录、命令行**前两个
 参数**。它拦不住同用户进程直接调用 `lib.vault`（操作系统级边界），但能让这条路

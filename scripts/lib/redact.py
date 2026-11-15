@@ -7,6 +7,11 @@ from urllib.parse import quote
 
 PLACEHOLDER = "[REDACTED]"
 
+# 按值替换的最小长度。Redactor 现在装的是 vault 里**全部**值（I9），
+# 过短的值（"x"、"123456"）会在正常输出里造成大面积误伤，得不偿失；
+# 不足长度的口令仍有通用规则（password=…）兜底，且本就不该这么短。
+MIN_SECRET_LEN = 8
+
 _GENERIC = [
     # `pwd` 不进来：它是「打印工作目录」的极常见写法（Makefile、CI 输出、
     # shell 提示符），误伤会把排障要看的路径抹掉（#11）。
@@ -22,7 +27,7 @@ class Redactor:
             self.add(s)
 
     def add(self, secret: str | None) -> None:
-        if not secret or len(secret) < 4:
+        if not secret or len(secret) < MIN_SECRET_LEN:
             return
         variants = {
             secret,

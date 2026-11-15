@@ -271,6 +271,11 @@ class Vault:
     def names(self) -> list[str]:
         return sorted(self._data)
 
+    def values(self) -> list[str]:
+        """全部明文值。供 Redactor 用 vault 全量构造（#34 I9）：
+        A 机的密码出现在 B 机的输出里时同样要被替换。"""
+        return list(self._data.values())
+
     def rekey(self, new_master: str) -> None:
         assert self._header is not None
         salt = _secrets.token_bytes(16)

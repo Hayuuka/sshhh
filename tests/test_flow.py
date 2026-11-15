@@ -99,15 +99,20 @@ def _fake_shell(command: str) -> str:
 
 def _handle(transport, server):
     try:
-        chan = transport.accept(20)
-        if chan is None:
-            return
-        if not server.event.wait(20):
+        # 一条 SSH 连接上可能开多个 session（test 的探测命令是三条独立 exec），
+        # 服务端循环 accept，直到客户端断开
+        while True:
+            chan = transport.accept(20)
+            if chan is None:
+                return
+            if not server.event.wait(20):
+                chan.close()
+                return
+            server.event.clear()
+            chan.sendall(
+                _fake_shell(server.command.decode("utf-8", "replace")).encode())
+            chan.send_exit_status(0)
             chan.close()
-            return
-        chan.sendall(_fake_shell(server.command.decode("utf-8", "replace")).encode())
-        chan.send_exit_status(0)
-        chan.close()
     except Exception:
         pass
     finally:

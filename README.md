@@ -183,7 +183,7 @@ AI 的上下文很贵，也很容易被灌满：`cat` 一个大文件、`find /`
 |---|---|
 | `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时；被截断时带 `truncated` 与原始字节数 |
 | `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、字节数、结果 |
-| `test` | 探测了哪台机器、结果如何 |
+| `test` / `test.denied` | 探测了哪台机器、结果如何；被策略拒绝时同样留记录 |
 | `setpass` | 哪台主机的密码被改动（不含密码本身） |
 | `unlock` | 解锁事件，含自动解锁失败的尝试 |
 | `migrate` | 凭据库迁移的来源与条数 |

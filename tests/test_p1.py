@@ -140,6 +140,83 @@ def test_sudo_with_stdin() -> None:
     check("只喂密码", written == "sudo-password-1\n", repr(written))
 
 
+# --------------------------------------------------------------------------
+# #34 I6：test 也要过策略、也要脱敏；I9：redactor 用 vault 全量值
+# --------------------------------------------------------------------------
+
+
+def run_cli(args: list[str]) -> tuple[int, str, str]:
+    import contextlib
+    import io
+
+    import sshhh as cli
+
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(args)
+    except SystemExit as exc:
+        code = int(exc.code or 0)
+    return code, out.getvalue(), err.getvalue()
+
+
+class _NoConnectClient:
+    """哨兵：test 在策略阶段就该被拒，绝不应该走到建连。"""
+
+    def __init__(self, *a, **kw):
+        raise AssertionError("策略拒绝发生在建连之前，Client 不应被构造")
+
+
+def test_test_policy_and_redaction() -> None:
+    from lib import paths, store, vault
+    from lib.redact import Redactor
+    from lib.transport import Client as RealClient
+
+    import sshhh as cli
+
+    print("\n== #34 I9 Redactor 阈值 8 ==")
+    r = Redactor(["short12", "eight-char-ok"])
+    check("7 字符的值不做按值替换", "short12" in r.clean("x short12 y"))
+    check("8 字符的值被替换", "eight-char-ok" not in r.clean("x eight-char-ok y"))
+    r2 = Redactor(["1234567"])
+    check("7 字符口令不误伤正常文本", r2.clean("size=1234567") == "size=1234567")
+
+    print("\n== #34 I6 白名单主机的 test 被拒 ==")
+    reset()
+    master = "p1-master-passphrase-1"
+    os.environ["SSHHH_MASTER"] = master
+    v = vault.Vault.create(paths.vault_file(), master)
+    v.set("wl", "host-password-1")
+    store.upsert_host(store.Host(name="wl", host="127.0.0.1", user="root",
+                                 port=1))
+    store.set_policy("wl", ["^df -h$"], [])
+
+    saved = cli.transport.Client if hasattr(cli, "transport") else None
+    from lib import transport
+    transport.Client = _NoConnectClient
+    try:
+        code, _, err = run_cli(["test", "wl"])
+    finally:
+        transport.Client = RealClient
+    check("test 返回 1（策略拒绝）", code == 1, str(code))
+    check("提示探测命令被策略拒绝", "探测命令被策略拒绝" in err, err)
+    check("提示白名单模式如何验证连通", "白名单" in err and "run" in err, err)
+
+    recs = [r for r in __import__("lib.audit", fromlist=["tail"]).tail(20)
+            if str(r.get("action", "")).startswith("test")]
+    check("写了 test.denied 审计",
+          any(r.get("action") == "test.denied" for r in recs), str(recs))
+    os.environ.pop("SSHHH_MASTER", None)
+
+    print("\n== #34 I9 cmd_run 用 vault 全量值构造 Redactor ==")
+    import inspect
+
+    src = inspect.getsource(cli.cmd_run)
+    check("run 的 redactor 来自 vault.values()", "vault_obj.values()" in src,
+          src[:80])
+    check("不再只装本机密码", "Redactor([password]" not in src)
+
+
 def test_redact_pwd() -> None:
     from lib.redact import Redactor
 
@@ -169,6 +246,7 @@ def test_redact_pwd() -> None:
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
+    test_test_policy_and_redaction()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

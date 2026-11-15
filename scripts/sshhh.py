@@ -500,7 +500,9 @@ def cmd_run(argv: list[str]) -> int:
         )
 
     # --- 5. 执行 ---------------------------------------------------------
-    redactor = Redactor([password] if password else [])
+    # 脱敏用 vault 全量值而不是只有本机密码（#34 I9）：A 机的密码出现在
+    # B 机的输出里（jump host 场景、配置文件里贴了另一台的密码）同样要替换。
+    redactor = Redactor(vault_obj.values())
     safe_cmd = redactor.clean(command)
 
     reason = host.policy.check(command, allow_shell=host.allow_shell)
@@ -581,6 +583,7 @@ def cmd_list(argv: list[str]) -> int:
 
 def cmd_test(argv: list[str]) -> int:
     from lib import audit, protocol, store, vault
+    from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
     _, pos = _parse(argv, set())
@@ -598,29 +601,49 @@ def cmd_test(argv: list[str]) -> int:
         return protocol.emit(protocol.EXIT_LOCKED, str(exc))
     password = v.get(name)
 
+    # 探测命令是脚本自己写死的，但同样要过策略（#34 I6）：用户把主机配成
+    # 白名单模式（「只许跑 df -h」）时，test 无权在这台机器上另跑别的命令。
+    # 探测拆成三条独立命令，避免为了拼一行而依赖 shell 元字符。
+    probes = ["echo __SSHHH_OK__", "uname -s", "hostname"]
+    for probe in probes:
+        reason = host.policy.check(probe, allow_shell=host.allow_shell)
+        if reason:
+            audit.write("test.denied", host=name, user=host.user,
+                        command=probe, ok=False, error=reason)
+            _warn(f"[sshhh] 探测命令被策略拒绝：{reason}")
+            if host.policy.allow:
+                _warn("[sshhh] 该主机处于白名单模式，test 的探测命令未获放行；"
+                      "请直接 run 一条白名单内的命令验证连通")
+            return 1
+
     target = f"{host.user}@{host.host}:{host.port}"
     _say(f"连接 {name} ({target}) ...")
-    client = Client(host, password, store.Settings())
+    redactor = Redactor(v.values())
+    client = Client(host, password, store.Settings(), redactor)
     try:
         with client:
-            r = client.run("echo __SSHHH_OK__; uname -s; hostname", timeout=20)
+            r = client.run(probes[0], timeout=20)
+            if "__SSHHH_OK__" not in r.stdout:
+                error = "连接建立但测试命令未返回预期输出"
+                audit.write("test", host=name, user=host.user, command=target,
+                            ok=False, error=error, duration_ms=r.duration_ms)
+                _warn(f"[sshhh] {error}")
+                return 4
+            info = ""
+            for probe in probes[1:]:
+                rr = client.run(probe, timeout=20)
+                info += rr.stdout
     except TransportError as exc:
         audit.write("test", host=name, user=host.user, command=target,
                     ok=False, error=str(exc))
         _warn(f"[sshhh] 连接失败：{exc}")
         return 4
 
-    if "__SSHHH_OK__" not in r.stdout:
-        error = "连接建立但测试命令未返回预期输出"
-        audit.write("test", host=name, user=host.user, command=target,
-                    ok=False, error=error, duration_ms=r.duration_ms)
-        _warn(f"[sshhh] {error}")
-        return 4
     audit.write("test", host=name, user=host.user, command=target,
                 duration_ms=r.duration_ms)
     _say(f"[ok] 连接成功（{r.duration_ms} ms）")
-    for line in r.stdout.splitlines():
-        if line and line != "__SSHHH_OK__":
+    for line in info.splitlines():
+        if line:
             _say(f"     {line}")
     return 0
 

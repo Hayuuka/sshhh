@@ -287,7 +287,7 @@ python scripts/sshhh.py audit -n 20 # 最近的调用记录
 
 审计覆盖 `run` / `put` / `get` / `test` / `setpass` / `unlock` / `migrate`，
 以及每一次成功解密（action 为 `vault.open`）。被策略拒绝的动作记成
-`run.denied` / `transfer.denied`。
+`run.denied` / `transfer.denied` / `test.denied`。
 
 常见错误：
 
