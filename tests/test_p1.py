@@ -811,6 +811,56 @@ def test_code_hygiene() -> None:
     check("vault_obj 直取", "vault_obj.get(name)" in run_src)
 
 
+# --------------------------------------------------------------------------
+# #25 manage 分层：子命令分发 + 别名不破坏
+# --------------------------------------------------------------------------
+
+
+def test_manage_dispatch() -> None:
+    import json as jsonlib
+
+    from lib import audit, paths, store, vault
+
+    print("\n== #25 manage 子命令分发 ==")
+    reset()
+    vault.Vault.create(paths.vault_file(), "p1-master-manage-1")
+    os.environ["SSHHH_MASTER"] = "p1-master-manage-1"
+    store.upsert_host(store.Host(name="prod", host="10.1.1.1", user="deploy",
+                                 port=2222, description="生产"))
+    store.set_policy("prod", [r"^df -h$"], [r"^rm -rf.*"],
+                     allow_get=[r"^/var/log/"])
+
+    code, out, err = run_cli(["manage", "policy", "prod"])
+    check("manage policy 查看生效策略", code == 0 and "allow" in out, out)
+    check("列出规则原文", "^df -h$" in out and "^/var/log/" in out, out)
+    check("提示修改方式", "hosts.toml" in out, out)
+
+    code, out, err = run_cli(["manage", "policy", "ghost"])
+    check("manage policy 未知主机 → 3", code == 3, f"{code} {err}")
+
+    code, out, err = run_cli(["manage", "hosts"])
+    check("manage hosts 列出清单", code == 0 and "prod" in out, out)
+
+    audit.write("run", host="prod", command="df -h")
+    code, out, err = run_cli(["manage", "audit", "-n", "5"])
+    check("manage audit 可用", code == 0 and "df -h" in out, out)
+
+    code, out, err = run_cli(["manage", "bogus"])
+    check("未知子命令 → 2", code == 2, f"{code} {err}")
+
+    code, out, err = run_cli(["manage"])
+    check("无参数 → 用法（2）", code == 2 and "manage" in err + out, err + out)
+
+    print("\n== #25 旧命令别名不破坏 ==")
+    code, out, err = run_cli(["list"])
+    check("list 照常", code == 0 and "prod" in out, out)
+    code, out, err = run_cli(["audit", "-n", "5"])
+    check("顶层 audit 别名照常", code == 0 and "df -h" in out, out)
+    code, out, err = run_cli(["setpass", "ghost-host"])
+    check("顶层 setpass 别名照常", code == 3, str(code))
+    os.environ.pop("SSHHH_MASTER", None)
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -823,6 +873,7 @@ def main() -> int:
     test_gpg_backend()
     test_status_headless_guidance()
     test_code_hygiene()
+    test_manage_dispatch()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

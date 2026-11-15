@@ -66,6 +66,10 @@ def parse_simple(fm: str) -> dict:
 def main() -> int:
     skill_md = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     protocol_md = (ROOT / "references" / "protocol.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_en_path = ROOT / "README.en.md"
+    readme_en = (readme_en_path.read_text(encoding="utf-8")
+                 if readme_en_path.exists() else "")
 
     print("== frontmatter ==")
     fm, body = split_frontmatter(skill_md)
@@ -99,16 +103,31 @@ def main() -> int:
     check("frontmatter 内无 HTML 注释", "<!--" not in fm, repr(fm))
     check("来源说明写在正文里", "<!--" in body and "agent_created" in body)
 
-    print("\n== 命令表 ==")
+    print("\n== 命令表（#25 按受众分层）==")
     import sshhh  # noqa: E402
 
-    documented = set(re.findall(r"^\| `([a-z]+)", skill_md, re.M))
-    implemented = set(sshhh.COMMANDS)
-    check("命令表非空", len(documented) >= 10, str(sorted(documented)))
-    missing = documented - implemented
-    check("文档里的命令都已实现", not missing, f"缺失实现：{sorted(missing)}")
-    shadowed = implemented - documented - {"ls"}
-    check("没有未公开的命令", not shadowed, f"未公开：{sorted(shadowed)}")
+    implemented = set(sshhh.COMMANDS) - {"ls"}
+    skill_cmds = set(re.findall(r"^\| `([a-z]+)", skill_md, re.M))
+    readme_cmds = set(re.findall(r"^\| `([a-z]+)", readme, re.M))
+
+    agent_layer = {"run", "list", "test", "put", "get", "status"}
+    manage_layer = {"manage", "setup", "hosts", "setpass", "unlock",
+                    "policy", "audit", "migrate", "config"}
+    check("SKILL 命令表非空", len(skill_cmds) >= 5, str(sorted(skill_cmds)))
+    check("SKILL 只写执行层命令",
+          not (skill_cmds - agent_layer), str(sorted(skill_cmds - agent_layer)))
+    check("SKILL 里的命令都已实现",
+          not (skill_cmds - implemented), str(sorted(skill_cmds - implemented)))
+    check("README 覆盖管理层命令",
+          not (manage_layer - readme_cmds - {"manage", "config"}
+               - set(re.findall(r"^\| `manage ([a-z]+)", readme, re.M))),
+          str(sorted(manage_layer - readme_cmds - {"manage", "config"})))
+    check("README 说明 config 入口", "`config" in readme)
+    check("没有两层都没写的命令",
+          not (implemented - skill_cmds - readme_cmds - {"config"}
+               - set(re.findall(r"^\| `manage ([a-z]+)", readme, re.M))),
+          str(sorted(implemented - skill_cmds - readme_cmds)))
+    check("SKILL 明说管理操作归 manage", "manage" in skill_md)
 
     print("\n== 状态码 ==")
     names = set(protocol.STATUS_NAMES.values())
@@ -138,10 +157,7 @@ def main() -> int:
     check("没有 .sshh 旧目录写法", not legacy_lower, f"发现：{sorted(legacy_lower)}")
 
     print("\n== README（中英双语）==")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    readme_en_path = ROOT / "README.en.md"
     check("README.en.md 存在", readme_en_path.exists())
-    readme_en = readme_en_path.read_text(encoding="utf-8") if readme_en_path.exists() else ""
 
     check("中文 README 有「数据存在哪里」小节", "## 数据存在哪里" in readme)
     check("英文 README 有对应小节", "## Where your data lives" in readme_en)

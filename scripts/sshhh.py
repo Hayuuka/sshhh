@@ -25,19 +25,23 @@ _SELF = Path(__file__).resolve()
 USAGE = """\
 sshhh —— AI 可用的 SSH 通道，密码不进入 AI 上下文
 
+执行层（agent 调用）：
   run <主机> <命令...>     执行命令（退出码透传）
   list                    列出已配置的主机
   test <主机>              连通性测试
   put <主机> <本地> <远端>   上传文件
   get <主机> <远端> <本地>   下载文件
-  status                  查看整体状态
-  audit [-n N]            查看最近的调用记录
+  status                  查看整体状态（自诊断）
 
+管理层（用户本人执行；旧命令保留别名）：
+  manage setup            只安装运行环境
+  manage hosts            列出主机清单（同 list）
+  manage setpass <主机>    修改某台主机的密码
+  manage unlock           重新输入主密码
+  manage policy <主机>     查看该主机的生效策略
+  manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
+  manage migrate <旧目录>  从旧版 sshx 项目迁移主机和密码
   config [--here]         打开配置窗口；加 --here 则在当前终端里配置
-  setpass <主机>           修改某台主机的密码
-  unlock                  重新输入主密码
-  setup                   只安装运行环境
-  migrate <旧目录>         从旧版 sshx 项目迁移主机和密码
 
 数据目录（所有 agent 共用）：{data}
 """
@@ -1085,6 +1089,69 @@ def cmd_migrate(argv: list[str]) -> int:
     return 0
 
 
+def cmd_policy(argv: list[str]) -> int:
+    """查看某台主机的生效策略（管理操作）。
+
+    修改策略仍走 hosts.toml 手编（语法见 README 策略一节）；这里是只读视图，
+    免得用户为「看一眼」去解析整份清单。
+    """
+    from lib import store
+
+    _, pos = _parse(argv, set())
+    if not pos:
+        raise UsageError("用法：sshhh manage policy <主机>")
+    name = pos[0]
+    host = store.get(name)
+    if host is None:
+        return _unknown_host(name)
+
+    _say(f"[{name}] {host.user}@{host.host}:{host.port}"
+         + (f"  {host.description}" if host.description else ""))
+    if host.allow_shell:
+        _say("allow_shell = true（允许 shell 元字符；allow/deny 只对整条命令原样生效）")
+    pol = host.policy
+    if not pol.active:
+        _say("  未配置策略：所有命令与文件通道默认放行（元字符仍默认拒绝）")
+        return 0
+    for key, rules in (("allow", pol.allow), ("deny", pol.deny),
+                       ("allow_put", pol.allow_put), ("allow_get", pol.allow_get),
+                       ("deny_put", pol.deny_put), ("deny_get", pol.deny_get)):
+        if rules:
+            _say(f"  {key} = ['" + "', '".join(rules) + "']")
+    _say("修改请编辑 ~/.sshhh/hosts.toml 的 [hosts.<名称>.policy] 段，语法见 README")
+    return 0
+
+
+MANAGE_USAGE = """\
+sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
+
+  manage setup             只安装运行环境
+  manage hosts             列出主机清单（同 list）
+  manage setpass <主机>     修改某台主机的密码
+  manage unlock            重新输入主密码
+  manage policy <主机>      查看该主机的生效策略
+  manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
+  manage migrate <旧目录>   从旧版 sshx 项目迁移
+
+加主机：对 AI 说「连一下 <名称>」自动触发；或手动执行 config
+（加 --here 在当前终端完成，不弹窗）。
+"""
+
+
+def cmd_manage(argv: list[str]) -> int:
+    """管理操作入口（#25）：按受众拆分，配置 / 密码 / 审计归用户本人。"""
+    if not argv:
+        _say(MANAGE_USAGE)
+        return 2
+    sub, rest = argv[0], argv[1:]
+    handler = MANAGE_COMMANDS.get(sub)
+    if handler is None:
+        _warn(f"未知管理子命令：{sub}")
+        _say(MANAGE_USAGE)
+        return 2
+    return handler(rest)
+
+
 COMMANDS = {
     "run": cmd_run,
     "list": cmd_list,
@@ -1092,12 +1159,24 @@ COMMANDS = {
     "test": cmd_test,
     "put": cmd_put,
     "get": cmd_get,
+    "status": cmd_status,
+    # 管理层入口与旧命令别名（旧手感不破坏）
+    "manage": cmd_manage,
     "config": cmd_config,
     "setpass": cmd_setpass,
     "unlock": cmd_unlock,
-    "status": cmd_status,
     "audit": cmd_audit,
     "setup": cmd_setup,
+    "migrate": cmd_migrate,
+}
+
+MANAGE_COMMANDS = {
+    "setup": cmd_setup,
+    "hosts": cmd_list,
+    "setpass": cmd_setpass,
+    "unlock": cmd_unlock,
+    "policy": cmd_policy,
+    "audit": cmd_audit,
     "migrate": cmd_migrate,
 }
 
@@ -1121,7 +1200,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        if cmd != "setup":
+        # setup 只装环境，不需要 venv 里才有依赖；manage setup 同理
+        if cmd != "setup" and not (cmd == "manage" and rest
+                                   and rest[0] == "setup"):
             from lib import runtime
 
             try:

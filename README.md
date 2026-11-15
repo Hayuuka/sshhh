@@ -320,12 +320,24 @@ sequenceDiagram
 | `test <主机>` | 连通性测试 |
 | `put` / `get` | 上传 / 下载文件 |
 | `status` | 数据目录、密码库、主机清单 |
-| `audit [-n N]` | 查看调用记录 |
-| `config` | 手动打开配置窗口 |
-| `setpass <主机>` | 修改某台主机的密码 |
-| `unlock` | 重新输入主密码 |
-| `setup` | 只安装运行环境 |
-| `migrate <旧目录>` | 从旧版 sshx 项目迁移配置 |
+| `manage <子命令>` | 管理操作入口（见下表），配置与审计归用户本人 |
+
+命令按受众分两层（#25）：**执行层**给 AI 调用（run / list / test / put / get /
+status，见 SKILL.md）；**管理层**给用户本人执行：
+
+| 管理子命令 | 作用 |
+|------|------|
+| `manage setup` | 只安装运行环境 |
+| `manage hosts` | 列出主机清单（同 `list`） |
+| `manage setpass <主机>` | 修改某台主机的密码 |
+| `manage unlock` | 重新输入主密码 |
+| `manage policy <主机>` | 查看该主机的生效策略 |
+| `manage audit [-n N] [--all]` | 查看审计记录（`--all` 含 `vault.open` 解密留痕） |
+| `manage migrate <旧目录>` | 从旧版 sshx 项目迁移配置 |
+
+旧命令全部保留别名（`sshhh setpass prod` ≡ `sshhh manage setpass prod`）。
+加主机：对 AI 说「连一下 <名称>」自动触发；或手动 `sshhh config`
+（加 `--here` 在当前终端完成，不弹新窗口）。
 
 常用参数：
 
