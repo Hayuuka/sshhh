@@ -264,8 +264,22 @@ python scripts/sshhh.py config --here
 
 Windows 上是 `C:\Users\<你的用户名>\.sshhh\`。
 
-主密码本身不写在任何文件里 —— 它保存在操作系统凭据库：
-Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service。
+主密码本身不写在任何文件里 —— 它保存在本机的凭据后端里，按环境自动选择：
+
+| 环境 | 主密码后端 |
+|---|---|
+| Windows | 凭据管理器 |
+| macOS | 钥匙串 |
+| Linux 桌面 | Secret Service（dbus） |
+| **Linux headless / 容器**（无桌面、无 dbus） | **gpg 加密文件 `~/.sshhh/master.gpg`** |
+| 都不可用 | `SSHHH_MASTER` 环境变量（兜底；**agent 能 `printenv` 读到**，只做最后手段） |
+
+headless（无桌面的服务器 / 容器）说明：主密码用本机 gpg 私钥加密保存，
+与 `pass` 同一套机制；agent 调用时解密走 gpg-agent，主密码不出现在环境
+变量、argv 或日志里。要求本机有 gpg 且至少一把私钥（`gpg --list-secret-keys`
+有输出），私钥带口令时需 gpg-agent 已缓存。headless 上的首次配置在用户
+自己的终端里完成：`sshhh config --here`。
+
 所以拷走 `vault.enc` 也没用，没有主密码解不开。
 
 换电脑时：拷 `~/.sshhh/` 过去，但**排除 `venv/`**（运行时会在新机器上自动重建）。

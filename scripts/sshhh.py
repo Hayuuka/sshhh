@@ -906,6 +906,23 @@ def cmd_unlock(argv: list[str]) -> int:
     return 0
 
 
+def _backend_guidance() -> None:
+    """无钥匙串环境（headless Linux / 容器）的针对性指引（#19）。"""
+    from lib import vault
+
+    if vault.keyring_available():
+        return
+    _say("     本环境没有可用的系统凭据库（无钥匙串 / Secret Service）")
+    if vault.gpg_available():
+        _say("     可用 gpg 加密文件后端：让用户在自己的终端里执行 "
+             f"{_manual_cmd('unlock')}，主密码会加密存到 ~/.sshhh/master.gpg")
+        _say("     （解密走本机 gpg 私钥 + gpg-agent；私钥带口令时需 agent 已缓存口令）")
+    else:
+        _say("     本机也没有 gpg。各平台后端可用性见 README「主密码后端」一节；")
+        _say("     SSHHH_MASTER 环境变量可临时兜底，但 agent 能 printenv 读到，"
+             "只做最后手段")
+
+
 def cmd_status(argv: list[str]) -> int:
     from lib import store, vault
 
@@ -922,6 +939,7 @@ def cmd_status(argv: list[str]) -> int:
             _say(f"[ok] 密码库可自动解锁，含 {len(v.names())} 条密码")
         except vault.VaultError as exc:
             _say(f"[!!] 密码库无法自动解锁：{exc}")
+            _backend_guidance()
 
     hosts = store.load()
     _say(f"[--] 已配置 {len(hosts)} 台主机")
@@ -1049,10 +1067,13 @@ def cmd_migrate(argv: list[str]) -> int:
                                      deny_get=deny_get)
                 migrated.append(name)
 
-    if vault.keyring_save(paths.vault_file(), master):
+    backend = vault.save_master_auto(paths.vault_file(), master)
+    if backend == "keyring":
         _say("[ok] 主密码已存入系统凭据管理器")
+    elif backend == "gpg":
+        _say("[ok] 凭据管理器不可用；主密码已用 gpg 加密存到 ~/.sshhh/master.gpg")
     else:
-        _warn("[!] 凭据管理器不可用，之后需设置环境变量 SSHHH_MASTER")
+        _warn("[!] 凭据管理器与 gpg 都不可用，之后需设置环境变量 SSHHH_MASTER")
 
     audit.write("migrate", command=f"{old_dir}（{len(new_v.names())} 条密码 / "
                                    f"{len(migrated)} 台主机）")

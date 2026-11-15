@@ -289,6 +289,22 @@ def _import_lib():
     return paths, store, vault, data_lock
 
 
+def _save_master(vault_mod, vault_path, master: str) -> None:
+    """把主密码落到本机后端：优先钥匙串，其次 gpg 加密文件（#19）。
+
+    两种都不行时如实告知：只剩 SSHHH_MASTER 环境变量兜底，但 agent 能读它。
+    """
+    backend = vault_mod.save_master_auto(vault_path, master)
+    if backend == "keyring":
+        _ok("主密码已保存到系统凭据管理器")
+    elif backend == "gpg":
+        _ok("系统凭据管理器不可用；主密码已用本机 gpg 加密保存到 "
+            "~/.sshhh/master.gpg（headless 环境同样能自动解锁）")
+    else:
+        _err("系统凭据管理器与 gpg 都不可用，之后需设置环境变量 SSHHH_MASTER "
+             "才能自动连接（headless 指引见 README「主密码后端」一节）")
+
+
 def _host_hints(existing=None) -> None:
     """添加主机前把每个字段讲清楚。"""
     print("  名称     给这台机器起个短名，之后 `run <名称>` 用它定位")
@@ -340,10 +356,7 @@ def do_setup(payload: dict) -> dict:
         else:
             vault_mod.Vault.create(paths.vault_file(), master)
 
-    if vault_mod.keyring_save(paths.vault_file(), master):
-        _ok("主密码已保存到系统凭据管理器")
-    else:
-        _err("系统凭据管理器不可用，之后需要设置环境变量 SSHHH_MASTER 才能自动连接")
+    _save_master(vault_mod, paths.vault_file(), master)
 
     print()
     print("  下面填一台服务器，窗口不会自己关，可以慢慢填。")
@@ -387,8 +400,7 @@ def do_add_host(payload: dict) -> dict:
         print()
         master = ask_secret("主密码")
         vault_mod.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
-        if vault_mod.keyring_save(paths.vault_file(), master):
-            _ok("主密码已保存到系统凭据管理器")
+        _save_master(vault_mod, paths.vault_file(), master)
 
     print()
     if reset_password and existing is not None:
@@ -442,10 +454,7 @@ def do_unlock(payload: dict) -> dict:
     else:
         raise RuntimeError("主密码连续 3 次错误")
 
-    if vault_mod.keyring_save(paths.vault_file(), master):
-        _ok("已重新保存到系统凭据管理器，以后无需再输入")
-    else:
-        _err("系统凭据管理器不可用，之后请设置环境变量 SSHHH_MASTER")
+    _save_master(vault_mod, paths.vault_file(), master)
 
     return {"status": "ok"}
 

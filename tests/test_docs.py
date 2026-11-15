@@ -163,6 +163,15 @@ def main() -> int:
     check("英文 README 无 SSHH_ 旧标识",
           not re.search(r"\bSSHH_[A-Z]+", readme_en))
 
+    print("\n== 主密码后端矩阵（#19 headless）==")
+    check("中文 README 有「主密码后端」一节", "主密码后端" in readme)
+    check("README 记载 gpg 加密文件后端", "master.gpg" in readme)
+    check("README 如实声明 SSHHH_MASTER 可被 agent 读到",
+          "printenv" in readme, "")
+    check("protocol.md 记载 gpg 后端", "master.gpg" in protocol_md)
+    check("SKILL.md 给 headless 的 LOCKED 指引",
+          "master.gpg" in skill_md)
+
     print("\n== 超时数值一致 ==")
     os.environ.pop("SSHHH_SETUP_HANDOFF", None)
     handoff_default = sshhh._handoff_seconds() or 0

@@ -299,12 +299,21 @@ pip 安装 150s + 窗口交接 120s ≈ 270s  <  建议首次调用 300s
 用户输入 (窗口进程内存)
         │
         ├─→ AES-GCM 加密 ─→ ~/.sshhh/vault.enc
-        └─→ 主密码 ────────→ Windows 凭据管理器
-                              │
+        └─→ 主密码 ────────→ 系统凭据库（Windows 凭据管理器 / macOS 钥匙串 /
+                              Linux Secret Service）
+                              └─ 不可用时 → ~/.sshhh/master.gpg
+                                 （gpg 加密文件，headless Linux 的
+                                  一等公民后端，#19）
 agent 调用时 ─────────────────┘
         │
-        └─→ 脚本取出明文 → paramiko.connect() → 用完即弃
+        └─→ 脚本取出明文（钥匙串 → gpg 后端依次尝试）
+            → paramiko.connect() → 用完即弃
 ```
+
+headless 环境没有 Secret Service：主密码改用本机 gpg 私钥加密保存
+（与 pass 同一套机制），不进 `SSHHH_MASTER` 这类 agent 可读的环境变量。
+`master.gpg` 只在钥匙串不可用或未命中时被尝试，每次经它解锁同样写
+`vault.open` 审计。
 
 明文不落盘、不进 argv、不进环境变量、不进日志、不回显。
 

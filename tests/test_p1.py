@@ -665,6 +665,120 @@ def test_non_windows_first_run_guidance() -> None:
         console.launch, console.available = real_launch, real_available
 
 
+# --------------------------------------------------------------------------
+# #19 无钥匙串环境（headless）：gpg 后端 + status 指引
+# --------------------------------------------------------------------------
+
+
+def test_gpg_backend() -> None:
+    from lib import paths, vault
+
+    print("\n== #19 gpg 指纹解析（--with-colons）==")
+    sample = (
+        "pub:u:3072:1:ABCD:1700000000:::u:::esc:::ed:::3072:\n"
+        "fpr:::::::::AAAABBBBCCCC1111222233334444555566667777:\n"
+        "uid:u::::1700000000::ABCDEF12::user (comment) <u@e>:\n"
+        "ssb:u:3072:1:EFGH:1700000000::::::e:::\n"
+        "fpr:::::::::DDDD0000EEEE1111FFFF22223333444455556666:\n"
+        "sec:u:3072:1:IJKL:1700000005:::u:::sesc:::ed:::3072:\n"
+        "fpr:::::::::9999888877776666555544443333222211110000:\n"
+    )
+    check("第一把 sec 的指纹胜出（pub/ssb 的不算）",
+          vault._first_secret_fpr(sample) == "9999888877776666555544443333222211110000",
+          str(vault._first_secret_fpr(sample)))
+    check("只有公钥块返回 None",
+          vault._first_secret_fpr("pub:u:3072:1:ABCD:0:\nfpr:::::::::XYZ:\n") is None)
+    check("空输出返回 None", vault._first_secret_fpr("") is None)
+
+    print("\n== #19 Vault.open 在无钥匙串时经 gpg 后端解开 ==")
+    reset()
+    master = "p1-master-gpg-backend"
+    vault.Vault.create(paths.vault_file(), master)
+    os.environ.pop("SSHHH_MASTER", None)
+    real_kl = vault.keyring_load
+    real_gl = vault.gpg_load_master
+    vault.keyring_load = lambda *a, **k: None  # 模拟无 Secret Service
+    vault.gpg_load_master = lambda *a, **k: master
+    try:
+        v = vault.open_vault()
+        check("gpg 后端提供的主密码解开了库", v is not None and v.names() == [])
+    finally:
+        vault.keyring_load = real_kl
+        vault.gpg_load_master = real_gl
+
+    print("\n== #19 save_master_auto 的优先级 ==")
+    real_ks = vault.keyring_save
+    real_gs = vault.gpg_save_master
+    try:
+        vault.keyring_save = lambda *a, **k: True
+        check("钥匙串成功 → keyring",
+              vault.save_master_auto(paths.vault_file(), "m-12345678") == "keyring")
+        vault.keyring_save = lambda *a, **k: False
+        vault.gpg_save_master = lambda *a, **k: True
+        check("钥匙串失败 → gpg",
+              vault.save_master_auto(paths.vault_file(), "m-12345678") == "gpg")
+        vault.gpg_save_master = lambda *a, **k: False
+        check("全失败 → None",
+              vault.save_master_auto(paths.vault_file(), "m-12345678") is None)
+    finally:
+        vault.keyring_save = real_ks
+        vault.gpg_save_master = real_gs
+
+    print("\n== #19 真 gpg round-trip（无 gpg / 无私钥自动跳过）==")
+    if not vault.gpg_available():
+        print("       本机无 gpg，跳过")
+        check("gpg 缺席时 save 直接 False", vault.gpg_save_master(
+            paths.vault_file(), "m-12345678") is False)
+    elif vault._gpg_recipient(vault._gpg()) is None:
+        print("       本机没有带私钥的 gpg 键，跳过")
+        check("无私钥时 save 直接 False", vault.gpg_save_master(
+            paths.vault_file(), "m-12345678") is False)
+    else:
+        reset()
+        os.environ.pop("SSHHH_MASTER", None)
+        check("保存成功", vault.gpg_save_master(paths.vault_file(), "real-gpg-master-1"))
+        f = vault.gpg_file(paths.vault_file())
+        check("master.gpg 存在且非明文",
+              f.exists() and b"real-gpg-master-1" not in f.read_bytes())
+        check("读回来一致", vault.gpg_load_master(paths.vault_file()) == "real-gpg-master-1")
+        real_kl2 = vault.keyring_load
+        vault.keyring_load = lambda *a, **k: None
+        try:
+            v = vault.open_vault()
+            check("open_vault 经 gpg 自动解锁", v is not None)
+        finally:
+            vault.keyring_load = real_kl2
+
+
+def test_status_headless_guidance() -> None:
+    from lib import paths, vault
+
+    print("\n== #19 status 的 headless 指引 ==")
+    reset()
+    vault.Vault.create(paths.vault_file(), "p1-master-status-guide-1")
+    os.environ.pop("SSHHH_MASTER", None)
+    real_kr = vault.keyring_available
+    real_ga = vault.gpg_available
+    real_kl = vault.keyring_load
+    vault.keyring_load = lambda *a, **k: None  # 让解锁失败
+    try:
+        vault.keyring_available = lambda: False
+        vault.gpg_available = lambda: True
+        code, out, err = run_cli(["status"])
+        check("status 仍返回 0", code == 0, f"{code} {err}")
+        check("说明无钥匙串", "没有可用的系统凭据库" in out, out)
+        check("指引 gpg 后端", "master.gpg" in out, out)
+
+        vault.gpg_available = lambda: False
+        code, out, err = run_cli(["status"])
+        check("无 gpg 时指向 README 矩阵", "主密码后端" in out, out)
+        check("如实声明 SSHHH_MASTER 可被 agent 读到", "printenv" in out, out)
+    finally:
+        vault.keyring_available = real_kr
+        vault.gpg_available = real_ga
+        vault.keyring_load = real_kl
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -674,6 +788,8 @@ def main() -> int:
     test_nonce_anti_forgery()
     test_audit_streaming()
     test_non_windows_first_run_guidance()
+    test_gpg_backend()
+    test_status_headless_guidance()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

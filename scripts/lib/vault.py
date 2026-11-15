@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import secrets as _secrets
+import shutil
+import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -20,6 +22,8 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from . import paths
 from .lock import data_lock
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 VAULT_VERSION = 1
 
@@ -122,6 +126,125 @@ def keyring_forget(vault_path: Path, service: str | None = None) -> None:
 
 
 # --------------------------------------------------------------------------
+# gpg 加密文件后端（headless Linux 一等公民，#19）
+#
+# 无 Secret Service 的服务器 / 容器上没有钥匙串，主密码无处安放：文档兜底
+# SSHHH_MASTER 恰是 agent 能 printenv 读到的，等于放弃安全模型。这里给
+# headless 一个不进环境变量的选择：主密码用本机 gpg 私钥加密后存
+# ~/.sshhh/master.gpg，解密走 gpg-agent —— 与 pass（gpg）同一套机制。
+#
+# 定性（如实声明）：gpg 私钥对同 UID 进程同样可用，这仍是 OS 边界内的
+# 「不被顺手读到」而非「防同用户恶意进程」；vault.open 的解密留痕不变。
+# --------------------------------------------------------------------------
+
+GPG_FILE_NAME = "master.gpg"
+
+
+def _gpg() -> str | None:
+    return shutil.which("gpg") or shutil.which("gpg2")
+
+
+def gpg_available() -> bool:
+    return _gpg() is not None
+
+
+def gpg_file(vault_path: Path) -> Path:
+    return vault_path.parent / GPG_FILE_NAME
+
+
+def _first_secret_fpr(text: str) -> str | None:
+    """从 gpg --with-colons 输出里取第一把**有私钥**的键的指纹。
+
+    sec 行后面跟着 fpr 行（第 10 列是完整指纹）。没有私钥的机器解不开，
+    只有公钥没用。
+    """
+    seen_sec = False
+    for line in text.splitlines():
+        fields = line.split(":")
+        if fields[0] == "sec":
+            seen_sec = True
+        elif fields[0] == "fpr" and seen_sec and len(fields) > 9 and fields[9]:
+            return fields[9]
+    return None
+
+
+def _gpg_recipient(gpg: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            [gpg, "--batch", "--list-secret-keys", "--with-colons"],
+            capture_output=True, timeout=15,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return None
+        return _first_secret_fpr(proc.stdout.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def gpg_load_master(vault_path: Path) -> str | None:
+    """解密 master.gpg。gpg 缺席、私钥不可用、文件不存在都返回 None。"""
+    gpg = _gpg()
+    f = gpg_file(vault_path)
+    if not gpg or not f.exists():
+        return None
+    try:
+        proc = subprocess.run(
+            [gpg, "--batch", "--quiet", "-d", str(f)],
+            capture_output=True, timeout=30,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return None
+        text = proc.stdout.decode("utf-8", "replace").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def gpg_save_master(vault_path: Path, master: str) -> bool:
+    """把主密码加密到 master.gpg。失败返回 False（调用方继续兜底）。"""
+    gpg = _gpg()
+    if not gpg or not master:
+        return False
+    recipient = _gpg_recipient(gpg)
+    if not recipient:
+        return False
+    f = gpg_file(vault_path)
+    try:
+        proc = subprocess.run(
+            [gpg, "--batch", "--yes", "--trust-model", "always", "-e",
+             "-r", recipient, "-o", str(f)],
+            input=(master + "\n").encode("utf-8"),
+            capture_output=True, timeout=30,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return False
+        try:
+            os.chmod(f, 0o600)
+        except OSError:
+            pass
+        _harden(f)
+        return True
+    except Exception:
+        return False
+
+
+def save_master_auto(vault_path: Path, master: str) -> str | None:
+    """存主密码：优先系统钥匙串，其次 gpg 加密文件。
+
+    返回用的后端名（"keyring" / "gpg"），全失败返回 None —— 调用方据此
+    提示用户（还剩 SSHHH_MASTER 环境变量兜底，但 agent 可读，只做最后手段）。
+    """
+    if keyring_save(vault_path, master):
+        return "keyring"
+    if gpg_save_master(vault_path, master):
+        return "gpg"
+    return None
+
+
+# --------------------------------------------------------------------------
 # 保险库
 # --------------------------------------------------------------------------
 
@@ -219,6 +342,10 @@ class Vault:
                 candidates.append(env)
             if allow_keyring:
                 cached = keyring_load(path)
+                if cached:
+                    candidates.append(cached)
+                # 无钥匙串的 headless 环境（#19）：gpg 加密文件兜在钥匙串后面
+                cached = gpg_load_master(path)
                 if cached:
                     candidates.append(cached)
 
