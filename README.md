@@ -397,14 +397,13 @@ set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 python scripts/sshhh.py setup
 ```
 
-**Q：多台机器想共用同一个密码？**
+**Q：多台机器是同一个密码，能只输一次吗？**
 
-```toml
-[hosts.db1]
-password = "@vault:shared"
-[hosts.db2]
-password = "@vault:shared"
-```
+不能。每台主机的密码按主机名各存一条，同一密码要分别 `sshhh setpass db1`、
+`sshhh setpass db2` 各录一遍（录同一个值即可）。hosts.toml 没有 password 字段、
+也没有跨主机引用机制 —— 这是刻意的：清单文件保持零秘密，密码只存在于
+vault.enc 里。注意「多 agent 共用配置」不需要这个：所有 agent 读的是
+同一份 `~/.sshhh/`，配一次全家通用。
 
 **Q：改密码会不会把主机配置弄丢？**
 

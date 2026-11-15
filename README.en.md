@@ -395,14 +395,13 @@ python scripts/sshhh.py setup
 
 Or any other mirror you can reach.
 
-**I want several machines to share one password.**
+**Several machines share the same password — can I enter it once?**
 
-```toml
-[hosts.db1]
-password = "@vault:shared"
-[hosts.db2]
-password = "@vault:shared"
-```
+No. Each host's password is stored under its own name; run `sshhh setpass db1`
+and `sshhh setpass db2` separately (same value is fine). hosts.toml has no
+password field and no cross-host reference — deliberate: the host list stays
+secret-free, passwords live only in vault.enc. Sharing across **agents** needs
+nothing extra: every agent reads the same `~/.sshhh/`, one configuration for all.
 
 **How does sudo work?**
 
