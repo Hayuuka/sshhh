@@ -22,7 +22,17 @@ from . import paths
 from .lock import data_lock
 
 VAULT_VERSION = 1
-_AAD = b"sshhh-vault"
+
+# AAD 的演进：旧版用常量 "sshhh-vault"（S7 评审项）。常量 AAD 不绑定头部，
+# 将来字段变化时密文仍能被「错误格式」解开，格式混淆没有防线。
+# 新版把头部静态部分（v + kdf 参数）以 canonical JSON 参与 GCM 认证；
+# 打开旧文件时先试新 AAD、再回落旧常量，成功后下次落盘自动升级。
+_LEGACY_AAD = b"sshhh-vault"
+
+
+def _canonical_aad(header: dict) -> bytes:
+    static = {"v": header.get("v"), "kdf": header.get("kdf")}
+    return json.dumps(static, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 _SCRYPT_N = 2**15
 _SCRYPT_R = 8
@@ -156,6 +166,8 @@ class Vault:
         self._key: bytes | None = None
         self._header: dict | None = None
         self._data: dict[str, str] = {}
+        # 旧常量 AAD 解开的文件在下次写盘时升级为 canonical AAD
+        self._legacy_aad = False
 
     # -- 生命周期 ------------------------------------------------------
 
@@ -211,11 +223,18 @@ class Vault:
                     candidates.append(cached)
 
         for cand in candidates:
+            v._key = _derive(cand, salt, n, r, p)
             try:
-                v._key = _derive(cand, salt, n, r, p)
-                v._data = v._decrypt()
+                v._data = v._decrypt(_canonical_aad(header))
+                v._legacy_aad = False
             except InvalidTag:
-                continue
+                # 旧版文件用常量 AAD 加密；能解开说明主密码没错，
+                # 只是格式老 —— 标记后由 _flush 升级（S7）
+                try:
+                    v._data = v._decrypt(_LEGACY_AAD)
+                except InvalidTag:
+                    continue
+                v._legacy_aad = True
             _audit_open(path, cand, v._data.values())
             return v
 
@@ -223,18 +242,19 @@ class Vault:
 
     # -- 内部 ----------------------------------------------------------
 
-    def _decrypt(self) -> dict[str, str]:
+    def _decrypt(self, aad: bytes) -> dict[str, str]:
         assert self._key is not None and self._header is not None
         nonce = _b64d(self._header["nonce"])
         ct = _b64d(self._header["ct"])
-        plain = AESGCM(self._key).decrypt(nonce, ct, _AAD)
+        plain = AESGCM(self._key).decrypt(nonce, ct, aad)
         return json.loads(plain.decode("utf-8"))
 
     def _flush(self) -> None:
         assert self._key is not None and self._header is not None
         nonce = _secrets.token_bytes(12)
         plain = json.dumps(self._data, ensure_ascii=False).encode("utf-8")
-        ct = AESGCM(self._key).encrypt(nonce, plain, _AAD)
+        aad = _canonical_aad(self._header)
+        ct = AESGCM(self._key).encrypt(nonce, plain, aad)
         out = dict(self._header)
         # 头部不写条目名：谁能拷走 vault.enc，谁就能枚举「这台机器上有哪些凭据」
         # （值解不开，清单却一目了然）。旧版本写过这个字段，顺手清掉。
@@ -242,14 +262,12 @@ class Vault:
         out["nonce"] = _b64e(nonce)
         out["ct"] = _b64e(ct)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, self.path)
+        # 落盘走 fsutil 的原子写：mkstemp 临时名唯一，并发写不再互踩固定
+        # 的 vault.tmp（S8）；tmp + os.replace 保证并发读不拿到半截文件
+        from .fsutil import atomic_write_text
+
+        atomic_write_text(self.path, json.dumps(out, ensure_ascii=False, indent=2))
+        self._legacy_aad = False
         _harden(self.path)
 
     # -- 对外 ----------------------------------------------------------

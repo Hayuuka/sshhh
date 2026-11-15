@@ -243,10 +243,107 @@ def test_redact_pwd() -> None:
     check("已知值被替换", "pw-value-9f31" not in out, out)
 
 
+# --------------------------------------------------------------------------
+# #34 S7：vault AAD 绑定 header；S8：落盘临时文件唯一命名
+# --------------------------------------------------------------------------
+
+
+def test_vault_aad_and_tmp() -> None:
+    import base64 as b64
+    import json as jsonlib
+    import threading
+
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    from lib import paths, vault
+    from lib.vault import _b64d, _b64e, _canonical_aad, _derive, _LEGACY_AAD
+
+    def _key_of(header: dict) -> AESGCM:
+        kdf = header["kdf"]
+        key = _derive(master, _b64d(kdf["salt"]),
+                      int(kdf["n"]), int(kdf["r"]), int(kdf["p"]))
+        return AESGCM(key)
+
+    print("\n== #34 S7 新库用 canonical AAD 绑定 header ==")
+    reset()
+    master = "p1-master-aad-9f21"
+    v = vault.Vault.create(paths.vault_file(), master)
+    v.set("prod", "vault-pw-aad-1")
+    header = jsonlib.loads(paths.vault_file().read_text(encoding="utf-8"))
+    err = None
+    try:
+        _key_of(header).decrypt(_b64d(header["nonce"]),
+                                _b64d(header["ct"]), _LEGACY_AAD)
+    except InvalidTag:
+        err = True
+    check("新文件不再被旧常量 AAD 解开", err is not None)
+    expect = jsonlib.dumps({"v": header["v"], "kdf": header["kdf"]},
+                           sort_keys=True, separators=(",", ":")).encode()
+    check("AAD 是 header 静态部分的 canonical JSON",
+          _canonical_aad(header) == expect, str(_canonical_aad(header)))
+
+    print("\n== #34 S7 旧常量 AAD 的文件仍能打开，写盘时自动升级 ==")
+    plain = jsonlib.dumps({"legacy": "legacy-pw-value"}, ensure_ascii=False).encode()
+    nonce = bytes(range(12))
+    ct = _key_of(header).encrypt(nonce, plain, _LEGACY_AAD)
+    legacy_header = {"v": vault.VAULT_VERSION, "kdf": header["kdf"],
+                     "nonce": _b64e(nonce), "ct": _b64e(ct)}
+    paths.vault_file().write_text(jsonlib.dumps(legacy_header), encoding="utf-8")
+    v2 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    check("旧文件解开（legacy 回落）", v2.get("legacy") == "legacy-pw-value")
+    v2.set("prod", "vault-pw-aad-2")  # 触发升级落盘
+    header2 = jsonlib.loads(paths.vault_file().read_text(encoding="utf-8"))
+    err = None
+    try:
+        _key_of(header2).decrypt(_b64d(header2["nonce"]),
+                                 _b64d(header2["ct"]), _LEGACY_AAD)
+    except InvalidTag:
+        err = True
+    check("升级后旧 AAD 解不开", err is not None)
+    upgraded = _key_of(header2).decrypt(_b64d(header2["nonce"]),
+                                        _b64d(header2["ct"]),
+                                        _canonical_aad(header2))
+    check("升级后 canonical AAD 解得开",
+          jsonlib.loads(upgraded.decode())["prod"] == "vault-pw-aad-2")
+
+    print("\n== #34 S7 主密码错误依旧被拒 ==")
+    err = None
+    try:
+        vault.Vault.open(paths.vault_file(), master="wrong-master-pass-1",
+                         allow_keyring=False)
+    except vault.VaultError:
+        err = True
+    check("错误主密码 → VaultError", err is not None)
+
+    print("\n== #34 S8 临时文件唯一命名，并发写不互踩 ==")
+    import inspect
+
+    src = inspect.getsource(vault.Vault._flush)
+    check("落盘走 atomic_write_text（mkstemp 唯一临时名）",
+          "atomic_write_text" in src, src[:120])
+    check("不再用固定名字 vault.tmp", 'with_suffix(".tmp")' not in src)
+
+    v3 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    writers = [threading.Thread(target=lambda i=i: v3.set(f"thread-{i}",
+                                                          f"thread-value-{i}"))
+               for i in range(6)]
+    for t in writers:
+        t.start()
+    for t in writers:
+        t.join()
+    v4 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    check("并发写后文件完好可解", v4.get("thread-5") == "thread-value-5",
+          str(v4.names()))
+    leftovers = [p.name for p in paths.data_dir().glob("*.tmp")]
+    check("没有残留临时文件", not leftovers, str(leftovers))
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
     test_test_policy_and_redaction()
+    test_vault_aad_and_tmp()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)
