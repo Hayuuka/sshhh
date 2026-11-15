@@ -275,6 +275,21 @@ class Client:
 
     # -- 执行 ----------------------------------------------------------
 
+    def banner(self) -> str:
+        """远端版本 banner（如 `SSH-2.0-OpenSSH_9.6p1`），取不到返回空串。
+
+        用于 harden --check 判断 sshd 是否 OpenSSH：不用在服务器上执行任何
+        命令，握手阶段就能拿到（#37）。
+        """
+        if self._ssh is None:
+            raise TransportError("尚未连接")
+        try:
+            t = self._ssh.get_transport()
+            return ((t.get_banner() or b"") if t else b"").decode(
+                "utf-8", "replace").strip()
+        except Exception:
+            return ""
+
     def run(self, command: str, stdin_data: str | None = None,
             timeout: float | None = None, use_sudo: bool = False) -> Result:
         if self._ssh is None:

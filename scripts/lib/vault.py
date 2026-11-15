@@ -414,7 +414,16 @@ class Vault:
         return False
 
     def names(self) -> list[str]:
-        return sorted(self._data)
+        """密码条目名（不含 key: 私钥命名空间）。
+
+        `key:<host>` 命名空间预留给 P2 的密钥认证（#37）：与密码条目隔离，
+        避免「按主机名查密码」的调用方误把私钥材料当密码取走。
+        """
+        return sorted(n for n in self._data if not n.startswith("key:"))
+
+    def key_names(self) -> list[str]:
+        """私钥条目名（key:<host>）。使用侧随 P2 密钥认证启用。"""
+        return sorted(n for n in self._data if n.startswith("key:"))
 
     def values(self) -> list[str]:
         """全部明文值。供 Redactor 用 vault 全量构造（#34 I9）：

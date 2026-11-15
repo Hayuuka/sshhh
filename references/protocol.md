@@ -395,6 +395,33 @@ headless 环境没有 Secret Service：主密码改用本机 gpg 私钥加密保
 审计日志超过 10 MiB 自动轮转为 `audit.log.1`（只保留一代），`tail` 从文件
 尾部倒读，不因日志增长而变慢。
 
+触达远端的业务记录（`run` / `transfer.*` / `test` / `harden.check`）带
+`auth` 字段标记本次认证方式：`password` 或 `key-file`（#37）。为加固回落
+检测铺路 —— 将来受限密钥就位后，「本应走密钥的连接回落到密码」必须在
+审计里看得见。
+
+## vault 的 key:<host> 命名空间（#37）
+
+私钥条目预留在独立命名空间：`key:<主机名>`。与密码条目隔离是为了
+「按主机名查密码」的调用方（`vault.get(name)` / `names()`）不会误把私钥
+材料当密码取走：
+
+- `Vault.names()` 只返回密码条目（过滤 `key:` 前缀）
+- `Vault.key_names()` 只返回私钥条目
+- 条目本身照常 get / set / delete；使用侧随 P2 密钥认证启用（#3 基线部分），
+  届时私钥**只以密文存在于 vault**（设计宪法：明文私钥落盘 = 禁止）
+
+## harden --check（只读探测，#37）
+
+`sshhh harden <主机> --check` 连接后检查：sshd 是否 OpenSSH（从握手 banner
+识别，不在服务器上执行任何命令）、shell 是否可用、`~/.ssh/authorized_keys`
+是否可写（或可创建），输出可加固性报告与建议的 restrict 行模板。
+**不执行任何改动**——装公钥 / 服务端包装 / 回滚属 #15 完整实现，在观察名单。
+
+退出码：0 = 具备可加固条件；1 = 探测完成但有阻塞项；4 = 连接失败；
+3 = 主机不存在；2 = 用法错误。探测命令（`bash -s` + stdin 脚本）与 test
+同一纪律：过主机策略。
+
 只留前两个参数是刻意的：整串 `sys.argv` 会把调用方顺手写在命令里的秘密一起
 落盘（`run prod --stdin S3cret mysql -pS3cret` 就是原样两条），而 redactor 只认得
 主密码和库里已有的值。落盘前仍会再过一遍 redactor，作第二道保险。

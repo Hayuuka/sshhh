@@ -181,9 +181,10 @@ AI 的上下文很贵，也很容易被灌满：`cat` 一个大文件、`find /`
 
 | action | 记什么 |
 |---|---|
-| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时；被截断时带 `truncated` 与原始字节数 |
-| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、字节数、结果 |
+| `run` / `run.denied` | 执行或拒绝的命令、退出码、耗时、认证方式（`auth: password` / `key-file`）；被截断时带 `truncated` 与原始字节数 |
+| `transfer.put` / `transfer.get` / `transfer.denied` | 传输方向、本地与远端路径、字节数、结果、认证方式 |
 | `test` / `test.denied` | 探测了哪台机器、结果如何；被策略拒绝时同样留记录 |
+| `harden.check` | 加固只读探测的结果与阻塞项（`manage harden <主机> --check`） |
 | `setpass` | 哪台主机的密码被改动（不含密码本身） |
 | `unlock` | 解锁事件，含自动解锁失败的尝试 |
 | `migrate` | 凭据库迁移的来源与条数 |
@@ -333,11 +334,17 @@ status，见 SKILL.md）；**管理层**给用户本人执行：
 | `manage unlock` | 重新输入主密码 |
 | `manage policy <主机>` | 查看该主机的生效策略 |
 | `manage audit [-n N] [--all]` | 查看审计记录（`--all` 含 `vault.open` 解密留痕） |
+| `manage harden <主机> --check` | **只读探测**远端可加固性（sshd 是否 OpenSSH、shell、authorized_keys 可写性），不做任何改动 |
 | `manage migrate <旧目录>` | 从旧版 sshx 项目迁移配置 |
 
 旧命令全部保留别名（`sshhh setpass prod` ≡ `sshhh manage setpass prod`）。
 加主机：对 AI 说「连一下 <名称>」自动触发；或手动 `sshhh config`
 （加 `--here` 在当前终端完成，不弹新窗口）。
+
+**加固模式（可选档）当前只开接口**：`manage harden <主机> --check` 只读探测
+远端能不能加固（sshd 是否 OpenSSH、shell、`authorized_keys` 可写性），输出
+建议的 restrict 行；装公钥与服务端包装（真正抬高「agent 在服务器上能做什么」
+的上限）暂未实现，定位与决策见 docs/DESIGN.md §1「产品两档」。
 
 常用参数：
 

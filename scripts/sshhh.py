@@ -40,6 +40,7 @@ sshhh —— AI 可用的 SSH 通道，密码不进入 AI 上下文
   manage unlock           重新输入主密码
   manage policy <主机>     查看该主机的生效策略
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
+  manage harden <主机> --check 只读探测远端可加固性
   manage migrate <旧目录>  从旧版 sshx 项目迁移主机和密码
   config [--here]         打开配置窗口；加 --here 则在当前终端里配置
 
@@ -548,10 +549,13 @@ def cmd_run(argv: list[str]) -> int:
     redactor = Redactor(vault_obj.values())
     safe_cmd = redactor.clean(command)
 
+    # 认证方式进审计（#37）：将来受限密钥就位后，回落到密码必须看得见
+    auth = "key-file" if host.key_file else "password"
+
     reason = host.policy.check(command, allow_shell=host.allow_shell)
     if reason:
         audit.write("run.denied", host=name, user=host.user, command=safe_cmd,
-                    ok=False, error=reason)
+                    ok=False, error=reason, auth=auth)
         _warn(f"[sshhh] 命令被策略拒绝：{reason}")
         return 1
 
@@ -567,7 +571,7 @@ def cmd_run(argv: list[str]) -> int:
             )
     except TransportError as exc:
         audit.write("run", host=name, user=host.user, command=safe_cmd,
-                    ok=False, error=str(exc))
+                    ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] {exc}")
         return protocol.EXIT_NETWORK
 
@@ -589,7 +593,7 @@ def cmd_run(argv: list[str]) -> int:
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
                 ok=result.exit_code == 0, truncated=truncated,
                 original_bytes=max(out_info["original_bytes"],
-                                   err_info["original_bytes"]))
+                                   err_info["original_bytes"]), auth=auth)
     return result.exit_code
 
 
@@ -662,6 +666,7 @@ def cmd_test(argv: list[str]) -> int:
     target = f"{host.user}@{host.host}:{host.port}"
     _say(f"连接 {name} ({target}) ...")
     redactor = Redactor(v.values())
+    auth = "key-file" if host.key_file else "password"
     client = Client(host, password, store.Settings(), redactor)
     try:
         with client:
@@ -669,7 +674,8 @@ def cmd_test(argv: list[str]) -> int:
             if "__SSHHH_OK__" not in r.stdout:
                 error = "连接建立但测试命令未返回预期输出"
                 audit.write("test", host=name, user=host.user, command=target,
-                            ok=False, error=error, duration_ms=r.duration_ms)
+                            ok=False, error=error, duration_ms=r.duration_ms,
+                            auth=auth)
                 _warn(f"[sshhh] {error}")
                 return 4
             info = ""
@@ -678,12 +684,12 @@ def cmd_test(argv: list[str]) -> int:
                 info += rr.stdout
     except TransportError as exc:
         audit.write("test", host=name, user=host.user, command=target,
-                    ok=False, error=str(exc))
+                    ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] 连接失败：{exc}")
         return 4
 
     audit.write("test", host=name, user=host.user, command=target,
-                duration_ms=r.duration_ms)
+                duration_ms=r.duration_ms, auth=auth)
     _say(f"[ok] 连接成功（{r.duration_ms} ms）")
     for line in info.splitlines():
         if line:
@@ -782,6 +788,7 @@ def _transfer(argv: list[str], direction: str) -> int:
     max_bytes = cap if has_cap else None
     timeout = _float_opt(opts, "timeout")
 
+    auth = "key-file" if host.key_file else "password"
     client = Client(host, v.get(name), store.Settings())
     try:
         with client:
@@ -793,16 +800,16 @@ def _transfer(argv: list[str], direction: str) -> int:
                                        timeout=timeout)
     except TransportError as exc:
         audit.write(f"transfer.{direction}", host=name, user=host.user,
-                    command=summary, ok=False, error=str(exc))
+                    command=summary, ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] {exc}")
         return 4
     except OSError as exc:
         audit.write(f"transfer.{direction}", host=name, user=host.user,
-                    command=summary, ok=False, error=str(exc))
+                    command=summary, ok=False, error=str(exc), auth=auth)
         _warn(f"[sshhh] 文件传输失败：{exc}")
         return 4
     audit.write(f"transfer.{direction}", host=name, user=host.user,
-                command=f"{summary}（{size} 字节）")
+                command=f"{summary}（{size} 字节）", auth=auth)
     _say(f"[ok] {direction} 完成：{a} -> {b}（{size} 字节）")
     return 0
 
@@ -1089,6 +1096,132 @@ def cmd_migrate(argv: list[str]) -> int:
     return 0
 
 
+def cmd_harden(argv: list[str]) -> int:
+    """加固模式：只开接口，点到为止（#37，作者决策 2026-11-09）。
+
+    `harden <主机> --check` 是**只读探测**：检查 sshd 是否 OpenSSH、shell 是否
+    可用、authorized_keys 是否可写，输出可加固性报告与建议的 restrict 行。
+    不装公钥、不部署服务端包装、不做回滚 —— 那是 #15 的完整实现，在观察名单，
+    有真实需求或用户反馈再启动。
+    """
+    import re
+
+    from lib import audit, store, vault
+    from lib.redact import Redactor
+    from lib.transport import Client, TransportError
+
+    # --check 自己识别，不进全局解析器：harden 有位置参数，`harden prod --check`
+    # 里的 --check 会被 _parse 当成「位置参数之后的未知长选项」留给远端
+    check_flag = "--check" in argv
+    opts, pos = _parse([a for a in argv if a != "--check"], set())
+    if not pos or not check_flag:
+        _warn("用法：sshhh manage harden <主机> --check（别名 sshhh harden）")
+        _warn("目前只提供 --check 只读探测；完整加固（装公钥 / 服务端包装 / 回滚）"
+              "尚未实现（#15，观察名单）")
+        return 2
+    name = pos[0]
+
+    host = store.get(name)
+    if host is None:
+        return _unknown_host(name)
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+    auth = "key-file" if host.key_file else "password"
+    password = v.get(name)
+
+    # 探测命令与 test 同一纪律：过策略。脚本经 stdin 喂给 `bash -s`，
+    # 命令行本身没有元字符；白名单主机不放行 `bash -s` 时如实拒绝。
+    probe_cmd = "bash -s"
+    reason = host.policy.check(probe_cmd, allow_shell=host.allow_shell)
+    if reason:
+        audit.write("harden.check", host=name, user=host.user,
+                    command=probe_cmd, ok=False, error=reason, auth=auth)
+        _warn(f"[sshhh] 探测命令被策略拒绝：{reason}")
+        if host.policy.allow:
+            _warn("[sshhh] 该主机处于白名单模式；探测命令未获放行")
+        return 1
+
+    # 探测脚本：只读检查 ~/.ssh 与 authorized_keys 的存在性与可写性。
+    # keyw 的语义：文件可写，或文件不存在但目录可写（可创建）。
+    script = (
+        'd="$HOME/.ssh"; k="$d/authorized_keys"\n'
+        'printf \'SSHHH_PROBE dir=%s dirw=%s keyw=%s\\n\' '
+        '"$([ -d "$d" ] && echo 1 || echo 0)" '
+        '"$([ -d "$d" ] && [ -w "$d" ] && echo 1 || echo 0)" '
+        '"$([ -f "$k" ] && [ -w "$k" ] && echo 1 || echo 0; '
+        '[ ! -e "$k" ] && [ -w "$d" ] && echo 1)"\n'
+    )
+
+    target = f"{host.user}@{host.host}:{host.port}"
+    _say(f"[sshhh] 加固探测（只读）：{name} ({target})")
+    client = Client(host, password, store.Settings(), Redactor(v.values()))
+    try:
+        with client:
+            banner = client.banner()
+            r = client.run(probe_cmd, stdin_data=script, timeout=20)
+    except TransportError as exc:
+        audit.write("harden.check", host=name, user=host.user, command=probe_cmd,
+                    ok=False, error=str(exc), auth=auth)
+        _warn(f"[sshhh] 探测失败：{exc}")
+        return 4
+
+    checks: list[tuple[str, bool, str]] = []
+
+    m = re.search(r"OpenSSH[_ ]([0-9][0-9.p]*)", banner)
+    if m:
+        checks.append(("sshd", True,
+                       f"OpenSSH {m.group(1)}（支持 restrict / command=）"))
+    elif banner:
+        checks.append(("sshd", False,
+                       f"非 OpenSSH：{banner[:60]}（受限 authorized_keys 语法不保证可用）"))
+    else:
+        checks.append(("sshd", False, "无法识别（服务器未提供 banner）"))
+
+    fields: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("SSHHH_PROBE "):
+            for kv in line[len("SSHHH_PROBE "):].split():
+                key, _, val = kv.partition("=")
+                fields[key] = val
+            break
+
+    if not fields:
+        checks.append(("shell", False,
+                       "bash 存在但探测脚本没有返回结果（shell 受限或行为异常）"))
+    else:
+        checks.append(("shell", True, "bash 可用"))
+        dir_ok = fields.get("dir") == "1"
+        dir_w = fields.get("dirw") == "1"
+        key_w = fields.get("keyw") == "1"
+        checks.append(("~/.ssh 目录", dir_ok,
+                       "存在" if dir_ok else "不存在（首次部署时创建即可，不算阻塞）"))
+        checks.append(("authorized_keys 可写", key_w,
+                       "可写或可创建" if key_w else
+                       "不可写（需要先修权限或换部署方式）"))
+        if not dir_w and dir_ok:
+            checks.append(("~/.ssh 目录可写", False,
+                           "目录存在但不可写，装公钥会失败"))
+
+    _say("")
+    ok_all = True
+    for label, good, detail in checks:
+        ok_all = ok_all and good
+        _say(f"  {'[ok]' if good else '[!!]'} {label}：{detail}")
+    audit.write("harden.check", host=name, user=host.user, command=probe_cmd,
+                ok=ok_all, auth=auth)
+    _say("")
+    if ok_all:
+        _say("结论：具备可加固条件。")
+    else:
+        _say("结论：存在阻塞项（见上）。先把 [!!] 的项处理好再评估加固。")
+    _say("建议的 restrict 行（#15 完整实现后自动生成并部署，当前仅供评估）：")
+    _say('  restrict,command="$HOME/bin/sshhh-agent-shell" <key-type> '
+         "<base64 公钥> sshhh-agent")
+    return 0 if ok_all else 1
+
+
 def cmd_policy(argv: list[str]) -> int:
     """查看某台主机的生效策略（管理操作）。
 
@@ -1131,6 +1264,7 @@ sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
   manage unlock            重新输入主密码
   manage policy <主机>      查看该主机的生效策略
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
+  manage harden <主机> --check 只读探测远端可加固性（不改动，见 #15）
   manage migrate <旧目录>   从旧版 sshx 项目迁移
 
 加主机：对 AI 说「连一下 <名称>」自动触发；或手动执行 config
@@ -1168,6 +1302,7 @@ COMMANDS = {
     "audit": cmd_audit,
     "setup": cmd_setup,
     "migrate": cmd_migrate,
+    "harden": cmd_harden,
 }
 
 MANAGE_COMMANDS = {
@@ -1178,6 +1313,7 @@ MANAGE_COMMANDS = {
     "policy": cmd_policy,
     "audit": cmd_audit,
     "migrate": cmd_migrate,
+    "harden": cmd_harden,
 }
 
 

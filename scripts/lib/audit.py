@@ -45,7 +45,8 @@ def _cut(text: str, limit: int = MAX_COMMAND_CHARS) -> str:
 def write(action: str, *, host: str = "", user: str = "", command: str = "",
           exit_code: int | None = None, duration_ms: int | None = None,
           ok: bool = True, error: str = "",
-          truncated: bool = False, original_bytes: int | None = None) -> None:
+          truncated: bool = False, original_bytes: int | None = None,
+          auth: str = "") -> None:
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "epoch": int(time.time()),
@@ -54,6 +55,10 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
         "user": user,
         "ok": ok,
     }
+    if auth:
+        # 本次认证方式：password / key-file（#37）。为「加固回落检测」铺路：
+        # 将来受限密钥就位后，本应走密钥的连接回落到密码必须在审计里看得见。
+        record["auth"] = auth
     if command:
         record["command"] = _cut(command)
     if exit_code is not None:

@@ -168,7 +168,9 @@ def test_audit_does_not_leak_argv() -> None:
     check("库里已有的密码也不落盘", vault_secret not in text, text[-400:])
     check("主密码不落盘", master not in text, text[-400:])
 
-    opens = [r for r in audit.tail(10) if r.get("action") == "vault.open"]
+    # vault.open 在展示层被过滤（#26），验「文件里有没有」用全保真视图
+    opens = [r for r in audit.tail(10, include_internal=True)
+             if r.get("action") == "vault.open"]
     last = opens[-1] if opens else {}
     command = str(last.get("command", ""))
     check("留下了 pid", f"pid={os.getpid()}" in command, command)

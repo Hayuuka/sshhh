@@ -861,6 +861,130 @@ def test_manage_dispatch() -> None:
     os.environ.pop("SSHHH_MASTER", None)
 
 
+# --------------------------------------------------------------------------
+# #37 加固三件套：审计 auth 字段 / vault key:<host> / harden --check
+# --------------------------------------------------------------------------
+
+
+class _ProbeClient:
+    """harden 探测的替身：banner 可配，run 返回预置的探测结果。"""
+
+    script: str | None = None
+    banner_text = "SSH-2.0-OpenSSH_9.6p1 Debian-3"
+    probe_line = "SSHHH_PROBE dir=1 dirw=1 keyw=1\n"
+
+    def __init__(self, host, password, settings, redactor=None):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def banner(self) -> str:
+        return _ProbeClient.banner_text
+
+    def run(self, command, stdin_data=None, timeout=None, use_sudo=False):
+        from lib.transport import Result
+
+        _ProbeClient.script = stdin_data
+        return Result(stdout=_ProbeClient.probe_line, stderr="",
+                      exit_code=0, duration_ms=5)
+
+
+def test_harden_check() -> None:
+    from lib import audit, paths, store, vault
+    from lib import transport
+
+    real_client = transport.Client
+    transport.Client = _ProbeClient
+    try:
+        print("\n== #37 harden --check 只读探测（全部通过）==")
+        reset()
+        vault.Vault.create(paths.vault_file(), "p1-master-harden-1")
+        os.environ["SSHHH_MASTER"] = "p1-master-harden-1"
+        store.upsert_host(store.Host(name="prod", host="10.0.0.1", user="root"))
+
+        code, out, err = run_cli(["harden", "prod", "--check"])
+        check("全部通过返回 0", code == 0, f"{code} {err}")
+        check("识别 OpenSSH 版本", "OpenSSH 9.6p1" in out, out)
+        check("shell 可用", "bash 可用" in out, out)
+        check("authorized_keys 可写", "可写或可创建" in out, out)
+        check("结论可加固", "具备可加固条件" in out, out)
+        check("给出 restrict 行模板",
+              'restrict,command="$HOME/bin/sshhh-agent-shell"' in out, out)
+        check("声明不改动", "只读" in out, out)
+        check("探测脚本经 stdin 喂入（bash -s）",
+              _ProbeClient.script is not None and "$HOME/.ssh" in _ProbeClient.script)
+        recs = [r for r in audit.tail(5, include_internal=True)
+                if r.get("action") == "harden.check"]
+        check("写了 harden.check 审计", bool(recs), str(audit.tail(5)))
+        check("审计带 auth=password",
+              bool(recs) and recs[-1].get("auth") == "password", str(recs[-1]))
+
+        print("\n== #37 harden --check 存在阻塞项 ==")
+        _ProbeClient.probe_line = "SSHHH_PROBE dir=0 dirw=0 keyw=0\n"
+        code, out, err = run_cli(["harden", "prod", "--check"])
+        check("有阻塞返回 1", code == 1, f"{code} {err}")
+        check("结论提示阻塞", "阻塞" in out, out)
+
+        print("\n== #37 非 OpenSSH 的 sshd ==")
+        _ProbeClient.probe_line = "SSHHH_PROBE dir=1 dirw=1 keyw=1\n"
+        _ProbeClient.banner_text = "SSH-2.0-Dropbear_2020.79"
+        code, out, err = run_cli(["harden", "prod", "--check"])
+        check("识别为非 OpenSSH", "非 OpenSSH" in out, out)
+        check("返回 1", code == 1, str(code))
+        _ProbeClient.banner_text = "SSH-2.0-OpenSSH_9.6p1 Debian-3"
+
+        print("\n== #37 harden 不带 --check 拒绝 ==")
+        code, out, err = run_cli(["harden", "prod"])
+        check("提示只支持 --check", code == 2 and "--check" in err, f"{code} {err}")
+
+        print("\n== #37 白名单主机探测被拒 ==")
+        store.set_policy("prod", ["^df -h$"], [])
+        code, out, err = run_cli(["harden", "prod", "--check"])
+        check("白名单下返回 1", code == 1, f"{code} {err}")
+        check("提示探测命令被策略拒绝", "探测命令被策略拒绝" in err, err)
+        store.set_policy("prod", [], [])
+    finally:
+        transport.Client = real_client
+
+
+def test_auth_field_and_key_namespace() -> None:
+    from lib import audit, paths, vault
+
+    print("\n== #37 审计 auth 字段 ==")
+    reset()
+    audit.write("run", host="h", command="x", auth="password")
+    rec = audit.tail(1)[0]
+    check("auth=password 落盘", rec.get("auth") == "password", str(rec))
+    audit.write("transfer.put", host="h2", command="y", auth="key-file")
+    rec = audit.tail(1)[0]
+    check("auth=key-file 落盘", rec.get("auth") == "key-file", str(rec))
+    audit.write("test", host="h3", command="z")
+    rec = audit.tail(1)[0]
+    check("不传 auth 就没有该字段", "auth" not in rec, str(rec))
+
+    print("\n== #37 vault key:<host> 命名空间 ==")
+    reset()
+    v = vault.Vault.create(paths.vault_file(), "p1-master-keyns-1")
+    v.set("prod", "host-password-1")
+    v.set("key:prod", "private-key-material-1")
+    check("names() 过滤 key: 条目",
+          v.names() == ["prod"], str(v.names()))
+    check("key_names() 只含 key: 条目", v.key_names() == ["key:prod"],
+          str(v.key_names()))
+    check("get('key:prod') 仍可取", v.get("key:prod") == "private-key-material-1")
+    check("get('prod') 不受影响", v.get("prod") == "host-password-1")
+
+    print("\n== #37 protocol.md 写入约定 ==")
+    proto = (Path(__file__).resolve().parent.parent
+             / "references" / "protocol.md").read_text(encoding="utf-8")
+    check("约定 key:<host> 命名空间", "key:<host>" in proto)
+    check("说明 names() 过滤", "过滤" in proto and "key:" in proto)
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -874,6 +998,8 @@ def main() -> int:
     test_status_headless_guidance()
     test_code_hygiene()
     test_manage_dispatch()
+    test_harden_check()
+    test_auth_field_and_key_namespace()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)
