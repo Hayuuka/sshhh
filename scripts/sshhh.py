@@ -234,13 +234,17 @@ def _launch(task: str, payload: dict) -> tuple[str, dict]:
     return console.launch(task, payload, _setup_timeout(), _handoff_seconds())
 
 
-def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
-    """把配置窗口的非成功结果翻译成协议状态码。"""
+def _setup_failed(status: str, detail: dict, manual_sub: str,
+                  nonce: str = "") -> int:
+    """把配置窗口的非成功结果翻译成协议状态码。
+
+    `nonce`：run 路径传入本次调用的 nonce，让 agent 只认带同一标识的状态行。
+    """
     from lib import protocol
 
     if status == "cancel":
         return protocol.emit(
-            protocol.EXIT_CANCELLED, "用户取消了配置，未做任何修改"
+            protocol.EXIT_CANCELLED, "用户取消了配置，未做任何修改", nonce=nonce
         )
     if status == "timeout":
         return protocol.emit(
@@ -251,6 +255,7 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
                 f"{_manual_cmd(manual_sub)}\n"
                 "窗口可能还开着，里面输入完会照样生效；如果已经关了，重跑上面这条"
             ),
+            nonce=nonce,
         )
     if status == "gone":
         return protocol.emit(
@@ -262,6 +267,7 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
                 "不会再弹新窗口：\n"
                 f"{_manual_cmd('config --here')}"
             ),
+            nonce=nonce,
         )
     if status == "pending":
         if detail.get("active"):
@@ -274,6 +280,7 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
                     "再重试原命令一次。\n"
                     "窗口标题是「sshhh setup」，如果用户说找不到，让他在任务栏里找一下。"
                 ),
+                nonce=nonce,
             )
         return protocol.emit(
             protocol.EXIT_PENDING,
@@ -285,6 +292,7 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
                 "再重试原命令即可。\n"
                 "不要反复调用本命令，也不要再开新窗口。"
             ),
+            nonce=nonce,
         )
     err = detail.get("error") or "配置窗口返回错误"
     return protocol.emit(
@@ -292,6 +300,7 @@ def _setup_failed(status: str, detail: dict, manual_sub: str) -> int:
         hint=("如果配置窗口反复异常退出，可以直接在用户自己的终端里执行下面的命令，"
               "全程不弹新窗口：\n"
               f"{_manual_cmd('config --here')}"),
+        nonce=nonce,
     )
 
 
@@ -437,6 +446,12 @@ def cmd_run(argv: list[str]) -> int:
     from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
+    # run 是唯一混杂远端输出的命令：远端可以在 stderr 里伪造 SSHHH_STATUS
+    # 劫持 agent（#36）。所以本次调用先打一行本地 nonce，协议状态行全部
+    # 带上它 —— 远端在本地输出之后才开口，抢不到先手。
+    nonce = protocol.new_nonce()
+    print(f"SSHHH_INVOCATION: {nonce}", file=sys.stderr)
+
     opts, pos = _parse(argv, {"timeout", "stdin", "stdin-file",
                               "max-bytes", "tail"})
     if not pos:
@@ -454,9 +469,10 @@ def cmd_run(argv: list[str]) -> int:
     if not paths.vault_file().exists():
         status, detail = _launch("setup", {})
         if status != "ok":
-            return _setup_failed(status, detail, "config")
+            return _setup_failed(status, detail, "config", nonce=nonce)
         return protocol.emit(
-            protocol.EXIT_CONFIGURED, "已经完成初始化配置，请重试这条命令"
+            protocol.EXIT_CONFIGURED, "已经完成初始化配置，请重试这条命令",
+            nonce=nonce,
         )
 
     # --- 2. 解锁密码库 ---------------------------------------------------
@@ -466,27 +482,29 @@ def cmd_run(argv: list[str]) -> int:
     except vault.VaultError:
         status, detail = _launch("unlock", {})
         if status != "ok":
-            code = _setup_failed(status, detail, "unlock")
+            code = _setup_failed(status, detail, "unlock", nonce=nonce)
             if code == protocol.EXIT_CONFIG:
                 return protocol.emit(
                     protocol.EXIT_LOCKED, "密码库无法自动解锁",
                     hint=(f"密码库无法自动解锁。请告诉用户在自己的终端里执行：\n"
                           f"{_manual_cmd('unlock')}"),
+                    nonce=nonce,
                 )
             return code
         try:
             vault_obj = vault.open_vault()
         except vault.VaultError as exc:
-            return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+            return protocol.emit(protocol.EXIT_LOCKED, str(exc), nonce=nonce)
 
     # --- 3. 主机必须已配置 -----------------------------------------------
     host = store.get(name)
     if host is None:
         status, detail = _launch("add_host", {"host_name": name})
         if status != "ok":
-            return _setup_failed(status, detail, f"config")
+            return _setup_failed(status, detail, f"config", nonce=nonce)
         return protocol.emit(
-            protocol.EXIT_HOST_ADDED, f"已添加主机 {name}，请重试这条命令"
+            protocol.EXIT_HOST_ADDED, f"已添加主机 {name}，请重试这条命令",
+            nonce=nonce,
         )
 
     # --- 4. 拿密码 -------------------------------------------------------
@@ -494,9 +512,10 @@ def cmd_run(argv: list[str]) -> int:
     if not password and not host.key_file:
         status, detail = _launch("add_host", {"host_name": name})
         if status != "ok":
-            return _setup_failed(status, detail, "config")
+            return _setup_failed(status, detail, "config", nonce=nonce)
         return protocol.emit(
-            protocol.EXIT_CONFIGURED, f"已补充 {name} 的密码，请重试这条命令"
+            protocol.EXIT_CONFIGURED, f"已补充 {name} 的密码，请重试这条命令",
+            nonce=nonce,
         )
 
     # --- 5. 执行 ---------------------------------------------------------

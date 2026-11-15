@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -226,6 +227,11 @@ def run_cli(args: list[str]) -> tuple[int, str, str]:
     return code, out.getvalue(), err.getvalue()
 
 
+def status_names(err: str) -> set[str]:
+    """从 stderr 提取全部状态名（新旧两种形态都算，#36 之后 run 带 nonce）。"""
+    return set(re.findall(r"SSHHH_STATUS(?:\[[0-9a-f]+\])?: ([A-Z_]+)", err))
+
+
 def reset_data():
     shutil.rmtree(_TMP, ignore_errors=True)
     _TMP.mkdir(parents=True, exist_ok=True)
@@ -252,7 +258,7 @@ def main() -> int:
         code, out, err = run_cli(["run", HOST_NAME, "echo hi"])
         check("无密码库 → 触发 setup 窗口", mock.tasks == ["setup"], str(mock.tasks))
         check("返回 CONFIGURED(10)", code == protocol.EXIT_CONFIGURED, str(code))
-        check("stderr 有状态行", "SSHHH_STATUS: CONFIGURED" in err, err)
+        check("stderr 有状态行", "CONFIGURED" in status_names(err), err[:200])
         check("状态行不含密码", SSH_PASSWORD not in err)
 
         reset_data()
@@ -260,7 +266,7 @@ def main() -> int:
         mock.push("cancel")
         code, _, err = run_cli(["run", HOST_NAME, "echo hi"])
         check("用户取消 → CANCELLED(11)", code == protocol.EXIT_CANCELLED, str(code))
-        check("取消状态行", "SSHHH_STATUS: CANCELLED" in err, err)
+        check("取消状态行", "CANCELLED" in status_names(err), err[:200])
 
         reset_data()
         mock = MockConsole().install()
@@ -366,7 +372,7 @@ def main() -> int:
         code, _, err = run_cli(["run", "newbox", "echo hi"])
         check("主机不存在 → HOST_ADDED(14)", code == protocol.EXIT_HOST_ADDED, str(code))
         check("窗口任务是 add_host", mock.tasks == ["add_host"], str(mock.tasks))
-        check("状态行正确", "SSHHH_STATUS: HOST_ADDED" in err, err)
+        check("状态行正确", "HOST_ADDED" in status_names(err), err[:200])
 
         reset_data()
         v = vault.Vault.create(paths.vault_file(), MASTER)
@@ -645,7 +651,7 @@ def main() -> int:
         code, _, err = run_cli(["run", HOST_NAME, "echo hi"])
         check("窗口交接 → SETUP_PENDING(15)",
               code == protocol.EXIT_PENDING, str(code))
-        check("pending 状态行", "SSHHH_STATUS: SETUP_PENDING" in err, err)
+        check("pending 状态行", "SETUP_PENDING" in status_names(err), err[:200])
         check("让用户去窗口里完成", "窗口" in err, err)
         check("要求 agent 不要反复调用", "不要反复调用" in err, err)
 

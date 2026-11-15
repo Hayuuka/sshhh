@@ -115,6 +115,7 @@ def main() -> int:
     mentioned = set(re.findall(r"`([A-Z_]{4,})`", skill_md + protocol_md))
     unknown = mentioned - names - {
         "SSHHH_STATUS", "SSHHH_MESSAGE", "SSHHH_HINT",
+        "SSHHH_INVOCATION", "SSHHH_HOSTKEY",
         "SSHHH_SETUP_TIMEOUT", "SSHHH_SETUP_HANDOFF",
         "SSHHH_DATA_DIR", "SSHHH_MASTER",
         "RESULT_KEYS", "CREATE_NEW_CONSOLE", "CREATE_BREAKAWAY_FROM_JOB",
