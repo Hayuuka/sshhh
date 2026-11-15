@@ -73,14 +73,17 @@ def deps_ok(executable: str | Path) -> bool:
 def _python_version_ok(executable: str) -> bool:
     try:
         proc = subprocess.run(
-            [executable, "-c", "import sys;print(sys.version_info[:2])"],
+            [executable, "-c",
+             "import sys;print(sys.version_info.major, sys.version_info.minor)"],
             capture_output=True, timeout=20, text=True,
             creationflags=_NO_WINDOW,
         )
         if proc.returncode != 0:
             return False
-        major, minor = eval(proc.stdout.strip())  # noqa: S307 - 输出受控
-        return (major, minor) >= (3, 9)
+        parts = proc.stdout.strip().split()
+        # 打印成两个整数再解析，不用 eval —— 输出虽受控，但没理由留着 eval（#21）
+        return (len(parts) == 2
+                and (int(parts[0]), int(parts[1])) >= (3, 9))
     except Exception:
         return False
 
@@ -89,7 +92,10 @@ def find_base_python() -> str | None:
     """找一个可用的基础解释器来建 venv。"""
     candidates: list[list[str]] = []
     if os.name == "nt":
-        candidates.append(["py", "-3.14"])
+        # 按版本号从新到旧逐个探测（#21）：写死 py -3.14 在 3.15 发布后
+        # 会一直错过更新的解释器。不存在的版本 py 启动器立刻失败，探测成本可忽略。
+        for minor in range(15, 8, -1):
+            candidates.append(["py", f"-3.{minor}"])
         candidates.append(["py", "-3"])
         candidates.append(["py"])
     candidates.append(["python3"])

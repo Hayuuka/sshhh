@@ -527,7 +527,8 @@ def cmd_run(argv: list[str]) -> int:
         )
 
     # --- 4. 拿密码 -------------------------------------------------------
-    password = vault_obj.get(name) if vault_obj else None
+    # vault_obj 到这里必然非 None：第 2 步失败早已走 unlock 路径并 return
+    password = vault_obj.get(name)
     if not password and not host.key_file:
         status, detail = _launch("add_host", {"host_name": name})
         if status != "ok":

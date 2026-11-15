@@ -779,6 +779,38 @@ def test_status_headless_guidance() -> None:
         vault.keyring_load = real_kl
 
 
+# --------------------------------------------------------------------------
+# #21 代码卫生：eval、死防御、硬编码版本
+# --------------------------------------------------------------------------
+
+
+def test_code_hygiene() -> None:
+    import inspect
+
+    from lib import runtime
+
+    print("\n== #21 版本探测不再用 eval ==")
+    src = inspect.getsource(runtime)
+    check("runtime 里没有 eval(", "eval(" not in src,
+          "仍存在 eval 调用")
+    check("本解释器版本探测通过",
+          runtime._python_version_ok(sys.executable) is True)
+    check("不存在的解释器返回 False",
+          runtime._python_version_ok(str(_TMP / "no-such-python.exe")) is False)
+
+    print("\n== #21 基础解释器按版本从新到旧探测 ==")
+    find_src = inspect.getsource(runtime.find_base_python)
+    check("动态探测 3.15..3.9", "range(15, 8, -1)" in find_src, find_src[:200])
+    check("不再硬编码 py -3.14", '"py", "-3.14"' not in find_src)
+
+    print("\n== #21 cmd_run 死防御分支已删 ==")
+    import sshhh as cli
+
+    run_src = inspect.getsource(cli.cmd_run)
+    check("不再有 `if vault_obj else None`", "if vault_obj else None" not in run_src)
+    check("vault_obj 直取", "vault_obj.get(name)" in run_src)
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -790,6 +822,7 @@ def main() -> int:
     test_non_windows_first_run_guidance()
     test_gpg_backend()
     test_status_headless_guidance()
+    test_code_hygiene()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)
