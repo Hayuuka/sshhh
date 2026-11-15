@@ -40,6 +40,9 @@ sshhh —— AI 可用的 SSH 通道，密码不进入 AI 上下文
   manage unlock           重新输入主密码
   manage policy <主机>     查看该主机的生效策略
   manage reseal            手编 hosts.toml 后重新签名
+  manage keygen <主机> [--force]  生成密钥（私钥入密码库，打印公钥）
+  manage keyimport <主机> [文件]  导入已有私钥到密码库
+  manage keyshow <主机>    显示该主机的公钥行与指纹
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
   manage harden <主机> --check 只读探测远端可加固性
   manage migrate <旧目录>  从旧版 sshx 项目迁移主机和密码
@@ -1327,6 +1330,172 @@ def cmd_reseal(argv: list[str]) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# 密钥管理（#3 基线：生成 / 导入 / 展示；公钥部署属加固档 #15，观察名单）
+# --------------------------------------------------------------------------
+
+
+def _key_entry(name: str) -> str:
+    """vault 里的私钥条目名（#37 预留的 key:<host> 命名空间）。"""
+    return f"key:{name}"
+
+
+def _key_intro(pem: str, name: str) -> None:
+    """打印公钥行与指纹 —— 唯一允许出现在终端上的密钥形态。"""
+    from lib import sshkeys
+
+    comment = f"sshhh-{name}"
+    _say(f"     指纹：{sshkeys.sha256_fingerprint(pem)}")
+    _say(f"     公钥（放进服务器 authorized_keys 的一行）：")
+    _say(f"     {sshkeys.public_key_line(pem, comment=comment)}")
+
+
+def cmd_keygen(argv: list[str]) -> int:
+    """生成 Ed25519 密钥对：私钥加密入 vault（key:<host>），公钥打印出来。
+
+    私钥只在内存与密文之间流转，绝不落盘（设计宪法：明文私钥落盘 = 禁止）。
+    公钥部署（写服务器 authorized_keys）属加固档写操作，当前由用户手动
+    完成；`manage harden <主机> --check` 可先探测服务器端条件（#15）。
+    `--force` 轮换：旧公钥不会自动从服务器移除，输出里会提醒。
+    """
+    from lib import audit, protocol, sshkeys, store, vault
+
+    force = "--force" in argv
+    _, pos = _parse([a for a in argv if a != "--force"], set())
+    if not pos:
+        raise UsageError("用法：sshhh manage keygen <主机> [--force]")
+    name = pos[0]
+
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
+    if host is None:
+        return _unknown_host(name)
+
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
+    old = v.get(_key_entry(name))
+    if old and not force:
+        _warn(f"[sshhh] {name} 已有密钥（{sshkeys.sha256_fingerprint(old)}）")
+        _warn("[sshhh] 确认要轮换请加 --force；旧公钥需在服务器上手工移除")
+        return 3
+
+    pem = sshkeys.generate_ed25519_pem(comment=f"sshhh-{name}")
+    v.set(_key_entry(name), pem)
+    audit.write("key.gen", host=name, user=host.user,
+                command=f"ed25519 {sshkeys.sha256_fingerprint(pem)}")
+    _say(f"[ok] 已生成 Ed25519 密钥并加密存入密码库（key:{name}）")
+    _key_intro(pem, name)
+    _say("     部署提示：追加到服务器的 ~/.ssh/authorized_keys；Windows")
+    _say("     管理员组用户是 administrators_authorized_keys（注意 ACL 只留")
+    _say("     Administrators/SYSTEM）。部署后本工具会自动优先用密钥认证。")
+    if old:
+        _say("     注意：这是轮换出的新密钥，旧公钥记得从服务器上移除。")
+    return 0
+
+
+def cmd_keyimport(argv: list[str]) -> int:
+    """导入已有私钥：解析校验 + 归一化后加密入 vault，全程不落盘不回显。
+
+    文件路径省略时使用该主机遗留的 key_file 字段（#18 之后该字段不再参与
+    认证，只作为迁移线索保留）。带口令的私钥拒绝导入，错误信息给出用户
+    本机移除口令的办法。
+    """
+    from lib import audit, protocol, sshkeys, store, vault
+
+    _, pos = _parse(argv, set())
+    if not pos:
+        raise UsageError("用法：sshhh manage keyimport <主机> [私钥文件]")
+    name = pos[0]
+    path_arg = pos[1] if len(pos) > 1 else None
+
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
+    if host is None:
+        return _unknown_host(name)
+
+    legacy = host.key_file
+    if path_arg is None:
+        if not legacy:
+            _warn("[sshhh] 未指定私钥文件，该主机也没有遗留的 key_file 字段")
+            _warn("[sshhh] 用法：sshhh manage keyimport <主机> <私钥文件>")
+            return 2
+        path_arg = legacy
+        _say(f"[sshhh] 使用主机遗留的 key_file 路径：{path_arg}")
+
+    source = Path(path_arg).expanduser()
+    try:
+        pem_raw = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        audit.write("key.import", host=name, ok=False,
+                    error=f"私钥文件读取失败：{source}")
+        _warn(f"[sshhh] 读不了私钥文件 {source}：{exc}")
+        return 3
+    except UnicodeDecodeError:
+        audit.write("key.import", host=name, ok=False,
+                    error="私钥文件不是文本 PEM")
+        _warn(f"[sshhh] {source} 不是文本 PEM（PuTTY 的 .ppk 请先转换导出）")
+        return 3
+
+    try:
+        pem = sshkeys.normalize_pem(pem_raw)
+        sshkeys.load_pkey(pem)  # 双保险：入库前确认 paramiko 能加载归一化产物
+    except sshkeys.SSHKeyError as exc:
+        audit.write("key.import", host=name, ok=False, error=str(exc))
+        _warn(f"[sshhh] {exc}")
+        return 3
+
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+    v.set(_key_entry(name), pem)
+
+    audit.write("key.import", host=name, user=host.user,
+                command=f"from {source} {sshkeys.sha256_fingerprint(pem)}")
+    _say(f"[ok] 私钥已导入并加密存入密码库（key:{name}），明文不落盘")
+    _key_intro(pem, name)
+    if legacy:
+        _say("     提示：hosts.toml 的 key_file 字段已不再参与认证，可删除")
+    return 0
+
+
+def cmd_keyshow(argv: list[str]) -> int:
+    """显示某主机密钥的公钥行与指纹（只有公开材料会出现在输出里）。"""
+    from lib import protocol, sshkeys, store, vault
+
+    _, pos = _parse(argv, set())
+    if not pos:
+        raise UsageError("用法：sshhh manage keyshow <主机>")
+    name = pos[0]
+
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
+    if host is None:
+        return _unknown_host(name)
+
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+    pem = v.get(_key_entry(name))
+    if not pem:
+        _warn(f"[sshhh] {name} 还没有密钥")
+        _warn(f"[sshhh] 生成：{_manual_cmd(f'manage keygen {name}')}")
+        _warn(f"[sshhh] 导入：{_manual_cmd(f'manage keyimport {name} <私钥文件>')}")
+        return 3
+    _key_intro(pem, name)
+    return 0
+
+
 MANAGE_USAGE = """\
 sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
 
@@ -1336,6 +1505,9 @@ sshhh manage —— 管理操作（给用户本人执行，AI 不需要代跑）
   manage unlock            重新输入主密码
   manage policy <主机>      查看该主机的生效策略
   manage reseal            手编 hosts.toml 后重新签名（完整性校验，#18）
+  manage keygen <主机> [--force]  生成 Ed25519 密钥（私钥入密码库，打印公钥）
+  manage keyimport <主机> [文件]  导入已有私钥到密码库（省略文件用遗留 key_file）
+  manage keyshow <主机>     显示该主机的公钥行与指纹
   manage audit [-n N] [--all] 查看审计记录（--all 含解密留痕）
   manage harden <主机> --check 只读探测远端可加固性（不改动，见 #15）
   manage migrate <旧目录>   从旧版 sshx 项目迁移
@@ -1385,6 +1557,9 @@ MANAGE_COMMANDS = {
     "unlock": cmd_unlock,
     "policy": cmd_policy,
     "reseal": cmd_reseal,
+    "keygen": cmd_keygen,
+    "keyimport": cmd_keyimport,
+    "keyshow": cmd_keyshow,
     "audit": cmd_audit,
     "migrate": cmd_migrate,
     "harden": cmd_harden,

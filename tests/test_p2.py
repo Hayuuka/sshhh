@@ -390,11 +390,191 @@ def test_data_dir_gating() -> None:
           proc.stderr[-300:])
 
 
+# --------------------------------------------------------------------------
+# #3 密钥管理：keygen / keyimport / keyshow（vault key:<host> 启用）
+# --------------------------------------------------------------------------
+
+
+def _audit_raw() -> str:
+    try:
+        return paths.audit_file().read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _same_key_material(original: str, stored: str) -> bool:
+    """比较导入前后的密钥材料：ed/ec 比公钥 blob，RSA 比 n/e。
+
+    不能比 PEM 文本 —— 归一化本来就会改封装（这正是它的职责）。
+    """
+    import paramiko
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+
+    from lib import sshkeys
+
+    def _s(b: bytes) -> bytes:
+        return len(b).to_bytes(4, "big") + b
+
+    def _mpint(n: int) -> bytes:
+        b = n.to_bytes((n.bit_length() + 7) // 8 or 1, "big")
+        if b[0] & 0x80:
+            b = b"\x00" + b
+        if n == 0:
+            b = b""
+        return _s(b)
+
+    try:
+        key = serialization.load_pem_private_key(original.strip().encode(),
+                                                 password=None)
+        orig_kind = "crypto"
+    except ValueError:
+        # OpenSSH 容器输入：cryptography 读不了，原始侧也走 paramiko
+        pk_orig = sshkeys.load_pkey(original)
+        orig_kind = "paramiko"
+    pk = sshkeys.load_pkey(stored)
+    if orig_kind == "paramiko":
+        # 输入本就是 paramiko 可读形态：归一化应原样保留（blob 逐字节一致）
+        return (pk.get_name() == pk_orig.get_name()
+                and pk.asbytes() == pk_orig.asbytes())
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        pub = key.public_key().public_bytes(serialization.Encoding.Raw,
+                                            serialization.PublicFormat.Raw)
+        return (pk.get_name() == "ssh-ed25519"
+                and pk.asbytes() == _s(b"ssh-ed25519") + _s(pub))
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        curve = {"secp256r1": "nistp256"}.get(key.curve.name, key.curve.name)
+        point = key.public_key().public_bytes(
+            serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        return (pk.get_name() == f"ecdsa-sha2-{curve}"
+                and pk.asbytes() == (_s(f"ecdsa-sha2-{curve}".encode())
+                                     + _s(curve.encode()) + _s(point)))
+    if isinstance(key, rsa.RSAPrivateKey):
+        nums = key.public_key().public_numbers()
+        blob = _s(b"ssh-rsa") + _mpint(nums.e) + _mpint(nums.n)
+        return pk.get_name() == "ssh-rsa" and pk.asbytes() == blob
+    return False
+
+
+def test_key_management() -> None:
+    from lib import sshkeys
+
+    print("\n== #3 keygen：生成、入 vault、公钥可派生 ==")
+    reset()
+    setup_sealed_host()
+    code, out, err = run_cli(["manage", "keygen", "prod"])
+    check("keygen 退出码 0", code == 0, f"{out}{err}")
+    check("输出含公钥行", "ssh-ed25519 " in out, out)
+    check("输出含指纹", "SHA256:" in out, out)
+
+    v = vault.open_vault()
+    pem = v.get("key:prod")
+    check("私钥入 vault key:<host>", bool(pem))
+    check("names() 不含密钥条目",
+          "prod" in v.names() and "key:prod" not in v.names(), str(v.names()))
+    pk = sshkeys.load_pkey(pem)
+    check("paramiko 能从内存加载生成的密钥", pk.get_name() == "ssh-ed25519")
+    check("私钥材料不进输出", "BEGIN" not in out, out[:200])
+    check("私钥材料不进审计", "BEGIN" not in _audit_raw())
+    actions = [r.get("action") for r in audit.tail(5, include_internal=True)]
+    check("审计记录 key.gen", "key.gen" in actions, str(actions))
+
+    print("\n== #3 keygen：重复生成被拒，--force 轮换 ==")
+    code, out, err = run_cli(["manage", "keygen", "prod"])
+    check("已有密钥时退出码 3", code == 3, f"{out}{err}")
+    old_fp = sshkeys.sha256_fingerprint(pem)
+    code, out, err = run_cli(["manage", "keygen", "prod", "--force"])
+    check("--force 轮换成功", code == 0, f"{out}{err}")
+    pem2 = vault.open_vault().get("key:prod")
+    check("轮换后私钥更换", pem2 != pem)
+    check("轮换后指纹变化", sshkeys.sha256_fingerprint(pem2) != old_fp)
+
+    print("\n== #3 keyimport：三种封装归一化后入库 ==")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+
+    key_dir = Path(tempfile.mkdtemp(prefix="sshhh-keys-"))
+    cases = {}
+    cases["ed25519-pkcs8"] = ed25519.Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode()
+    cases["ecdsa-pkcs8"] = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode()
+    cases["rsa-pkcs1"] = rsa.generate_private_key(
+        public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption()).decode()
+    # OpenSSH 容器是用户手里最常见的形态（ssh-keygen 产出），必须原样通过
+    cases["ed25519-openssh"] = sshkeys.generate_ed25519_pem(comment="existing")
+
+    for label, original in cases.items():
+        src = key_dir / f"{label}.pem"
+        src.write_text(original, encoding="utf-8")
+        code, out, err = run_cli(["manage", "keyimport", "prod", str(src)])
+        check(f"{label} 导入退出码 0", code == 0, f"{out}{err}")
+        stored = vault.open_vault().get("key:prod")
+        check(f"{label} 入库", bool(stored))
+        try:
+            sshkeys.load_pkey(stored)
+            loadable = True
+        except Exception:
+            loadable = False
+        check(f"{label} 归一化产物 paramiko 可加载", loadable)
+        check(f"{label} 密钥材料一致（仅封装改变）",
+              _same_key_material(original, stored))
+    check("私钥材料不进审计", "BEGIN" not in _audit_raw())
+    actions = [r.get("action") for r in audit.tail(10, include_internal=True)]
+    check("审计记录 key.import", "key.import" in actions, str(actions))
+
+    print("\n== #3 keyimport：拒绝与兜底 ==")
+    enc_src = key_dir / "encrypted.pem"
+    enc_src.write_text(rsa.generate_private_key(
+        public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.BestAvailableEncryption(b"a-passphrase-1")).decode(),
+        encoding="utf-8")
+    code, out, err = run_cli(["manage", "keyimport", "prod", str(enc_src)])
+    check("带口令私钥被拒（退出码 3）", code == 3, f"{out}{err}")
+    check("报错给出口令处理指引", "口令" in err, err)
+
+    junk = key_dir / "junk.pem"
+    junk.write_text("PuTTY-User-Key-File-3: ssh-ed25519\nnot-a-pem\n",
+                    encoding="utf-8")
+    code, out, err = run_cli(["manage", "keyimport", "prod", str(junk)])
+    check("非 PEM 文件被拒", code == 3, f"{out}{err}")
+
+    missing = run_cli(["manage", "keyimport", "prod", str(key_dir / "nope.pem")])
+    check("文件不存在退出码 3", missing[0] == 3, f"{missing[1]}{missing[2]}")
+
+    print("\n== #3 keyimport：省略路径时用遗留 key_file ==")
+    reset()
+    setup_sealed_host()
+    legacy_src = key_dir / "legacy.pem"
+    legacy_src.write_text(cases["ed25519-pkcs8"], encoding="utf-8")
+    store.upsert_host(store.Host(name="prod", host="127.0.0.1", user="root",
+                                 key_file=str(legacy_src)))
+    code, out, err = run_cli(["manage", "keyimport", "prod"])
+    check("自动使用 key_file 路径", code == 0, f"{out}{err}")
+    check("输出含 legacy 路径与删除提示",
+          str(legacy_src) in out and "key_file" in out, out)
+
+    print("\n== #3 keyshow：只显示公钥 ==")
+    code, out, err = run_cli(["manage", "keyshow", "prod"])
+    check("keyshow 退出码 0", code == 0, f"{out}{err}")
+    check("输出含公钥行", "ssh-ed25519 " in out, out)
+    check("输出含指纹", "SHA256:" in out, out)
+    check("不含私钥材料", "BEGIN" not in out, out)
+    code, out, err = run_cli(["manage", "keyshow", "ghost"])
+    check("未知主机退出码 3", code == 3, f"{out}{err}")
+
+
 def main() -> int:
     test_seal_roundtrip_and_tamper()
     test_unsealed_failclosed_and_reseal()
     test_enforcement_and_views()
     test_data_dir_gating()
+    test_key_management()
 
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
