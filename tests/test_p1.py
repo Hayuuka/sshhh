@@ -325,18 +325,96 @@ def test_vault_aad_and_tmp() -> None:
     check("不再用固定名字 vault.tmp", 'with_suffix(".tmp")' not in src)
 
     v3 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
-    writers = [threading.Thread(target=lambda i=i: v3.set(f"thread-{i}",
-                                                          f"thread-value-{i}"))
-               for i in range(6)]
-    for t in writers:
+
+    # 并发裸写（无锁）唯一的保证是「文件始终完好」：唯一临时名下，每次
+    # os.replace 落盘的都是一个完整快照，谁最后完成谁获胜，不会出现混写
+    from lib.lock import data_lock
+
+    bare = [threading.Thread(target=lambda i=i: v3.set(f"bare-{i}", f"bare-{i}"))
+            for i in range(6)]
+    for t in bare:
         t.start()
-    for t in writers:
+    for t in bare:
         t.join()
     v4 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
-    check("并发写后文件完好可解", v4.get("thread-5") == "thread-value-5",
+    check("并发裸写后文件完好可解", v4 is not None and bool(v4.names()),
           str(v4.names()))
+    check("落盘的是完整快照（无混写损坏）",
+          all(str(k).split("-")[0] in ("bare", "thread", "legacy", "prod")
+              for k in v4.names()), str(v4.names()))
+
+    # 生产路径经 data_lock 串行化：一条不丢
+    def writer(i: int) -> None:
+        with data_lock(timeout=30):
+            v3.set(f"thread-{i}", f"thread-value-{i}")
+
+    locked = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+    for t in locked:
+        t.start()
+    for t in locked:
+        t.join()
+    v5 = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    check("走 data_lock 的并发写一条不丢",
+          all(v5.get(f"thread-{i}") == f"thread-value-{i}" for i in range(6)),
+          str(v5.names()))
     leftovers = [p.name for p in paths.data_dir().glob("*.tmp")]
     check("没有残留临时文件", not leftovers, str(leftovers))
+
+
+# --------------------------------------------------------------------------
+# #34 S6：首连 TOFU 指纹进状态行
+# --------------------------------------------------------------------------
+
+
+def test_tofu_hostkey_line() -> None:
+    import base64
+    import contextlib
+    import hashlib
+    import io
+
+    import paramiko
+
+    from lib.store import Host, Settings
+    from lib.transport import Client, _hostkey_fingerprint
+
+    print("\n== #34 S6 首连输出 SSHHH_HOSTKEY: SHA256 ==")
+    reset()
+    key = paramiko.RSAKey.generate(1024)
+    client = Client(Host(name="box", host="1.2.3.4", user="root"), "pw",
+                    Settings())
+    client._tofu.new_keys = [("1.2.3.4", key)]  # noqa: SLF001
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        client._save_new_keys()
+    text = err.getvalue()
+    expect = base64.b64encode(hashlib.sha256(key.asbytes()).digest()
+                              ).decode().rstrip("=")
+    check("状态行存在", "SSHHH_HOSTKEY: SHA256:" in text, text)
+    check("指纹与 ssh-keygen 算法一致", f"SHA256:{expect}" in text, text)
+    check("标注了首次连接的主机名", "首次连接 1.2.3.4" in text, text)
+    check("记录成功后 new_keys 清空", not client._tofu.new_keys)
+    check("指纹可复现（_hostkey_fingerprint）",
+          _hostkey_fingerprint(key) == expect)
+
+    print("\n== #34 S6 记录失败时既给指纹也给警告 ==")
+    from lib import paths as paths_mod
+
+    client2 = Client(Host(name="box", host="1.2.3.4", user="root"), "pw",
+                     Settings())
+    client2._tofu.new_keys = [("1.2.3.4", key)]  # noqa: SLF001
+    orig_kh = paths_mod.known_hosts_file
+    # known_hosts 指到一个「必写不进」的位置：_TMP 本身是目录，
+    # os.replace 到目录上必然失败
+    paths_mod.known_hosts_file = lambda: _TMP
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            client2._save_new_keys()
+    finally:
+        paths_mod.known_hosts_file = orig_kh
+    text = err.getvalue()
+    check("仍然输出指纹行", "SSHHH_HOSTKEY: SHA256:" in text, text)
+    check("输出没记录上的警告", "没能记录主机指纹" in text, text)
 
 
 def main() -> int:
@@ -344,6 +422,7 @@ def main() -> int:
     test_sudo_with_stdin()
     test_test_policy_and_redaction()
     test_vault_aad_and_tmp()
+    test_tofu_hostkey_line()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

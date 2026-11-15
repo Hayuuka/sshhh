@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import os
 import socket
 import sys
@@ -142,6 +143,12 @@ def load_known_hosts(ssh: paramiko.SSHClient, path: Path) -> None:
         ) from None
 
 
+def _hostkey_fingerprint(key: paramiko.PKey) -> str:
+    """OpenSSH 风格的 SHA256 指纹（无填充），与 `ssh-keygen -lf` 一致。"""
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 def remember_host_keys(entries: list[tuple[str, paramiko.PKey]],
                        path: os.PathLike | str | None = None) -> bool:
     """记下新主机指纹：加锁 + 原子替换，失败返回 False。
@@ -239,18 +246,32 @@ class Client:
         if not self._tofu.new_keys:
             return
         entries = list(self._tofu.new_keys)
-        if remember_host_keys(entries, self.settings.known_hosts):
+        recorded = remember_host_keys(entries, self.settings.known_hosts)
+        if recorded:
             self._tofu.new_keys.clear()
-            return
-        # 记不下来不让本次执行失败（命令已经跑完、输出就在内存里），但要说出来：
-        # 这台主机的指纹没进库，下次连接会重新走 TOFU。
-        try:
-            sys.stderr.write(
-                f"[sshhh] 警告：没能记录主机指纹（{self.settings.known_hosts}），"
-                "下次连接将重新校验该主机指纹\n"
-            )
-        except Exception:
-            pass
+        # 首连的 TOFU 窗口是本地防不住的弱点（#31 / TM-A6）：把指纹放进一行
+        # 机器可读的状态行，agent 在首次连接时把它念给用户，让用户有机会
+        # 当场发现「连错了机器」。这行出现在任何远端输出之前，是权威值；
+        # 远端在后续连接里伪造同型行只会造成一次多余的播报。
+        for hostname, key in entries:
+            try:
+                sys.stderr.write(
+                    f"SSHHH_HOSTKEY: SHA256:{_hostkey_fingerprint(key)}"
+                    f"（首次连接 {hostname}，指纹已记录到 "
+                    f"{self.settings.known_hosts}）\n"
+                )
+            except Exception:
+                pass
+        if not recorded:
+            # 记不下来不让本次执行失败（命令已经跑完、输出就在内存里），但要说出来：
+            # 这台主机的指纹没进库，下次连接会重新走 TOFU。
+            try:
+                sys.stderr.write(
+                    f"[sshhh] 警告：没能记录主机指纹（{self.settings.known_hosts}），"
+                    "下次连接将重新校验该主机指纹\n"
+                )
+            except Exception:
+                pass
 
     # -- 执行 ----------------------------------------------------------
 
