@@ -193,6 +193,100 @@ except Exception as exc:
 """
 
 
+AUDIT_WORKER = r"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from lib import audit
+
+for i in range(int(sys.argv[3])):
+    audit.write("stress", command=f"worker-{sys.argv[2]}-item-{i}")
+print("OK")
+"""
+
+
+def test_audit_concurrent_write() -> None:
+    """#47：多进程并发追加无残行，并发轮转不撕裂。"""
+    import threading
+
+    from lib import audit, paths as paths_mod
+
+    print("\n== #47 六进程并发追加：条条可解析、一条不少 ==")
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", AUDIT_WORKER, str(SCRIPTS), str(w), "30"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+        )
+        for w in range(6)
+    ]
+    outs = []
+    for p in procs:
+        out, err = p.communicate(timeout=120)
+        outs.append((out.strip(), err[-200:]))
+    check("六个写入进程都跑完", all(o.startswith("OK") for o, _ in outs),
+          str(outs))
+
+    log = paths_mod.audit_file()
+    records = []
+    torn = []
+    for file in (log, Path(str(log) + ".1")):
+        if not file.exists():
+            continue
+        for raw in file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+                if isinstance(rec, dict):
+                    records.append(rec)
+                else:
+                    torn.append(raw[:80])
+            except json.JSONDecodeError:
+                torn.append(raw[:80])
+    check("没有无法解析的残行", not torn, f"残行 {len(torn)} 条：{torn[:3]}")
+    stress = [r for r in records if r.get("action") == "stress"]
+    check("180 条 stress 记录一条不少（未被轮转丢弃）",
+          len(stress) == 6 * 30, f"实际 {len(stress)} 条")
+
+    print("\n== #47 并发轮转竞态：轮转 + 追加互斥 ==")
+    audit.ROTATE_BYTES = 2000  # 每条 ~180 字节，写十几条就轮一次
+    try:
+        def hammer(w: int) -> None:
+            for i in range(60):
+                audit.write("rotate-storm", command=f"w{w}-i{i}-"
+                                              + "x" * 120)
+
+        threads = [threading.Thread(target=hammer, args=(w,))
+                   for w in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(120)
+    finally:
+        audit.ROTATE_BYTES = 10 * 1024 * 1024
+
+    log1 = Path(str(log) + ".1")
+    check("确实发生了轮转", log1.exists(), "audit.log.1 不存在")
+    torn2 = []
+    for file in (log, log1):
+        if not file.exists():
+            continue
+        for raw in file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+                if not isinstance(rec, dict):
+                    torn2.append(raw[:80])
+            except json.JSONDecodeError:
+                torn2.append(raw[:80])
+    check("高频轮转下没有残行", not torn2,
+          f"残行 {len(torn2)} 条：{torn2[:3]}")
+    current_size = log.stat().st_size if log.exists() else 0
+    check("当前代没有超过上限太多（轮转在正常工作）",
+          current_size < audit.ROTATE_BYTES + 4096, str(current_size))
+
+
 def main() -> int:
     # 准备一个可用的密码库
     vault.Vault.create(paths.vault_file(), MASTER)
@@ -392,6 +486,8 @@ def main() -> int:
     check("提示语说明另一个进程在准备环境",
           "准备运行环境" in str(report.get("msg", "")), str(report))
     check("没有无限等待（<5s）", waited < 5.0, f"{waited:.1f}s")
+
+    test_audit_concurrent_write()
 
     shutil.rmtree(_TMP, ignore_errors=True)
     print("\n" + "=" * 46)

@@ -69,6 +69,22 @@ def bootstrap_lock(timeout: float = 300.0, poll: float = 0.2):
 
 
 @contextlib.contextmanager
+def audit_lock(timeout: float = 10.0, poll: float = 0.05):
+    """审计日志写入的专用锁（#47）。
+
+    串行化 audit 的「轮转 + 追加」：多 agent 并发追加不再互相穿插出残行，
+    轮转的 unlink/replace 与追加互斥。与 data_lock 用不同的锁文件 ——
+    审计写入嵌在 vault.open 这类不该等锁的读路径里（vault._audit_open），
+    不能让配置写入的临界区把它堵住；反过来审计临界区只有毫秒级。
+
+    可重入性：audit.write 不会嵌套调用自身，不做 data_lock 那种按线程
+    可重入的处理。同进程两个线程并发写审计同样互斥（第二个会稍等）。
+    """
+    with _file_lock(paths.audit_lock_file(), timeout, poll):
+        yield
+
+
+@contextlib.contextmanager
 def _file_lock(lock_path: Path, timeout: float, poll: float):
     fh = _open_retry(lock_path, timeout, poll)
     deadline = time.monotonic() + timeout

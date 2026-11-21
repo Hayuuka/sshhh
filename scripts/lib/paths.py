@@ -74,6 +74,17 @@ def bootstrap_lock_file() -> Path:
     return data_dir() / ".bootstrap"
 
 
+def audit_lock_file() -> Path:
+    """审计写入专用的锁（#47）。
+
+    与 `.lock` 分开：审计写入嵌在 vault.open 这类不该等锁的读路径里
+    （vault._audit_open），若与 hosts.toml / vault 共用一把锁，任何配置
+    写入都会让读路径陪着等。审计锁只串行化「轮转 + 追加」这一小段，
+    临界区毫秒级。
+    """
+    return data_dir() / ".audit"
+
+
 def no_window_marker() -> Path:
     """标记文件：这个环境里弹窗撑不住（命令一结束就被宿主回收）。
 

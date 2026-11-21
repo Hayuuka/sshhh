@@ -11,6 +11,12 @@ vault.open（解密留痕），`--all` 看全量。正常使用只见到业务�
 被诱导直接解密的行为在 --all 里可查。
 
 轮转：超过 ROTATE_BYTES 轮出一代 audit.log.1（只留一代），避免无上限增长。
+
+并发（#47）：「轮转 + 追加」整段在 audit_lock（专用锁文件 .audit）内
+完成，多 agent 并发不会把记录写进已改名的旧文件、也不会互相穿插出
+残行。与 data_lock 分开是因为审计写入嵌在 vault.open 这类不该等锁的
+读路径里。追加本身用 O_APPEND 的单次 os.write（字节级），锁等不到时
+也接近原子 —— 审计的定位是留痕，宁可有痕不完美，也不整条丢弃。
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from .lock import LockTimeout, audit_lock
 
 MAX_COMMAND_CHARS = 500
 
@@ -30,6 +37,10 @@ HIDDEN_ACTIONS = frozenset({"vault.open"})
 # 单文件上限与保留代数。10 MiB 对 JSONL 来说是很宽裕的额度；
 # 轮转只保留一代（audit.log.1），更老的直接丢弃。
 ROTATE_BYTES = 10 * 1024 * 1024
+
+# 写入锁的等待上限。审计是旁路，写不进去也不能拖垮主流程；
+# 等不到就降级为无锁单次追加。
+_WRITE_LOCK_TIMEOUT = 10.0
 
 # 倒读的扫描上限：正常日志里业务记录密度足够；极端情况（整片都是
 # vault.open 且 --all 也没凑够 limit）就少显示几条，不为此读整个文件
@@ -80,20 +91,41 @@ def write(action: str, *, host: str = "", user: str = "", command: str = "",
         record["bytes"] = original_bytes
 
     path = paths.audit_file()
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate(path)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+        with audit_lock(timeout=_WRITE_LOCK_TIMEOUT):
+            _rotate(path)
+            _append_line(path, line)
+    except (OSError, LockTimeout):
+        # 锁被长期占用等不到、或落盘中途出错：降级为无锁单次追加。
+        # 单条 os.write(O_APPEND) 接近原子，比整条丢弃好。
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _append_line(path, line)
+        except OSError:
+            pass
+
+
+def _append_line(path: Path, line: bytes) -> None:
+    """字节级单次追加（#47）。
+
+    文本层的 open("a") + write 可能拆成多次 flush，多进程交错时互相
+    穿插产生残行 —— audit tail 只能把它当 None 静默丢掉，丢的是留痕。
+    os.write 一次写完整行。
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
 
 
 def _rotate(path: Path) -> None:
     """超过上限把 audit.log 挪成 audit.log.1。
 
-    两个进程同时轮转也只是各挪一次，最后留在原位的是其中一份，不会丢记录
-    以外的任何东西（挪动本身是 rename，不截断内容）。
+    在 data_lock 内被调用（#47）：unlink/replace 与追加互斥，不会再有
+    「P1 拿着旧句柄写进了 P2 刚改名的 audit.log.1」的竞态。
     """
     try:
         if not path.exists() or path.stat().st_size < ROTATE_BYTES:
