@@ -136,7 +136,7 @@ _META_LABEL = {
 
 
 def _matches(pattern: str, text: str) -> bool:
-    """整条字符串匹配一条规则。
+    """整条字符串匹配一条命令规则。
 
     用 fullmatch 而不是 search：`allow = ['df -h']` 在 search 下会放过
     `x; rm -rf /; df -h`。规则写坏（非法正则）时退化成字面全串比较，
@@ -146,6 +146,19 @@ def _matches(pattern: str, text: str) -> bool:
         return re.fullmatch(pattern, text) is not None
     except re.error:
         return pattern == text
+
+
+def _matches_path(pattern: str, text: str) -> bool:
+    """子串匹配一条文件规则（re.search 语义：命中即算）。
+
+    非法正则退化成字面子串比较 —— 与命令规则的降级语义一致（#43）。
+    旧实现直接裸调 re.search，一条写错的规则（手写少个右括号很常见）
+    会让 put/get 以「内部错误」崩掉，同一份配置里其它合法规则全部失效。
+    """
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return pattern in text
 
 
 @dataclass
@@ -199,6 +212,11 @@ class Policy:
         默认关闭：主机一旦配了命令白名单（`allow`），文件通道就必须
         显式用 `allow_put` / `allow_get` 打开。否则「只允许 df -h 的机器」
         仍然可以 `get /etc/shadow` —— 白名单等于没配。
+
+        文件规则是 re.search 的子串命中语义（命令规则是 fullmatch，两者
+        拦的东西不同不必同构）：`allow_get = ['^/var/log/']` 是常规写法，
+        不带 `^` 锚定会把 `/var/tmp/evil` 也放进来。规则写坏时退化成
+        字面子串比较，不让一条笔误把 put/get 弄崩（#43）。
         """
         is_put = direction == "put"
         allow = self.allow_put if is_put else self.allow_get
@@ -206,11 +224,11 @@ class Policy:
         label = "上传" if is_put else "下载"
 
         for pat in deny:
-            if re.search(pat, remote_path):
+            if _matches_path(pat, remote_path):
                 return f"{label}命中禁止规则 /{pat}/"
         if allow:
             for pat in allow:
-                if re.search(pat, remote_path):
+                if _matches_path(pat, remote_path):
                     return None
             return f"远端路径未命中任何允许规则（{label}处于白名单模式）"
         if self.allow:

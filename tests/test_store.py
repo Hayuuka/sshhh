@@ -139,6 +139,29 @@ def main() -> int:
     check("没有策略的主机文件通道照常",
           store.get("李家豪LJH").policy.check_transfer("get", "/etc/shadow") is None)
 
+    print("\n== #43 非法正则退化成字面比较而不是崩 ==")
+    # 少个右括号，手写常犯。退化成字面子串比较：规则原文恰好出现在
+    # 路径里才命中，其余路径按白名单语义照常拒绝
+    pol = store.Policy(allow_get=["/var/log/(a|b"], deny_put=["(|"])
+    check("非法 allow_get 不崩、字面命中放行",
+          pol.check_transfer("get", "/var/log/(a|b") is None,
+          pol.check_transfer("get", "/var/log/(a|b"))
+    check("非法 allow_get 不崩、其它路径仍拒（白名单模式）",
+          pol.check_transfer("get", "/etc/shadow") is not None)
+    check("非法 deny_put 不崩、字面命中即拒",
+          pol.check_transfer("put", "/data/(|") is not None)
+    check("非法 deny_put 不崩、其它路径放行",
+          pol.check_transfer("put", "/tmp/x") is None)
+    # ^ 锚定的坏正则退化后匹配不到任何路径 → 白名单整体拒绝（宁可不可用）
+    pol_anchored = store.Policy(allow_get=["^/var/log/(a|b"])
+    check("^ 锚定的坏正则退化后放行面为零",
+          pol_anchored.check_transfer("get", "/var/log/(a|b") is not None)
+    # 同一语义口径下的 search 行为保持：合法规则子串命中
+    pol2 = store.Policy(allow_get=["^/var/log/"], deny_get=["secret"])
+    check("合法 search 规则照常工作",
+          pol2.check_transfer("get", "/var/log/secret.log") is not None
+          and pol2.check_transfer("get", "/var/log/syslog") is None)
+
     print("\n== 含单引号的规则不会写坏清单 ==")
     store.set_policy("my host", [], ["^it's"])
     h = store.get("my host")
