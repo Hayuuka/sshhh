@@ -17,10 +17,19 @@ from pathlib import Path
 from . import paths
 
 REQUIRED_MODULES = ("paramiko", "cryptography", "keyring", "tomli_w")
+# 版本兼容区间（#48 / TM-C5）：自举装的依赖必须可复现 —— 下限是验证过
+# 行为的最低线，上限挡住未测试的大版本，上游发版不再直接进用户 venv。
+# 升级 = 改这里 + 跑全部测试（CI 安装的是同一组约束）。
+# 2026-11 验证矩阵：paramiko 5.1 / cryptography 50.0 / keyring 25.7 /
+# tomli-w 1.2 / tomli 2.5。cryptography 50.x 不再解析 OpenSSH 容器的
+# 行为差异已在 sshkeys.normalize_pem 里对齐（新旧两代都兼容）。
 PACKAGES = (
-    "paramiko", "cryptography", "keyring", "tomli-w",
+    "paramiko>=4,<6",
+    "cryptography>=44,<51",
+    "keyring>=24,<26",
+    "tomli-w>=1.0,<2",
     # 3.9/3.10 没有标准库 tomllib，读 hosts.toml 需要 tomli（#22）
-    'tomli; python_version < "3.11"',
+    'tomli>=2,<3; python_version < "3.11"',
 )
 
 _BOOT_FLAG = "SSHHH_BOOTSTRAPPED"

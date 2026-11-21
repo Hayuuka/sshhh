@@ -33,7 +33,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: 安装依赖
-        run: pip install paramiko cryptography keyring tomli-w "tomli; python_version < '3.11'"
+        # 与 scripts/lib/runtime.py 的 PACKAGES 同一组约束（#48）：
+        # CI 验证的矩阵 = 用户自举装的矩阵；test_docs 校验两边不漂移
+        run: pip install "paramiko>=4,<6" "cryptography>=44,<51" "keyring>=24,<26" "tomli-w>=1.0,<2" "tomli>=2,<3; python_version < '3.11'"
       # 全部脚本自带 PASSED/FAILED 计数并 sys.exit(1) 于失败，CI 直接标红
       - name: 跑测试
         shell: bash

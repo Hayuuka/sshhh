@@ -378,6 +378,30 @@ def main() -> int:
     mig_src = _inspect.getsource(sshhh.cmd_migrate)
     check("migrate 全程持锁", "data_lock(" in mig_src, mig_src[:120])
 
+    print("\n== 自举依赖固定与 TM-C5 一致（#48）==")
+    from lib import runtime
+
+    unconstrained = [p for p in runtime.PACKAGES
+                     if not (">=" in p and "<" in p)]
+    check("PACKAGES 每个条目都有兼容区间上下界", not unconstrained,
+          str(unconstrained))
+    design_md = (ROOT / "docs" / "DESIGN.md").read_text(encoding="utf-8")
+    tm_c5_lines = [ln for ln in design_md.splitlines()
+                   if ln.startswith("| TM-C5 ")]
+    check("TM-C5 行存在", len(tm_c5_lines) == 1, str(len(tm_c5_lines)))
+    if tm_c5_lines:
+        check("TM-C5 声明 requirements 固定（兼容区间）",
+              "requirements 固定" in tm_c5_lines[0]
+              and "兼容区间" in tm_c5_lines[0], tm_c5_lines[0][:120])
+        check("TM-C5 残余风险如实写明（无哈希校验）",
+              "无哈希校验" in tm_c5_lines[0], tm_c5_lines[0][:120])
+    ci_yml = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8")
+    missing_in_ci = [p.split(";")[0].strip() for p in runtime.PACKAGES
+                     if p.split(";")[0].strip() not in ci_yml]
+    check("CI 安装约束与 PACKAGES 一致（矩阵不漂移）", not missing_in_ci,
+          str(missing_in_ci))
+
     print("\n" + "=" * 46)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     return 0 if FAILED == 0 else 1
