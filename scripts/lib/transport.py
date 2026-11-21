@@ -33,6 +33,11 @@ class Result:
     stderr: str
     exit_code: int
     duration_ms: int
+    # 读取侧截断（#40）：远端输出超过读取预算，只读回了预算内的部分。
+    # 与 output.shape 的回传截断不同 —— 那是读完之后整形，这是读完
+    # 之前就停止了接收，原始总量从此不可知。
+    stdout_read_truncated: bool = False
+    stderr_read_truncated: bool = False
 
 
 class _TOFU(paramiko.MissingHostKeyPolicy):
@@ -332,12 +337,18 @@ class Client:
             return ""
 
     def run(self, command: str, stdin_data: str | None = None,
-            timeout: float | None = None, use_sudo: bool = False) -> Result:
+            timeout: float | None = None, use_sudo: bool = False,
+            max_bytes: int | None = None) -> Result:
+        """执行命令。`timeout` 是墙钟上限（#40）：不管远端说不说话、
+        说不说完，到点就中断。`max_bytes` 给读取侧封顶（每条流读够
+        `max_bytes * _READ_BUDGET_FACTOR` 就停止接收），远端刷再多的
+        输出也不会把客户端内存灌爆。"""
         if self._ssh is None:
             raise TransportError("尚未连接")
 
         limit = timeout or self.settings.command_timeout
         started = time.monotonic()
+        deadline = started + limit
 
         if use_sudo:
             command = f"sudo -S -p '' bash -lc {_shquote(command)}"
@@ -360,32 +371,80 @@ class Client:
                 pass
 
         channel = stdout.channel
-        channel.settimeout(limit)
+        # 单次 recv 的阻塞粒度压到 1 秒（stdin 已写完，不会再受影响）：
+        # 总时长约束靠 deadline 检查，而不是「单次 recv 超过 channel
+        # timeout」—— 远端持续产出时后者永远不触发（#40）
+        channel.settimeout(_RECV_SLICE)
+
+        out_budget = err_budget = None
+        if max_bytes is not None and max_bytes > 0:
+            # 读取预算取回传上限的数倍：output.shape 的头尾整形（TM-A4）
+            # 在这个量级内仍然成立，超出就直接停止接收，内存有硬顶
+            out_budget = max_bytes * _READ_BUDGET_FACTOR
+            err_budget = max_bytes * _READ_BUDGET_FACTOR
+
+        out = err = b""
+        out_reason = err_reason = "eof"
+        hung = False
         try:
             from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import wait as futures_wait
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_out = pool.submit(_drain, stdout)
-                fut_err = pool.submit(_drain, stderr)
-                out = fut_out.result(timeout=limit + 10)
-                err = fut_err.result(timeout=limit + 10)
+                fut_out = pool.submit(_drain_channel, channel, deadline,
+                                      out_budget, stderr=False)
+                fut_err = pool.submit(_drain_channel, channel, deadline,
+                                      err_budget, stderr=True)
+                # _drain_channel 会按 deadline / 预算自行收束，这里只等
+                # 结果。不能用 fut.result(timeout=...)：到点抛异常后 with
+                # 的 __exit__ 还要先等线程结束，持续输出的远端让它永远
+                # 等不到 —— 旧实现的挂死根源（#40）。
+                futures_wait({fut_out, fut_err}, timeout=limit + 30)
+                hung = any(not f.done() for f in (fut_out, fut_err))
+                if hung:
+                    # 理论上到不了（线程自按 deadline 结束）；万一卡在
+                    # 阻塞 recv 里，先关通道让 recv 立刻失败再收尸
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+                    futures_wait([f for f in (fut_out, fut_err)
+                                  if not f.done()], timeout=10)
+                if fut_out.done():
+                    out, out_reason = fut_out.result()
+                if fut_err.done():
+                    err, err_reason = fut_err.result()
+
+            if "deadline" in (out_reason, err_reason) or hung:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+                raise TransportError(f"命令执行超时（{limit}s），已中断")
+
+            # 退出状态按 deadline 轮询：recv_exit_status 本身没有超时
+            # 语义，远端不发退出状态时会在那里挂死
+            while not channel.exit_status_ready():
+                if time.monotonic() >= deadline:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+                    raise TransportError(f"命令执行超时（{limit}s），已中断")
+                time.sleep(0.05)
             code = channel.recv_exit_status()
-        except (socket.timeout, TimeoutError):
-            try:
-                channel.close()
-            except Exception:
-                pass
-            raise TransportError(f"命令执行超时（{limit}s），已中断") from None
         except TransportError:
             raise
         except Exception as exc:
             raise TransportError(f"读取输出失败：{self.redactor.clean(str(exc))}") from None
 
         return Result(
-            stdout=self.redactor.clean(out),
-            stderr=self.redactor.clean(err),
+            stdout=self.redactor.clean(out.decode("utf-8", "replace")),
+            stderr=self.redactor.clean(err.decode("utf-8", "replace")),
             exit_code=code,
             duration_ms=int((time.monotonic() - started) * 1000),
+            stdout_read_truncated=(out_reason == "budget"),
+            stderr_read_truncated=(err_reason == "budget"),
         )
 
     def close(self) -> None:
@@ -509,8 +568,46 @@ class Client:
         return total
 
 
-def _drain(stream) -> str:
-    return stream.read().decode("utf-8", "replace")
+def _drain_channel(channel, deadline: float | None, budget: int | None,
+                   *, stderr: bool) -> tuple[bytes, str]:
+    """读一条流直到 EOF / 到 deadline / 读满预算，返回 (数据, 停止原因)。
+
+    停止原因：eof（读尽）/ deadline（到墙钟上限）/ budget（读满预算）/
+    closed（通道被关闭）。
+
+    旧实现 stream.read() 只有「单次 recv 超过 channel timeout」一个退出
+    条件：总时长与总量都没有约束 —— 远端每 0.1 秒来一条数据，单次 recv
+    就永远不会超时，命令永不返回；远端刷 1 GB 输出，内存就涨 1 GB（#40）。
+    现在每拿到一块数据都先看墙钟，总量另有预算封顶。
+    """
+    recv = channel.recv_stderr if stderr else channel.recv
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return b"".join(chunks), "deadline"
+        if budget is not None and total >= budget:
+            return b"".join(chunks), "budget"
+        try:
+            data = recv(_RUN_CHUNK)
+        except socket.timeout:
+            continue  # 单次等待超时不是结束，回循环顶看 deadline
+        except EOFError:
+            return b"".join(chunks), "eof"
+        except OSError:
+            # 通道被关闭（对端断开，或超时收尾时主线程关了通道）
+            return b"".join(chunks), "closed"
+        if not data:
+            return b"".join(chunks), "eof"
+        chunks.append(data)
+        total += len(data)
+
+
+# run 的输出读取（#40）：单次 recv 的阻塞粒度（秒）与单块读取字节数
+_RECV_SLICE = 1.0
+_RUN_CHUNK = 8 * 1024
+# 每条流的读取预算 = 回传上限 × 此倍数：给 output.shape 的头尾整形留材料
+_READ_BUDGET_FACTOR = 4
 
 
 # 文件通道的分块大小与上限说明，见 Settings.transfer_max_bytes

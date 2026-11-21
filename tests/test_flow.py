@@ -247,6 +247,159 @@ def reset_data():
 # --------------------------------------------------------------------------
 
 
+class _FloodServer(paramiko.ServerInterface):
+    """按收到的命令切换行为（#40）：
+
+    flood   —— 每 0.05 秒发一行、永不 EOF、永不发退出状态（挂死形态）
+    silence —— 什么都不发（沉默超时路径）
+    blob    —— 一次性发大块输出后正常收尾（读取预算封顶的验证形态）
+    """
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.command = b""
+
+    def check_auth_password(self, username, password):
+        return (paramiko.AUTH_SUCCESSFUL
+                if (username == USER and password == SSH_PASSWORD)
+                else paramiko.AUTH_FAILED)
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_channel_request(self, kind, chanid):
+        return (paramiko.OPEN_SUCCEEDED if kind == "session"
+                else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED)
+
+    def check_channel_exec_request(self, channel, command):
+        self.command = command
+        self.event.set()
+        return True
+
+
+def _handle_flood(transport, server) -> None:
+    try:
+        while True:
+            chan = transport.accept(20)
+            if chan is None:
+                return
+            if not server.event.wait(20):
+                chan.close()
+                return
+            server.event.clear()
+            cmd = server.command.decode("utf-8", "replace").strip()
+            try:
+                if cmd == "flood":
+                    line = b"flood-line-0123456789\n"
+                    while True:
+                        chan.sendall(line)
+                        time.sleep(0.05)
+                elif cmd == "silence":
+                    time.sleep(10)
+                elif cmd == "blob":
+                    chan.sendall(b"blob-" * 2048)  # 10 KiB
+                    chan.send_exit_status(0)
+                else:
+                    chan.sendall(b"(ran) " + cmd.encode() + b"\n")
+                    chan.send_exit_status(0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        try:
+            transport.close()
+        except Exception:
+            pass
+
+
+def _start_flood_server() -> tuple[int, threading.Event]:
+    host_key = paramiko.RSAKey.generate(2048)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(20)
+    port = sock.getsockname()[1]
+    stop = threading.Event()
+
+    def loop() -> None:
+        sock.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            t = paramiko.Transport(conn)
+            t.add_server_key(host_key)
+            srv = _FloodServer()
+            try:
+                t.start_server(server=srv)
+            except Exception:
+                t.close()
+                continue
+            threading.Thread(target=_handle_flood, args=(t, srv),
+                             daemon=True).start()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=loop, daemon=True).start()
+    return port, stop
+
+
+def test_run_timeout_and_read_cap() -> None:
+    """#40：--timeout 是墙钟上限，读取总量另有硬顶。"""
+    print("\n== #40 持续输出的远端命令在 --timeout 处收敛 ==")
+    port, stop = _start_flood_server()
+    try:
+        reset_data()
+        v = vault.Vault.create(paths.vault_file(), MASTER)
+        v.set(HOST_NAME, SSH_PASSWORD)
+        store.upsert_host(store.Host(name=HOST_NAME, host="127.0.0.1",
+                                     user=USER, port=port))
+        MockConsole().install()
+
+        started = time.monotonic()
+        code, out, err = run_cli(["run", HOST_NAME, "flood", "--timeout", "3"])
+        elapsed = time.monotonic() - started
+        check("持续输出下 --timeout 生效（退出码 4）", code == 4,
+              f"{code} {out[:100]}{err[-200:]}")
+        check("在时限内返回而不是挂死", elapsed < 15, f"{elapsed:.1f}s")
+        check("报错说明超时", "超时" in err, err[-200:])
+
+        print("\n== #40 沉默命令的既有超时语义保持 ==")
+        started = time.monotonic()
+        code, _, err = run_cli(["run", HOST_NAME, "silence", "--timeout", "2"])
+        elapsed = time.monotonic() - started
+        check("沉默命令同样超时", code == 4, f"{code} {err[-200:]}")
+        check("沉默超时也在时限内", elapsed < 10, f"{elapsed:.1f}s")
+
+        print("\n== #40 读取总量有硬顶 ==")
+        started = time.monotonic()
+        code, out, err = run_cli(["run", HOST_NAME, "blob", "--max-bytes", "1000"])
+        elapsed = time.monotonic() - started
+        check("blob 命令正常返回", code == 0, f"{code} {err[-200:]}")
+        check("在时限内返回", elapsed < 15, f"{elapsed:.1f}s")
+        check("读取侧截断有提示", "读取上限" in err, err[-300:])
+        check("回传内容仍按上限整形", "[sshhh] 输出已截断" in out, out[:200])
+        recs = [r for r in audit.tail(10) if r.get("action") == "run"]
+        check("审计记录了截断",
+              bool(recs) and bool(recs[-1].get("truncated")), str(recs[-1]))
+
+        print("\n== #40 正常命令不受预算影响 ==")
+        code, out, err = run_cli(["run", HOST_NAME, "blob"])
+        check("不超过上限时原样回传", code == 0 and "blob-" in out, out[:100])
+        check("无读取截断提示", "读取上限" not in err, err[-200:])
+    finally:
+        stop.set()
+
+
 def main() -> int:
     port, stop = start_server()
     real_available = console.available
@@ -660,6 +813,8 @@ def main() -> int:
         check("pending 状态行", "SETUP_PENDING" in status_names(err), err[:200])
         check("让用户去窗口里完成", "窗口" in err, err)
         check("要求 agent 不要反复调用", "不要反复调用" in err, err)
+
+        test_run_timeout_and_read_cap()
 
         reset_data()
         mock = MockConsole().install()

@@ -590,6 +590,7 @@ def cmd_run(argv: list[str]) -> int:
             result = client.run(
                 command, stdin_data=stdin_data, timeout=timeout,
                 use_sudo=bool(opts.get("sudo")) or host.sudo,
+                max_bytes=max_bytes,
             )
     except TransportError as exc:
         audit.write("run", host=name, user=host.user, command=safe_cmd,
@@ -614,7 +615,16 @@ def cmd_run(argv: list[str]) -> int:
         sys.stderr.write(stderr_text)
         sys.stderr.flush()
 
-    truncated = out_info["truncated"] or err_info["truncated"]
+    # 读取侧截断（#40）：远端还在输出时被预算叫停，原始总量从此不可知，
+    # 必须说出来，不能让人把「读到的」当成「全部」
+    read_truncated = result.stdout_read_truncated or result.stderr_read_truncated
+    for stream, capped in (("stdout", result.stdout_read_truncated),
+                           ("stderr", result.stderr_read_truncated)):
+        if capped:
+            _warn(f"[sshhh] 远端 {stream} 输出超过单次读取上限，已停止接收；"
+                  "回传的只是读到的部分，完整内容请缩小命令范围或分段查看")
+
+    truncated = out_info["truncated"] or err_info["truncated"] or read_truncated
     audit.write("run", host=name, user=host.user, command=safe_cmd,
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
                 ok=result.exit_code == 0, truncated=truncated,

@@ -83,19 +83,40 @@ class _FakeStdin:
 
 
 class _FakeStream:
-    def __init__(self, data: bytes = b"") -> None:
+    def __init__(self, data: bytes = b"",
+                 channel: "_FakeChannel | None" = None) -> None:
         self._data = data
-        self.channel = _FakeChannel()
+        self.channel = channel or _FakeChannel()
 
     def read(self) -> bytes:
         return self._data
 
 
 class _FakeChannel:
+    """run 的读取走 channel.recv / recv_stderr（#40 之后）。"""
+
+    def __init__(self, out: bytes = b"", err: bytes = b"") -> None:
+        self._out = out
+        self._err = err
+
+    def recv(self, n) -> bytes:
+        chunk, self._out = self._out[:n], self._out[n:]
+        return chunk
+
+    def recv_stderr(self, n) -> bytes:
+        chunk, self._err = self._err[:n], self._err[n:]
+        return chunk
+
+    def exit_status_ready(self) -> bool:
+        return True
+
     def recv_exit_status(self) -> int:
         return 0
 
     def settimeout(self, t) -> None:
+        pass
+
+    def close(self) -> None:
         pass
 
 
@@ -112,7 +133,9 @@ class _FakeExecSsh:
     def exec_command(self, command, timeout=None, get_pty=False):
         self.commands.append(command)
         self.stdin.written.clear()
-        return (self.stdin, _FakeStream(b"out\n"), _FakeStream(b""))
+        chan = _FakeChannel(b"out\n", b"")
+        return (self.stdin, _FakeStream(b"out\n", channel=chan),
+                _FakeStream(b"", channel=chan))
 
 
 def test_sudo_with_stdin() -> None:
@@ -444,7 +467,8 @@ class _ForgingClient:
     def __exit__(self, *exc):
         return False
 
-    def run(self, command, stdin_data=None, timeout=None, use_sudo=False):
+    def run(self, command, stdin_data=None, timeout=None, use_sudo=False,
+            max_bytes=None):
         from lib.transport import Result
 
         return Result(
@@ -894,7 +918,8 @@ class _ProbeClient:
     def banner(self) -> str:
         return _ProbeClient.banner_text
 
-    def run(self, command, stdin_data=None, timeout=None, use_sudo=False):
+    def run(self, command, stdin_data=None, timeout=None, use_sudo=False,
+            max_bytes=None):
         from lib.transport import Result
 
         _ProbeClient.script = stdin_data
