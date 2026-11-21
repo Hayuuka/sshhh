@@ -59,6 +59,14 @@ class _TOFU(paramiko.MissingHostKeyPolicy):
 
 
 def _key_line(hostname: str, key: paramiko.PKey) -> str:
+    """known_hosts 的一行。
+
+    `hostname` 是 paramiko `missing_host_key` 传来的 lookup 键：非 22
+    端口时 paramiko 按 OpenSSH 惯例传 `[host]:port`（paramiko/client.py
+    的 server_hostkey_name 逻辑，#44），所以写入与查找两侧天然区分端口
+    —— 同地址不同端口的两台主机指纹互不覆盖。test_flow 的同址双端口
+    回归测试钉住了这个行为：升级 paramiko 若改了口径，会在这里现形。
+    """
     return f"{hostname} {key.get_name()} {key.get_base64()}"
 
 

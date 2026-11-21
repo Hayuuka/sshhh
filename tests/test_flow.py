@@ -400,6 +400,53 @@ def test_run_timeout_and_read_cap() -> None:
         stop.set()
 
 
+def test_known_hosts_distinguishes_ports() -> None:
+    """#44：同地址不同端口的两台主机（跳板 + 业务双 SSH 部署很常见），
+    指纹互不覆盖、互不误报；记录形态遵循 OpenSSH 的 [host]:port 惯例。
+    """
+    print("\n== #44 同址双端口的指纹共存 ==")
+    port_a, stop_a = start_server()
+    port_b, stop_b = start_server()
+    try:
+        reset_data()
+        v = vault.Vault.create(paths.vault_file(), MASTER)
+        v.set("boxa", SSH_PASSWORD)
+        v.set("boxb", SSH_PASSWORD)
+        store.upsert_host(store.Host(name="boxa", host="127.0.0.1",
+                                     user=USER, port=port_a))
+        store.upsert_host(store.Host(name="boxb", host="127.0.0.1",
+                                     user=USER, port=port_b))
+        MockConsole().install()
+
+        code, out, err = run_cli(["run", "boxa", "echo hi"])
+        check("首连 boxa 成功", code == 0, f"{out[:100]}{err[-200:]}")
+        code, out, err = run_cli(["run", "boxb", "echo hi"])
+        check("首连 boxb 成功（两台主机的指纹没有互相覆盖/误报）",
+              code == 0, f"{out[:100]}{err[-200:]}")
+
+        text = paths.known_hosts_file().read_text(encoding="utf-8")
+        lines = [ln.split() for ln in text.splitlines()
+                 if ln.strip() and not ln.strip().startswith("#")]
+        aliases = {ln[0] for ln in lines}
+        check("known_hosts 恰好两条指纹", len(lines) == 2, text)
+        check("两条条目的主机别名不同",
+              len(aliases) == 2, str(aliases))
+        check("非 22 端口按 [host]:port 形态记录",
+              all(a.startswith("[127.0.0.1]:") for a in aliases), text)
+
+        code, out, err = run_cli(["run", "boxa", "echo hi"])
+        check("重连 boxa 指纹被识别", code == 0, f"{out[:100]}{err[-200:]}")
+        code, out, err = run_cli(["run", "boxb", "echo hi"])
+        check("重连 boxb 指纹被识别", code == 0, f"{out[:100]}{err[-200:]}")
+        text = paths.known_hosts_file().read_text(encoding="utf-8")
+        check("重连没有写出重复行",
+              len([ln for ln in text.splitlines() if ln.strip()
+                   and not ln.strip().startswith("#")]) == 2, text)
+    finally:
+        stop_a.set()
+        stop_b.set()
+
+
 def main() -> int:
     port, stop = start_server()
     real_available = console.available
@@ -815,6 +862,7 @@ def main() -> int:
         check("要求 agent 不要反复调用", "不要反复调用" in err, err)
 
         test_run_timeout_and_read_cap()
+        test_known_hosts_distinguishes_ports()
 
         reset_data()
         mock = MockConsole().install()
