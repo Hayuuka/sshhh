@@ -1457,7 +1457,17 @@ def cmd_keygen(argv: list[str]) -> int:
         return 3
 
     pem = sshkeys.generate_ed25519_pem(comment=f"sshhh-{name}")
-    v.set(_key_entry(name), pem)
+    from lib.lock import data_lock
+
+    with data_lock():
+        # 锁内重开（#41）：vault.set 会把「打开那一刻的快照 + 本次改动」
+        # 整份重写，锁外写会和配置窗口 / 另一台机器的 keygen 互相覆盖，
+        # 先落盘的条目静默消失。与 lib.vault.write_secret 同一纪律。
+        try:
+            v = vault.open_vault()
+        except vault.VaultError as exc:
+            return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+        v.set(_key_entry(name), pem)
     audit.write("key.gen", host=name, user=host.user,
                 command=f"ed25519 {sshkeys.sha256_fingerprint(pem)}")
     _say(f"[ok] 已生成 Ed25519 密钥并加密存入密码库（key:{name}）")
@@ -1529,7 +1539,16 @@ def cmd_keyimport(argv: list[str]) -> int:
         _warn(f"[sshhh] {exc}")
         return 3
 
-    v.set(_key_entry(name), pem)
+    from lib.lock import data_lock
+
+    with data_lock():
+        # 锁内重开（#41）：keyimport 的窗口期更长（读文件 + 归一化都在
+        # 打开 vault 之后），锁外写更容易撞上配置窗口的并发写入
+        try:
+            v = vault.open_vault()
+        except vault.VaultError as exc:
+            return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+        v.set(_key_entry(name), pem)
 
     audit.write("key.import", host=name, user=host.user,
                 command=f"from {source} {sshkeys.sha256_fingerprint(pem)}")

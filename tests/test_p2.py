@@ -648,6 +648,105 @@ def test_key_management() -> None:
     check("未知主机退出码 3", code == 3, f"{out}{err}")
 
 
+def test_keygen_lock_discipline() -> None:
+    """#41：keygen / keyimport 写 vault 必须持 data_lock、锁内重开。
+
+    复现时序（用事件把并发写入精确卡在 keygen「打开之后、写入之前」）：
+    keygen 在锁外拿到旧快照 → 配置窗口持锁写入另一条 → keygen 用旧快照
+    整份覆盖落盘 → 先写的密码静默消失。修复后 keygen 在锁内重开密码库，
+    以磁盘上的最新快照为基底。
+    """
+    print("\n== #41 keygen 写 vault 持锁 + 锁内重开 ==")
+    reset()
+    setup_sealed_host()
+    from lib.lock import data_lock
+    from lib import sshkeys
+
+    in_generate = threading.Event()
+    concurrent_written = threading.Event()
+    orig_generate = sshkeys.generate_ed25519_pem
+
+    def slow_generate(*, comment: str) -> str:
+        in_generate.set()           # keygen 已拿到旧快照（打开发生在生成之前）
+        concurrent_written.wait(5)  # 等并发写入落盘，模拟最坏交错
+        return orig_generate(comment=comment)
+
+    sshkeys.generate_ed25519_pem = slow_generate
+    code = -1
+    out = err = ""
+    try:
+        def concurrent_writer() -> None:
+            in_generate.wait(5)
+            with data_lock():
+                v = vault.Vault.open(paths.vault_file(), master=MASTER,
+                                     allow_keyring=False)
+                v.set("db1", "db1-password")
+            concurrent_written.set()
+
+        t = threading.Thread(target=concurrent_writer)
+        t.start()
+        code, out, err = run_cli(["manage", "keygen", "prod"])
+        t.join(10)
+    finally:
+        sshkeys.generate_ed25519_pem = orig_generate
+
+    check("keygen 成功", code == 0, f"{out}{err}")
+    v = vault.Vault.open(paths.vault_file(), master=MASTER, allow_keyring=False)
+    check("并发的配置写入没有被覆盖掉", v.get("db1") == "db1-password",
+          str(v.names()))
+    check("keygen 的密钥同样在库", bool(v.get("key:prod")), str(v.names()))
+
+
+def test_key_import_lock_discipline() -> None:
+    """#41：keyimport 的 vault 写入同样在锁内、以最新快照为基底。"""
+    print("\n== #41 keyimport 写 vault 持锁 ==")
+    reset()
+    setup_sealed_host()
+    from lib.lock import data_lock
+    from lib import sshkeys
+
+    key_dir = Path(tempfile.mkdtemp(prefix="sshhh-key41-"))
+    src = key_dir / "k.pem"
+    src.write_text(sshkeys.generate_ed25519_pem(comment="import-me"),
+                   encoding="utf-8")
+
+    in_hook = threading.Event()
+    concurrent_written = threading.Event()
+    orig_load = sshkeys.load_pkey
+
+    def slow_load(pem: str):
+        # keyimport 调 load_pkey 做入库前校验；此刻它已拿到旧 vault 快照
+        #（打开在读取私钥文件之前），并发写入在这之后、真正 v.set 之前落盘
+        in_hook.set()
+        concurrent_written.wait(5)
+        return orig_load(pem)
+
+    sshkeys.load_pkey = slow_load
+    code = -1
+    out = err = ""
+    try:
+        def concurrent_writer() -> None:
+            in_hook.wait(5)
+            with data_lock():
+                v = vault.Vault.open(paths.vault_file(), master=MASTER,
+                                     allow_keyring=False)
+                v.set("db1", "db1-password")
+            concurrent_written.set()
+
+        t = threading.Thread(target=concurrent_writer)
+        t.start()
+        code, out, err = run_cli(["manage", "keyimport", "prod", str(src)])
+        t.join(10)
+    finally:
+        sshkeys.load_pkey = orig_load
+
+    check("keyimport 成功", code == 0, f"{out}{err}")
+    v = vault.Vault.open(paths.vault_file(), master=MASTER, allow_keyring=False)
+    check("并发的配置写入没有被覆盖掉", v.get("db1") == "db1-password",
+          str(v.names()))
+    check("导入的私钥在库", bool(v.get("key:prod")), str(v.names()))
+
+
 # --------------------------------------------------------------------------
 # #3 密钥优先登录与回落留痕（本地 SSH 服务端）
 # --------------------------------------------------------------------------
@@ -840,6 +939,8 @@ def main() -> int:
     test_enforcement_in_fresh_process()
     test_data_dir_gating()
     test_key_management()
+    test_keygen_lock_discipline()
+    test_key_import_lock_discipline()
     test_key_first_auth()
 
     print("\n" + "=" * 46)
