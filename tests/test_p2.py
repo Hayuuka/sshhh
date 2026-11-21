@@ -347,6 +347,65 @@ def test_enforcement_and_views() -> None:
     check("子进程 reseal 落盘生效", store.get("prod") is not None)
 
 
+def test_load_single_read() -> None:
+    """#46：load() 的验签对象必须就是实际使用的文档（单次读取）。
+
+    旧实现验签读一次、解析再读一次：两次之间文件被并发替换的话，
+    「验签通过的清单」和「构建 Host 用的清单」可能不是同一份，
+    fail-closed 在窗口期被架空。用受控的两次不同内容模拟这个窗口：
+    修复后只会读到一次，策略段不可能凭空消失。
+    """
+    print("\n== #46 验签与解析共用同一次读取 ==")
+    reset()
+    setup_sealed_host(policy=["^df -h$"])
+    sealed_text = paths.hosts_file().read_text(encoding="utf-8")
+
+    import tomli_w
+
+    # 被篡改的第二份：删掉签名段与策略段（TM-B3 的删段形态）
+    tampered = tomllib.loads(sealed_text)
+    tampered.pop(integrity.SECTION, None)
+    tampered.get("hosts", {}).get("prod", {}).pop("policy", None)
+    tampered_text = tomli_w.dumps(tampered)
+
+    orig_read = store.read_text
+    calls = {"n": 0}
+
+    def raced_read(path, *args, **kwargs):
+        calls["n"] += 1
+        # 第一次读返回完好签名版；若还有第二次读，就返回被篡改版
+        return sealed_text if calls["n"] == 1 else tampered_text
+
+    store.read_text = raced_read
+    try:
+        hosts = store.load()
+    finally:
+        store.read_text = orig_read
+
+    check("单次读取（不再读第二遍）", calls["n"] == 1, str(calls))
+    h = hosts.get("prod")
+    check("用的是验过签的那一份", h is not None and h.host == "127.0.0.1",
+          str(hosts))
+    check("策略段来自已验签文档（不可能凭空消失）",
+          h is not None and h.policy.allow == ["^df -h$"], str(h))
+
+    print("\n== #46 读取失败仍映射 StoreError ==")
+    def broken_read(path, *args, **kwargs):
+        raise OSError(13, "模拟持续共享冲突")
+
+    store.read_text = broken_read
+    try:
+        err = None
+        try:
+            store.load()
+        except store.StoreError as exc:
+            err = str(exc)
+        check("OSError 映射为 StoreError（读取失败）",
+              err is not None and "读取失败" in err, str(err))
+    finally:
+        store.read_text = orig_read
+
+
 def _cli_subprocess(args: list[str]) -> subprocess.CompletedProcess:
     """在全新子进程里跑 CLI：不继承本进程绑定的 MAC 密钥（#39 的关键）。"""
     worker = (
@@ -937,6 +996,7 @@ def main() -> int:
     test_unsealed_failclosed_and_reseal()
     test_enforcement_and_views()
     test_enforcement_in_fresh_process()
+    test_load_single_read()
     test_data_dir_gating()
     test_key_management()
     test_keygen_lock_discipline()

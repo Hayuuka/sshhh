@@ -276,37 +276,22 @@ class Settings:
 
 def load() -> dict[str, Host]:
     """读主机清单。密码库已解锁时会先验完整性签名，失败抛 StoreError
-    （fail-closed，#18）：宁可拒绝服务，也不按一份被改过的清单放行命令。"""
-    path = paths.hosts_file()
-    if not path.exists():
-        return {}
-    _verify_integrity(_read_doc())
-    return load_unverified()
+    （fail-closed，#18）：宁可拒绝服务，也不按一份被改过的清单放行命令。
 
-
-def load_unverified() -> dict[str, Host]:
-    """不做完整性验签的读取，仅供 list / status / policy 这类只读展示。
-
-    这些视图的存在意义之一就是让用户在被改动的清单上「看看改了什么」，
-    所以不能被验签挡住。任何会触发连接或策略判定的路径禁止用本函数。
+    验签与解析共用**同一次读取**的文档（#46）：旧实现验签读一次、解析
+    再读一次，两次之间文件被并发替换的话，验签对象和实际使用的文档可能
+    不是同一份 —— fail-closed 在窗口期被架空。
     """
     path = paths.hosts_file()
     if not path.exists():
         return {}
-    try:
-        text = read_text(path)
-    except OSError as exc:
-        raise StoreError(f"hosts.toml 读取失败：{exc}") from None
-    try:
-        raw = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        # 旧版本把中文别名写成了裸键，整份清单会解析不了。
-        # 先按老格式修一遍再试，这样升级后不必手工改文件。
-        try:
-            raw = tomllib.loads(_heal_legacy(text))
-        except tomllib.TOMLDecodeError:
-            raise StoreError(f"hosts.toml 解析失败：{exc}") from None
+    doc = _read_doc()
+    _verify_integrity(doc)
+    return _hosts_from_doc(doc)
 
+
+def _hosts_from_doc(raw: dict) -> dict[str, Host]:
+    """从解析好的 TOML 文档构建 Host 对象。load 与 load_unverified 共用。"""
     hosts: dict[str, Host] = {}
     for name, item in (raw.get("hosts") or {}).items():
         if not isinstance(item, dict):
@@ -335,6 +320,32 @@ def load_unverified() -> dict[str, Host]:
     return hosts
 
 
+def load_unverified() -> dict[str, Host]:
+    """不做完整性验签的读取，仅供 list / status / policy 这类只读展示。
+
+    这些视图的存在意义之一就是让用户在被改动的清单上「看看改了什么」，
+    所以不能被验签挡住。任何会触发连接或策略判定的路径禁止用本函数。
+    """
+    path = paths.hosts_file()
+    if not path.exists():
+        return {}
+    try:
+        text = read_text(path)
+    except OSError as exc:
+        raise StoreError(f"hosts.toml 读取失败：{exc}") from None
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        # 旧版本把中文别名写成了裸键，整份清单会解析不了。
+        # 先按老格式修一遍再试，这样升级后不必手工改文件。
+        try:
+            raw = tomllib.loads(_heal_legacy(text))
+        except tomllib.TOMLDecodeError:
+            raise StoreError(f"hosts.toml 解析失败：{exc}") from None
+
+    return _hosts_from_doc(raw)
+
+
 def get(name: str) -> Host | None:
     return load().get(name)
 
@@ -348,7 +359,10 @@ def _read_doc() -> dict:
     path = paths.hosts_file()
     if not path.exists():
         return {}
-    text = read_text(path)
+    try:
+        text = read_text(path)
+    except OSError as exc:
+        raise StoreError(f"hosts.toml 读取失败：{exc}") from None
     try:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError:
