@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from . import paths
+from .fsutil import read_text
 from .lock import data_lock
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -323,7 +324,12 @@ class Vault:
         if not path.exists():
             raise VaultError("保险库不存在")
         try:
-            header = json.loads(path.read_text(encoding="utf-8"))
+            # 读走 fsutil 的短重试（#45）：Windows 上 _flush 的原子替换
+            # 落盘瞬间，并发读 open() 可能拿到瞬时共享冲突 —— 裸 read_text
+            # 会把它误报成「保险库文件损坏」，触发莫名其妙的解锁弹窗流程。
+            # hosts.toml / known_hosts 早已如此，vault 是三个数据文件里
+            # 唯一漏掉的。
+            header = json.loads(read_text(path))
         except (OSError, json.JSONDecodeError) as exc:
             raise VaultError(f"保险库文件损坏：{exc}") from None
         if header.get("v") != VAULT_VERSION:

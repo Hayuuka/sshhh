@@ -1147,11 +1147,102 @@ def test_deps_ok_target_version() -> None:
         runtime.deps_ok = orig_deps
 
 
+VAULT_READER = r"""
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from lib import vault, paths
+
+bad = []
+reads = 0
+t0 = time.time()
+while time.time() - t0 < 2.5:
+    try:
+        v = vault.Vault.open(paths.vault_file(), master=sys.argv[2],
+                             allow_keyring=False)
+        v.names()
+        reads += 1
+    except vault.VaultError as exc:
+        bad.append(str(exc)[-120:])
+print(json.dumps({"bad": bad[:5], "reads": reads}))
+"""
+
+
+def test_vault_open_read_retry() -> None:
+    """#45：Vault.open 读 vault.enc 走 fsutil 短重试 —— Windows 并发下
+    _flush 原子替换落盘瞬间的共享冲突，不再误报「保险库文件损坏」。
+    """
+    import json
+    import pathlib
+    import subprocess
+
+    from lib import paths, vault
+
+    master = "p1-master-retry-45"
+
+    print("\n== #45 瞬时共享冲突被重试吸收 ==")
+    reset()
+    vault.Vault.create(paths.vault_file(), master)
+    v = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    v.set("x1", "v1")
+
+    orig_read = pathlib.Path.read_text
+    state = {"n": 0}
+
+    def flaky_read(self, *args, **kwargs):
+        if self == paths.vault_file() and state["n"] < 2:
+            state["n"] += 1
+            raise PermissionError(13, "模拟 _flush 落盘瞬间的共享冲突")
+        return orig_read(self, *args, **kwargs)
+
+    pathlib.Path.read_text = flaky_read
+    try:
+        v2 = vault.Vault.open(paths.vault_file(), master=master,
+                              allow_keyring=False)
+        check("两次瞬时冲突后仍正常打开", v2.get("x1") == "v1")
+    finally:
+        pathlib.Path.read_text = orig_read
+
+    print("\n== #45 真损坏仍然报错 ==")
+    paths.vault_file().write_text("{这不是 JSON", encoding="utf-8")
+    err = None
+    try:
+        vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    except vault.VaultError as exc:
+        err = str(exc)
+    check("真损坏照样报 VaultError（损坏）",
+          err is not None and "损坏" in err, str(err))
+
+    print("\n== #45 并发写读不成误报损坏（参照 #9 手法）==")
+    reset()
+    vault.Vault.create(paths.vault_file(), master)
+    reader = subprocess.Popen(
+        [sys.executable, "-c", VAULT_READER, str(SCRIPTS), master],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8",
+    )
+    writer = vault.Vault.open(paths.vault_file(), master=master,
+                              allow_keyring=False)
+    writes = 0
+    while reader.poll() is None and writes < 300:
+        writer.set(f"churn{writes % 5}", "x" * (writes % 500))
+        writes += 1
+    out, rerr = reader.communicate(timeout=60)
+    try:
+        report = json.loads(out.strip().splitlines()[-1])
+    except Exception:
+        report = {"bad": [f"无输出: {rerr[-200:]}"], "reads": 0}
+    check("读方一次都没误报损坏", not report["bad"],
+          f"失败 {len(report['bad'])} 次：{report['bad'][:3]}")
+    check("读方确实在并发读", (report.get("reads") or 0) > 5, str(report))
+    check("写方也确实在写", writes > 5, str(writes))
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
     test_test_policy_and_redaction()
     test_vault_aad_and_tmp()
+    test_vault_open_read_retry()
     test_tofu_hostkey_line()
     test_nonce_anti_forgery()
     test_audit_streaming()
