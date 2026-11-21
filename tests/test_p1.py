@@ -1075,6 +1075,78 @@ def test_store_canonical_rewrite() -> None:
           paths.hosts_file().read_text(encoding="utf-8"))
 
 
+def test_deps_ok_target_version() -> None:
+    """#42：deps_ok 按目标解释器的版本决定检查清单，不看当前进程。
+
+    旧实现用 sys.version_info 决定要不要检查 tomli：宿主 3.9 拉起自举、
+    选中 3.14 建 venv 时，一个依赖齐全的 venv 会被判为不可用，每次调用
+    都重建再失败，这台机器上永远无法自举。
+    """
+    import importlib.util
+    import types
+
+    from lib import runtime
+
+    print("\n== #42 版本探测来自目标解释器 ==")
+    check("_interpreter_version 探测当前解释器",
+          runtime._interpreter_version(sys.executable) == sys.version_info[:2],
+          str(runtime._interpreter_version(sys.executable)))
+    check("不存在的解释器返回 None",
+          runtime._interpreter_version(str(_TMP / "no-such-python.exe")) is None)
+    check("deps_ok 对不存在的解释器为 False",
+          runtime.deps_ok(str(_TMP / "no-such-python.exe")) is False)
+    check("deps_ok 当前解释器依赖齐全", runtime.deps_ok(sys.executable) is True)
+
+    print("\n== #42 tomli 是否检查随目标版本取舍 ==")
+    has_tomli = importlib.util.find_spec("tomli") is not None
+    orig_version = runtime._interpreter_version
+    try:
+        runtime._interpreter_version = lambda exe: (3, 10)
+        check("目标 3.10：清单带 tomli（有无 tomli 决定结果）",
+              runtime.deps_ok(sys.executable) == has_tomli)
+        runtime._interpreter_version = lambda exe: (3, 12)
+        check("目标 3.12：清单不带 tomli，无 tomli 也通过",
+              runtime.deps_ok(sys.executable) is True)
+        runtime._interpreter_version = lambda exe: None
+        check("版本探测失败 → deps_ok False",
+              runtime.deps_ok(sys.executable) is False)
+    finally:
+        runtime._interpreter_version = orig_version
+
+    print("\n== #42 「装好了但自检不过」与 pip 失败分开报 ==")
+    orig_run = runtime.subprocess.run
+    orig_deps = runtime.deps_ok
+    fail_rc = 0
+
+    def make_fake_run():
+        # 第一次 subprocess 是 pip 升级自身（退出码被忽略），第二次是装依赖
+        state = {"n": 0}
+
+        def run(cmd, **kw):
+            state["n"] += 1
+            rc = 0 if state["n"] == 1 else fail_rc
+            return types.SimpleNamespace(returncode=rc, stdout=b"", stderr=b"")
+
+        return run
+
+    try:
+        runtime.subprocess.run = make_fake_run()
+        runtime.deps_ok = lambda exe: False
+        reason = runtime._install(_TMP / "fake-venv-py.exe")
+        check("退出码 0 但自检不过 → 说明是自检问题",
+              reason is not None and "自检" in reason and "pip 安装失败" not in reason,
+              str(reason))
+
+        fail_rc = 1
+        runtime.subprocess.run = make_fake_run()
+        reason = runtime._install(_TMP / "fake-venv-py.exe")
+        check("pip 真失败 → 保留 pip 失败文案",
+              reason is not None and "pip 安装失败" in reason, str(reason))
+    finally:
+        runtime.subprocess.run = orig_run
+        runtime.deps_ok = orig_deps
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -1087,6 +1159,7 @@ def main() -> int:
     test_gpg_backend()
     test_status_headless_guidance()
     test_code_hygiene()
+    test_deps_ok_target_version()
     test_manage_dispatch()
     test_harden_check()
     test_auth_field_and_key_namespace()

@@ -58,10 +58,40 @@ class PythonTooOldError(RuntimeError_):
     """
 
 
+def _interpreter_version(executable: str | Path) -> tuple[int, int] | None:
+    """探测目标解释器的 (major, minor)。探测失败返回 None。"""
+    try:
+        proc = subprocess.run(
+            [str(executable), "-c",
+             "import sys;print(sys.version_info.major, sys.version_info.minor)"],
+            capture_output=True, timeout=20, text=True,
+            creationflags=_NO_WINDOW,
+        )
+        if proc.returncode != 0:
+            return None
+        parts = proc.stdout.strip().split()
+        # 打印成两个整数再解析，不用 eval —— 输出虽受控，但没理由留着 eval（#21）
+        if len(parts) != 2:
+            return None
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return None
+
+
 def deps_ok(executable: str | Path) -> bool:
+    """检查 executable 里关键依赖是否齐全。
+
+    tomli 要不要在检查清单里，取决于**被检查的那个解释器**的版本而不是
+    当前进程（#42）：宿主 Python 3.9 拉起自举、选中 3.14 建 venv 时，
+    按当前进程版本补查 tomli 会让一个依赖齐全的 venv 永远判为不可用，
+    这台机器上就再也自举不起来了。
+    """
+    version = _interpreter_version(executable)
+    if version is None:
+        return False
     try:
         modules = list(REQUIRED_MODULES)
-        if sys.version_info < (3, 11):
+        if version < (3, 11):
             modules.append("tomli")
         code = "import " + ",".join(modules)
         proc = subprocess.run(
@@ -76,21 +106,8 @@ def deps_ok(executable: str | Path) -> bool:
 
 
 def _python_version_ok(executable: str) -> bool:
-    try:
-        proc = subprocess.run(
-            [executable, "-c",
-             "import sys;print(sys.version_info.major, sys.version_info.minor)"],
-            capture_output=True, timeout=20, text=True,
-            creationflags=_NO_WINDOW,
-        )
-        if proc.returncode != 0:
-            return False
-        parts = proc.stdout.strip().split()
-        # 打印成两个整数再解析，不用 eval —— 输出虽受控，但没理由留着 eval（#21）
-        return (len(parts) == 2
-                and (int(parts[0]), int(parts[1])) >= (3, 9))
-    except Exception:
-        return False
+    version = _interpreter_version(executable)
+    return version is not None and version >= (3, 9)
 
 
 def find_base_python() -> str | None:
@@ -165,6 +182,13 @@ def _install(venv_py: Path) -> str | None:
         return None
 
     tail = _tail(proc.stderr) or _tail(proc.stdout)
+    if proc.returncode == 0:
+        # 装是装上了，但自检不过（#42）：这不是 pip 的错，措辞必须分开，
+        # 否则按「安装失败」排查网络会南辕北辙
+        reason = "依赖已安装，但安装后的自检未通过（导入关键模块失败）"
+        if tail:
+            reason += f"：{tail}"
+        return reason
     reason = f"pip 安装失败（退出码 {proc.returncode}）"
     if tail:
         reason += f"：{tail}"
