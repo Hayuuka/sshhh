@@ -347,6 +347,77 @@ def test_enforcement_and_views() -> None:
     check("子进程 reseal 落盘生效", store.get("prod") is not None)
 
 
+def _cli_subprocess(args: list[str]) -> subprocess.CompletedProcess:
+    """在全新子进程里跑 CLI：不继承本进程绑定的 MAC 密钥（#39 的关键）。"""
+    worker = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "import sshhh; sys.exit(sshhh.main(sys.argv[2:]))"
+    )
+    env = dict(os.environ)
+    env["SSHHH_TEST_MODE"] = "1"
+    env["SSHHH_MASTER"] = MASTER
+    return subprocess.run(
+        [sys.executable, "-I", "-c", worker, str(SCRIPTS), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=120, env=env,
+    )
+
+
+def _strip_integrity_sections() -> None:
+    """模拟 TM-B3：删掉 [sshhh_integrity] 段和 [hosts.prod.policy] 段。
+
+    文件级手术 —— agent 拿不到签名密钥，能做的就是删段。
+    """
+    import tomli_w
+
+    doc = tomllib.loads(paths.hosts_file().read_text(encoding="utf-8"))
+    doc.pop(integrity.SECTION, None)
+    doc.get("hosts", {}).get("prod", {}).pop("policy", None)
+    paths.hosts_file().write_text(tomli_w.dumps(doc), encoding="utf-8")
+
+
+def test_enforcement_in_fresh_process() -> None:
+    """#39：验签的调用顺序纪律必须在**全新进程**里成立。
+
+    test / put / get / harden 曾经是「先 store.get 后解锁」：全新进程走到
+    store.get 时 MAC 密钥还没绑定，验签直接跳过，被篡改的清单照常建连。
+    进程内测试抓不到它 —— setup_sealed_host 已把密钥绑进模块全局，
+    store.get 只是「碰巧」验了签（测试内状态泄漏掩盖真实路径缺陷）。
+    """
+    print("\n== #39 全新子进程里 test 在建连前中止 ==")
+    reset()
+    setup_sealed_host(policy=["^df -h$"])
+    # 端口 1 没有服务：如果走到建连，表现为连接失败（退出码 4）而不是验签拒绝（3）
+    store.upsert_host(store.Host(name="prod", host="127.0.0.1", user="root", port=1))
+    _strip_integrity_sections()
+
+    proc = _cli_subprocess(["test", "prod"])
+    check("test 退出码 3（验签拒绝）", proc.returncode == 3,
+          f"rc={proc.returncode} {proc.stdout[-200:]}{proc.stderr[-300:]}")
+    check("test 报错指向签名", "签名" in proc.stderr, proc.stderr[-300:])
+
+    print("\n== #39 全新子进程里 put / get 同样被拒 ==")
+    local = _TMP / "put-src.txt"
+    local.write_text("payload", encoding="utf-8")
+    proc = _cli_subprocess(["put", "prod", str(local), "/tmp/x"])
+    check("put 退出码 3", proc.returncode == 3,
+          f"rc={proc.returncode} {proc.stderr[-300:]}")
+    check("put 报错指向签名", "签名" in proc.stderr, proc.stderr[-300:])
+    proc = _cli_subprocess(["get", "prod", "/etc/shadow", str(_TMP / "tmp" / "s")])
+    check("get 退出码 3（不是被本地路径拦下）", proc.returncode == 3,
+          f"rc={proc.returncode} {proc.stderr[-300:]}")
+
+    print("\n== #39 全新子进程里 harden / keygen 同样被拒 ==")
+    proc = _cli_subprocess(["manage", "harden", "prod", "--check"])
+    check("harden 退出码 3", proc.returncode == 3,
+          f"rc={proc.returncode} {proc.stderr[-300:]}")
+    check("harden 报错指向签名", "签名" in proc.stderr, proc.stderr[-300:])
+    proc = _cli_subprocess(["manage", "keygen", "prod"])
+    check("keygen 退出码 3", proc.returncode == 3,
+          f"rc={proc.returncode} {proc.stderr[-300:]}")
+    check("keygen 报错指向签名", "签名" in proc.stderr, proc.stderr[-300:])
+
+
 # --------------------------------------------------------------------------
 # #18 SSHHH_DATA_DIR 仅测试模式生效
 # --------------------------------------------------------------------------
@@ -766,6 +837,7 @@ def main() -> int:
     test_seal_roundtrip_and_tamper()
     test_unsealed_failclosed_and_reseal()
     test_enforcement_and_views()
+    test_enforcement_in_fresh_process()
     test_data_dir_gating()
     test_key_management()
     test_key_first_auth()

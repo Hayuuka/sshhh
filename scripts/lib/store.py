@@ -113,9 +113,10 @@ _RESEAL_HINT = (
 def _verify_integrity(doc: dict) -> None:
     """读路径的强制验签点。签名密钥未绑定（密码库没解锁）时跳过。
 
-    run / test / put / get / harden 全部先解锁密码库才走到这里，所以
-    强制路径必然验签；list / status / policy 在锁定状态下仍可用来
-    检查被改过的文件。
+    run / test / put / get / harden 以及 setpass / keygen / keyimport /
+    keyshow 全部先解锁密码库才走到这里（#39 的调用顺序纪律），所以这些
+    路径必然验签；list / status / policy 在锁定状态下仍可用来检查被改动
+    的文件。
     """
     key = integrity.mac_key()
     if key is None:

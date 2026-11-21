@@ -685,6 +685,14 @@ def cmd_test(argv: list[str]) -> int:
         raise UsageError("用法：sshhh test <主机>")
     name = pos[0]
 
+    # 先解锁再读清单（#39）：store.get 的验签依赖密码库解锁后绑定的 MAC
+    # 密钥，全新进程里锁着读等于不验 —— 与 run 同一纪律，所有连接类命令
+    # 都必须「先解锁、后读清单」。
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     try:
         host = store.get(name)
     except store.StoreError as exc:
@@ -692,10 +700,6 @@ def cmd_test(argv: list[str]) -> int:
     if host is None:
         return _unknown_host(name)
 
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
     password = v.get(name)
 
     # 探测命令是脚本自己写死的，但同样要过策略（#34 I6）：用户把主机配成
@@ -810,16 +814,18 @@ def _transfer(argv: list[str], direction: str) -> int:
         raise UsageError(f"用法：sshhh {direction} <主机> <本地> <远端>")
     name, a, b = pos[0], pos[1], pos[2]
 
+    # 先解锁再读清单（#39）：与 run 同一纪律，验签必须在 MAC 密钥绑定之后
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     try:
         host = store.get(name)
     except store.StoreError as exc:
         return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
 
     local = os.path.expanduser(a if direction == "put" else b)
     remote = b if direction == "put" else a
@@ -929,22 +935,24 @@ def cmd_setpass(argv: list[str]) -> int:
         raise UsageError("用法：sshhh setpass <主机>")
     name = pos[0]
 
-    try:
-        host = store.get(name)
-    except store.StoreError as exc:
-        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
-    if host is None:
-        return _unknown_host(name)
-
+    # 先解锁再读清单（#39）：后续 add_host 窗口会按清单里的主机信息改写，
+    # 读到被篡改的清单就等于按篡改后的目标改密码
     try:
         vault.open_vault()
     except vault.VaultError:
         status, detail = _launch("unlock", {})
         if status != "ok":
             code = _setup_failed(status, detail, "unlock")
-            audit.write("setpass", host=name, user=host.user, ok=False,
+            audit.write("setpass", host=name, ok=False,
                         error=f"密码库未解锁（{status}），密码未修改")
             return code
+
+    try:
+        host = store.get(name)
+    except store.StoreError as exc:
+        return protocol.emit(protocol.EXIT_CONFIG, str(exc))
+    if host is None:
+        return _unknown_host(name)
 
     status, detail = _launch("add_host", {"host_name": name, "reset_password": True})
     if status != "ok":
@@ -1179,7 +1187,7 @@ def cmd_harden(argv: list[str]) -> int:
     """
     import re
 
-    from lib import audit, store, vault
+    from lib import audit, protocol, store, vault
     from lib.redact import Redactor
     from lib.transport import Client, TransportError
 
@@ -1194,16 +1202,19 @@ def cmd_harden(argv: list[str]) -> int:
         return 2
     name = pos[0]
 
+    # 先解锁再读清单（#39）：与 run 同一纪律，验签必须在 MAC 密钥绑定之后
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     try:
         host = store.get(name)
     except store.StoreError as exc:
         return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     key_pem = v.get(f"key:{name}")
     auth = "key" if key_pem else "password"
     password = v.get(name)
@@ -1416,17 +1427,18 @@ def cmd_keygen(argv: list[str]) -> int:
         raise UsageError("用法：sshhh manage keygen <主机> [--force]")
     name = pos[0]
 
+    # 先解锁再读清单（#39）：keygen 的产出按清单里的主机身份记录
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     try:
         host = store.get(name)
     except store.StoreError as exc:
         return protocol.emit(protocol.EXIT_CONFIG, str(exc))
     if host is None:
         return _unknown_host(name)
-
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
 
     old = v.get(_key_entry(name))
     if old and not force:
@@ -1462,6 +1474,12 @@ def cmd_keyimport(argv: list[str]) -> int:
         raise UsageError("用法：sshhh manage keyimport <主机> [私钥文件]")
     name = pos[0]
     path_arg = pos[1] if len(pos) > 1 else None
+
+    # 先解锁再读清单（#39）：key_file 线索来自清单，验签先行
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
 
     try:
         host = store.get(name)
@@ -1501,10 +1519,6 @@ def cmd_keyimport(argv: list[str]) -> int:
         _warn(f"[sshhh] {exc}")
         return 3
 
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
     v.set(_key_entry(name), pem)
 
     audit.write("key.import", host=name, user=host.user,
@@ -1525,6 +1539,12 @@ def cmd_keyshow(argv: list[str]) -> int:
         raise UsageError("用法：sshhh manage keyshow <主机>")
     name = pos[0]
 
+    # 先解锁再读清单（#39）：与其它 manage 子命令同一纪律
+    try:
+        v = vault.open_vault()
+    except vault.VaultError as exc:
+        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
+
     try:
         host = store.get(name)
     except store.StoreError as exc:
@@ -1532,10 +1552,6 @@ def cmd_keyshow(argv: list[str]) -> int:
     if host is None:
         return _unknown_host(name)
 
-    try:
-        v = vault.open_vault()
-    except vault.VaultError as exc:
-        return protocol.emit(protocol.EXIT_LOCKED, str(exc))
     pem = v.get(_key_entry(name))
     if not pem:
         _warn(f"[sshhh] {name} 还没有密钥")
