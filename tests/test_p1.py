@@ -1237,6 +1237,61 @@ def test_vault_open_read_retry() -> None:
     check("写方也确实在写", writes > 5, str(writes))
 
 
+def test_audit_bytes_sums_streams() -> None:
+    """#49：run 审计的 bytes 口径是两路合计（stdout + stderr）。
+
+    旧实现取 max(out, err)：双流都截断时「原始多少只回了多少」对不上账
+    （#24 留痕的初衷就是给事后核对用的）。
+    """
+    from lib import audit as audit_mod
+    from lib import paths, store, transport as transport_mod, vault
+
+    class _SizedClient:
+        last: "_SizedClient | None" = None
+
+        def __init__(self, host, password, settings, redactor=None,
+                     key_pem=None):
+            self.auth_used = "password"
+            self.auth_fallback = False
+            _SizedClient.last = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, command, stdin_data=None, timeout=None, use_sudo=False,
+                max_bytes=None):
+            from lib.transport import Result
+
+            return Result(stdout="o" * 1000, stderr="e" * 400,
+                          exit_code=0, duration_ms=5)
+
+    print("\n== #49 审计 bytes 是两路合计 ==")
+    reset()
+    master = "p1-master-bytes-49"
+    vault.Vault.create(paths.vault_file(), master)
+    os.environ["SSHHH_MASTER"] = master  # 自动解锁，不走补录窗口
+    v = vault.Vault.open(paths.vault_file(), master=master, allow_keyring=False)
+    v.set("prod", "pw-49")
+    store.upsert_host(store.Host(name="prod", host="127.0.0.1", user="root"))
+
+    real_client = transport_mod.Client
+    transport_mod.Client = _SizedClient
+    try:
+        code, out, err = run_cli(["run", "prod", "echo hi"])
+    finally:
+        transport_mod.Client = real_client
+        os.environ.pop("SSHHH_MASTER", None)
+    check("run 正常返回", code == 0, f"{out}{err}")
+    recs = [r for r in audit_mod.tail(10, include_internal=True)
+            if r.get("action") == "run"]
+    rec = recs[-1] if recs else {}
+    check("bytes 记两路合计（1400 而不是 max 的 1000）",
+          rec.get("bytes") == 1400, str(rec))
+
+
 def main() -> int:
     test_redact_pwd()
     test_sudo_with_stdin()
@@ -1251,6 +1306,7 @@ def main() -> int:
     test_status_headless_guidance()
     test_code_hygiene()
     test_deps_ok_target_version()
+    test_audit_bytes_sums_streams()
     test_manage_dispatch()
     test_harden_check()
     test_auth_field_and_key_namespace()

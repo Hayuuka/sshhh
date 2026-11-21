@@ -628,8 +628,11 @@ def cmd_run(argv: list[str]) -> int:
     audit.write("run", host=name, user=host.user, command=safe_cmd,
                 exit_code=result.exit_code, duration_ms=result.duration_ms,
                 ok=result.exit_code == 0, truncated=truncated,
-                original_bytes=max(out_info["original_bytes"],
-                                   err_info["original_bytes"]),
+                # 两路合计（#49）：stdout 截 100 KiB + stderr 截 200 KiB 时
+                # 只记 max 会对不上账，「原始多少只回了多少」是截断留痕
+                # 的初衷（#24）
+                original_bytes=(out_info["original_bytes"]
+                                + err_info["original_bytes"]),
                 auth=client.auth_used or auth,
                 fallback="key" if client.auth_fallback else "")
     return result.exit_code

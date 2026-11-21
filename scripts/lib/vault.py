@@ -443,22 +443,6 @@ class Vault:
         A 机的密码出现在 B 机的输出里时同样要被替换。"""
         return list(self._data.values())
 
-    def rekey(self, new_master: str) -> None:
-        assert self._header is not None
-        salt = _secrets.token_bytes(16)
-        self._header["kdf"] = {
-            "name": "scrypt",
-            "salt": _b64e(salt),
-            "n": _SCRYPT_N,
-            "r": _SCRYPT_R,
-            "p": _SCRYPT_P,
-        }
-        self._key = _derive(new_master, salt, _SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
-        # 换了主密码，签名密钥随之更换；旧签名会失效，需重新 reseal（#18）
-        from . import integrity
-        integrity.set_vault_key(self._key)
-        self._flush()
-
 
 def _harden(path: Path) -> None:
     try:
