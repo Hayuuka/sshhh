@@ -1678,7 +1678,7 @@ def main(argv: list[str] | None = None) -> int:
         _say(USAGE.format(data=paths.data_dir()))
         return 0
     if args[0] in ("-V", "--version", "version"):
-        _say("sshhh 2.0.0")
+        _say("sshhh 2.0.1")
         return 0
 
     cmd, rest = args[0], args[1:]
